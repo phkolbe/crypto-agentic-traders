@@ -1,0 +1,55 @@
+# Infraestrutura opcional: PostgreSQL/TimescaleDB + Redis.
+#
+# O sistema roda sem Docker (SQLite + event bus in-process). Este compose existe
+# para quando quiser as series temporais do TimescaleDB e o replay de eventos do
+# Redis Streams. Depois de `docker compose up -d`, troque no .env:
+#
+#   DATABASE_URL=postgresql+asyncpg://crypto:crypto@localhost:5432/crypto_traders
+#   EVENT_BUS=redis
+#
+# e instale os extras: uv pip install -e ".[dev,postgres,redis]"
+#
+# Nenhum codigo de agente muda.
+
+name: crypto-agentic-traders
+
+services:
+  db:
+    image: timescale/timescaledb:latest-pg16
+    container_name: crypto-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: crypto
+      POSTGRES_PASSWORD: crypto
+      POSTGRES_DB: crypto_traders
+    # Exposto apenas em localhost: o banco nunca fica acessivel na rede.
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ./docker/timescale_init.sql:/docker-entrypoint-initdb.d/00-timescale.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U crypto -d crypto_traders"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: crypto-redis
+    restart: unless-stopped
+    # appendonly garante que os eventos sobrevivem a um restart do container.
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  db_data:
+  redis_data:
