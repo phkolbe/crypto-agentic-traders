@@ -385,10 +385,16 @@ class PortfolioSnapshotRepository:
         )
 
     async def latest(self) -> orm.PortfolioSnapshot | None:
-        stmt = select(orm.PortfolioSnapshot).order_by(orm.PortfolioSnapshot.timestamp.desc()).limit(1)
+        stmt = (
+            select(orm.PortfolioSnapshot)
+            .order_by(orm.PortfolioSnapshot.timestamp.desc())
+            .limit(1)
+        )
         return (await self._session.execute(stmt)).scalar_one_or_none()
 
-    async def history(self, since: datetime | None = None, limit: int = 1000) -> list[orm.PortfolioSnapshot]:
+    async def history(
+        self, since: datetime | None = None, limit: int = 1000
+    ) -> list[orm.PortfolioSnapshot]:
         stmt = select(orm.PortfolioSnapshot)
         if since:
             stmt = stmt.where(orm.PortfolioSnapshot.timestamp >= since)

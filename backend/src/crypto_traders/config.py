@@ -9,9 +9,10 @@ from __future__ import annotations
 from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
+from typing import Annotated
 
 from pydantic import Field, SecretStr, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from .domain.enums import TradingMode
 
@@ -28,6 +29,19 @@ class ExchangeCredentials(BaseSettings):
     api_secret: SecretStr | None = None
     passphrase: SecretStr | None = None
     """Usado por algumas APIs da Coinbase; ignorado pela Binance."""
+
+    @field_validator("api_key", "api_secret", "passphrase", mode="before")
+    @classmethod
+    def _empty_is_unset(cls, value: object) -> object:
+        """`BINANCE__API_KEY=` no `.env` significa "nao configurado", nao "vazio".
+
+        Sem isso, uma chave em branco viraria `SecretStr('')` -- que e diferente
+        de `None` -- e o sistema se consideraria autenticado, tentando enviar
+        ordens com credencial vazia em vez de recusar a subida.
+        """
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
 
     @property
     def configured(self) -> bool:
@@ -76,8 +90,10 @@ class RiskSettings(BaseSettings):
     )
     weekly_loss_limit_pct: float = Field(default=0.12, gt=0, le=1)
     min_signal_confidence: float = Field(default=0.55, ge=0, le=1)
-    asset_whitelist: list[str] = Field(default_factory=lambda: ["BTC", "ETH", "SOL"])
-    symbol_whitelist: list[str] = Field(
+    asset_whitelist: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["BTC", "ETH", "SOL"]
+    )
+    symbol_whitelist: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
     )
     cooldown_seconds: int = Field(
@@ -89,7 +105,12 @@ class RiskSettings(BaseSettings):
     @field_validator("asset_whitelist", "symbol_whitelist", mode="before")
     @classmethod
     def _split_csv(cls, value: object) -> object:
-        """Aceita CSV alem de JSON, porque o `.env` e escrito a mao."""
+        """Aceita CSV alem de JSON, porque o `.env` e escrito a mao.
+
+        Os campos usam `NoDecode` justamente para chegarem aqui como string
+        crua: sem isso o pydantic-settings tentaria `json.loads` primeiro e
+        falharia em `BTC,ETH` antes deste validador rodar.
+        """
         if isinstance(value, str):
             stripped = value.strip()
             if stripped.startswith("["):
@@ -150,17 +171,23 @@ class Settings(BaseSettings):
     """Nunca 0.0.0.0 por padrao: o backend so escuta em localhost."""
 
     api_port: int = 8000
-    cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:5173"])
+    cors_origins: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["http://localhost:5173"]
+    )
 
     # --- Mercado ----------------------------------------------------------
     exchange: str = "binance"
     quote_currency: str = "USDT"
-    symbols: list[str] = Field(default_factory=lambda: ["BTC/USDT", "ETH/USDT"])
+    symbols: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["BTC/USDT", "ETH/USDT"]
+    )
     timeframe: str = "15m"
     candle_history_limit: int = 500
     market_data_interval_seconds: int = 60
     portfolio_interval_seconds: int = 60
-    strategies: list[str] = Field(default_factory=lambda: ["ma_crossover", "rsi_reversion"])
+    strategies: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["ma_crossover", "rsi_reversion"]
+    )
 
     # --- Paper trading ----------------------------------------------------
     paper_initial_balance: Decimal = Decimal("1000")

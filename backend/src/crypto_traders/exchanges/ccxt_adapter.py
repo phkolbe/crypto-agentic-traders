@@ -112,7 +112,9 @@ class CcxtExchange(MarketDataSource, Broker):
                     delay *= 2
             except ccxt.BaseError as exc:
                 raise ExchangeError(f"{self.name}.{operation}: {exc}") from exc
-        raise ExchangeError(f"{self.name}.{operation} falhou apos {self._max_retries} tentativas: {last_error}")
+        raise ExchangeError(
+            f"{self.name}.{operation} falhou apos {self._max_retries} tentativas: {last_error}"
+        )
 
     # ------------------------------------------------------------------
     # MarketDataSource

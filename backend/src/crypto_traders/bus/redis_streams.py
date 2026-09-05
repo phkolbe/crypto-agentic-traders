@@ -53,7 +53,11 @@ class RedisStreamsEventBus(EventBus):
     async def publish(self, topic: str, payload: Any) -> None:
         if self._redis is None:
             raise RuntimeError("EventBus nao iniciado: chame start() antes de publish()")
-        body = payload.model_dump_json() if hasattr(payload, "model_dump_json") else json.dumps(payload)
+        body = (
+            payload.model_dump_json()
+            if hasattr(payload, "model_dump_json")
+            else json.dumps(payload)
+        )
         await self._redis.xadd(topic, {"data": body}, maxlen=MAX_STREAM_LENGTH, approximate=True)
 
     async def subscribe(self, topic: str) -> AsyncIterator[Any]:
