@@ -360,8 +360,15 @@ class TradeRepository:
         return True
 
     async def realized_pnl_total(self) -> Decimal:
-        stmt = select(func.sum(orm.Trade.realized_pnl))
-        return _as_decimal((await self._session.execute(stmt)).scalar_one_or_none())
+        """Soma o PnL realizado em Python, nao com `SUM()` no banco.
+
+        No SQLite estas colunas sao texto (ver `db.models.Money`), e deixar o
+        banco somar forcaria uma conversao para float -- reintroduzindo pela
+        agregacao o erro de precisao que o tipo evita no armazenamento.
+        """
+        stmt = select(orm.Trade.realized_pnl).where(orm.Trade.realized_pnl.is_not(None))
+        values = (await self._session.execute(stmt)).scalars().all()
+        return sum((_as_decimal(value) for value in values), start=Decimal(0))
 
 
 class PortfolioSnapshotRepository:

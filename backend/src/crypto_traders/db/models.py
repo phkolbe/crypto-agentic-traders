@@ -10,22 +10,70 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import (
     JSON,
     Boolean,
     DateTime,
+    Dialect,
     Index,
     Integer,
     Numeric,
     String,
     Text,
+    TypeDecorator,
     UniqueConstraint,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-#: Precisao ampla o suficiente para satoshis (8 casas) e para tokens com 18 casas.
-MONEY = Numeric(38, 18)
+#: Precisao ampla o suficiente para satoshis (8 casas) e tokens com 18 casas.
+MONEY_PRECISION = Numeric(38, 18)
+
+
+class Money(TypeDecorator):
+    """Valor monetario exato, em SQLite e em PostgreSQL.
+
+    O SQLite nao tem tipo decimal nativo: um `Numeric` la vira `REAL`, ou seja,
+    float64. Isso e suficiente para estragar dinheiro de verdade -- gravar
+    `0.4` e ler `0.400000000000000022` foi exatamente o que aconteceu antes
+    deste tipo existir, e o erro se propaga por PnL, custo medio e exportacao
+    fiscal.
+
+    A solucao e guardar o decimal como TEXTO no SQLite (representacao exata) e
+    como `NUMERIC` no PostgreSQL, que tem decimal de verdade. A conversao para
+    `Decimal` acontece na leitura, nos dois casos.
+
+    Consequencia a lembrar: no SQLite estas colunas sao texto, entao `ORDER BY`
+    e comparacoes numericas em SQL sobre elas nao sao confiaveis. Nenhuma query
+    do projeto faz isso -- agregacoes de dinheiro sao somadas em Python.
+    """
+
+    impl = Numeric
+    cache_ok = True
+
+    def load_dialect_impl(self, dialect: Dialect) -> Any:
+        if dialect.name == "sqlite":
+            return dialect.type_descriptor(String(64))
+        return dialect.type_descriptor(MONEY_PRECISION)
+
+    def process_bind_param(self, value: Any, dialect: Dialect) -> Any:
+        if value is None:
+            return None
+        number = value if isinstance(value, Decimal) else Decimal(str(value))
+        if dialect.name == "sqlite":
+            # `format(..., "f")` evita notacao cientifica: `1E-8` como texto
+            # voltaria como string nao comparavel e confundiria a leitura.
+            return format(number, "f")
+        return number
+
+    def process_result_value(self, value: Any, dialect: Dialect) -> Decimal | None:
+        if value is None:
+            return None
+        return value if isinstance(value, Decimal) else Decimal(str(value))
+
+
+MONEY = Money()
 
 
 def utcnow() -> datetime:
