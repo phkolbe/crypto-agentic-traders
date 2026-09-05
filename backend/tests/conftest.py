@@ -7,7 +7,8 @@ from decimal import Decimal
 import pytest
 from helpers import make_candles
 
-from crypto_traders.config import RiskSettings
+from crypto_traders.config import RiskSettings, Settings
+from crypto_traders.db.session import dispose_engine, init_db
 
 
 @pytest.fixture
@@ -28,6 +29,28 @@ def risk_limits() -> RiskSettings:
         symbol_whitelist=["BTC/USDT", "ETH/USDT"],
         cooldown_seconds=900,
     )
+
+
+@pytest.fixture
+async def settings(tmp_path, risk_limits) -> Settings:
+    """Configuracao apontando para um banco SQLite descartavel.
+
+    O engine do SQLAlchemy e um singleton de modulo, entao precisa ser descartado
+    entre os testes -- caso contrario o segundo teste continuaria escrevendo no
+    banco do primeiro.
+    """
+    await dispose_engine()
+    configured = Settings(
+        database_url=f"sqlite+aiosqlite:///{(tmp_path / 'test.db').as_posix()}",
+        symbols=["BTC/USDT"],
+        strategies=["ma_crossover"],
+        quote_currency="USDT",
+        paper_initial_balance=Decimal("1000"),
+        risk=risk_limits,
+    )
+    await init_db(configured)
+    yield configured
+    await dispose_engine()
 
 
 @pytest.fixture

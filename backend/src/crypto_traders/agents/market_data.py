@@ -40,12 +40,13 @@ class MarketDataAgent(BaseAgent):
     async def _run(self) -> None:
         while True:
             await self.wait_if_paused()
-            await self._cycle()
+            await self.refresh()
             await self.heartbeat(detail=f"{len(self.latest_prices)} precos")
             if not await self.sleep(self._settings.market_data_interval_seconds):
                 return
 
-    async def _cycle(self) -> None:
+    async def refresh(self) -> None:
+        """Um ciclo de coleta. Publico para o orquestrador poder aquecer o sistema."""
         for symbol in self._settings.symbols:
             try:
                 await self._fetch_symbol(symbol)

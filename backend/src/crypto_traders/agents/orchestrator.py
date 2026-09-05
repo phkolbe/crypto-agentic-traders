@@ -1,0 +1,301 @@
+"""Orquestrador.
+
+Monta os agentes, gerencia o ciclo de vida coletivo, vigia heartbeats e expoe o
+controle usado pela API (pausar, retomar, ajustar limites, rearmar o circuit
+breaker).
+
+Nao contem logica de trading -- e a camada fina que faz as pecas conversarem.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+from ..bus import EventBus, Topics, build_event_bus
+from ..config import Settings, get_settings
+from ..db.repositories import AuditLogRepository
+from ..db.session import init_db, session_scope
+from ..domain.enums import AgentState, TradingMode
+from ..domain.models import PortfolioSnapshot
+from ..exchanges import build_broker, build_market_data_source
+from ..exchanges.base import Broker, MarketDataSource
+from ..logging_setup import get_logger
+from ..notifications import Notifier, build_notifier
+from ..strategies import build_strategies
+from .base import BaseAgent
+from .execution import ExecutionAgent
+from .market_data import MarketDataAgent
+from .portfolio import PortfolioAgent
+from .risk_manager import RiskManagerAgent
+from .strategy import StrategyAgent
+
+log = get_logger(__name__)
+
+#: Sem heartbeat por mais que isso, o agente e considerado travado.
+HEARTBEAT_TIMEOUT = timedelta(minutes=10)
+
+#: Intervalo da vigilancia de saude.
+WATCHDOG_INTERVAL_SECONDS = 60
+
+
+class Orchestrator:
+    """Dono do ciclo de vida de todos os agentes."""
+
+    def __init__(self, settings: Settings | None = None) -> None:
+        self.settings = settings or get_settings()
+        self.bus: EventBus = build_event_bus(self.settings)
+        self.notifier: Notifier = build_notifier(self.settings)
+
+        self._source: MarketDataSource | None = None
+        self._broker: Broker | None = None
+        self._watchdog: asyncio.Task[None] | None = None
+        self._alert_listener: asyncio.Task[None] | None = None
+        self.started_at: datetime | None = None
+
+        self.market_data: MarketDataAgent
+        self.strategy: StrategyAgent
+        self.risk_manager: RiskManagerAgent
+        self.execution: ExecutionAgent
+        self.portfolio: PortfolioAgent
+
+    # ------------------------------------------------------------------
+    @property
+    def agents(self) -> dict[str, BaseAgent]:
+        return {
+            agent.name: agent
+            for agent in (
+                self.market_data,
+                self.strategy,
+                self.risk_manager,
+                self.execution,
+                self.portfolio,
+            )
+        }
+
+    async def start(self) -> None:
+        await init_db(self.settings)
+        await self.bus.start()
+
+        self._source = build_market_data_source(
+            self.settings.exchange, testnet=self.settings.trading_mode is TradingMode.TESTNET
+        )
+        self._broker = build_broker(self.settings)
+
+        self.market_data = MarketDataAgent(self.bus, self._source, self.settings)
+        self.strategy = StrategyAgent(
+            self.bus, build_strategies(self.settings.strategies), self.settings
+        )
+        self.risk_manager = RiskManagerAgent(self.bus, self.settings)
+        self.execution = ExecutionAgent(self.bus, self._broker, self.settings)
+        self.portfolio = PortfolioAgent(
+            self.bus,
+            self._broker,
+            self.settings,
+            price_source=lambda: dict(self.market_data.latest_prices),
+            on_snapshot=self._on_snapshot,
+        )
+
+        if self.settings.is_live:
+            log.warning(
+                "orchestrator.live_trading",
+                exchange=self.settings.exchange,
+                message="ORDENS SERAO ENVIADAS COM DINHEIRO REAL",
+            )
+
+        # Consumidores antes dos produtores: o Market Data Agent so pode publicar
+        # depois que Strategy, Risk e Execution ja estao inscritos no bus, senao
+        # os primeiros candles caem no vazio.
+        for agent in (self.execution, self.risk_manager, self.strategy):
+            await agent.start()
+        await asyncio.sleep(0)
+
+        await self.market_data.start()
+
+        # Primeiro snapshot antes de liberar o Portfolio Agent no ciclo normal:
+        # sem ele o Risk Manager rejeita tudo por falta de retrato do portfolio.
+        await self._prime_portfolio()
+        await self.portfolio.start()
+
+        self._alert_listener = asyncio.create_task(self._listen_alerts(), name="alert-listener")
+        self._watchdog = asyncio.create_task(self._watch_health(), name="watchdog")
+        self.started_at = datetime.now(UTC)
+
+        async with session_scope(self.settings) as session:
+            await AuditLogRepository(session).append(
+                action="system_started",
+                target="orchestrator",
+                after={
+                    "mode": str(self.settings.trading_mode),
+                    "exchange": self.settings.exchange,
+                    "symbols": self.settings.symbols,
+                    "strategies": self.settings.strategies,
+                },
+            )
+        log.info("orchestrator.started", mode=str(self.settings.trading_mode))
+
+    async def _prime_portfolio(self) -> None:
+        """Alimenta precos e produz o snapshot inicial."""
+        try:
+            await self.market_data.refresh()
+            self._sync_paper_prices()
+            snapshot = await self.portfolio.build_snapshot()
+            self.risk_manager.observe_snapshot(snapshot)
+        except Exception as exc:
+            # Sem snapshot inicial o sistema sobe mesmo assim: o Risk Manager
+            # simplesmente rejeita sinais ate o primeiro ciclo do Portfolio Agent.
+            log.warning("orchestrator.portfolio_priming_failed", error=str(exc))
+
+    async def stop(self) -> None:
+        for task in (self._watchdog, self._alert_listener):
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        self._watchdog = self._alert_listener = None
+
+        for agent in self.agents.values():
+            with contextlib.suppress(Exception):
+                await agent.stop()
+
+        # O broker e compartilhado entre Execution e Portfolio, entao quem o
+        # criou e quem o fecha -- uma unica vez.
+        for resource in (self._broker, self._source):
+            if resource is not None:
+                with contextlib.suppress(Exception):
+                    await resource.close()
+
+        await self.bus.stop()
+        log.info("orchestrator.stopped")
+
+    # ------------------------------------------------------------------
+    # Controle (usado pela API)
+    # ------------------------------------------------------------------
+    async def pause_agent(self, name: str, actor: str = "user") -> bool:
+        agent = self.agents.get(name)
+        if agent is None:
+            return False
+        agent.pause()
+        await self._audit("agent_paused", name, actor)
+        return True
+
+    async def resume_agent(self, name: str, actor: str = "user") -> bool:
+        agent = self.agents.get(name)
+        if agent is None:
+            return False
+        agent.resume()
+        await self._audit("agent_resumed", name, actor)
+        return True
+
+    async def pause_all(self, actor: str = "system", reason: str | None = None) -> None:
+        """Para a tomada de decisao, mantendo a coleta de dados viva.
+
+        O Market Data Agent segue rodando de proposito: sem preco atualizado o
+        dashboard congela e o circuit breaker perde a referencia para saber
+        quando seria seguro voltar.
+        """
+        for name in ("strategy", "risk_manager", "execution"):
+            self.agents[name].pause()
+        await self._audit("all_agents_paused", "system", actor, reason)
+        log.warning("orchestrator.paused_all", reason=reason)
+
+    async def resume_all(self, actor: str = "user") -> None:
+        for agent in self.agents.values():
+            agent.resume()
+        await self._audit("all_agents_resumed", "system", actor)
+
+    async def health(self) -> dict[str, Any]:
+        now = datetime.now(UTC)
+        agents = {}
+        for name, agent in self.agents.items():
+            stale = agent.last_beat is not None and (now - agent.last_beat) > HEARTBEAT_TIMEOUT
+            agents[name] = {
+                "state": str(agent.state),
+                "running": agent.is_running,
+                "paused": agent.is_paused,
+                "last_heartbeat": agent.last_beat.isoformat() if agent.last_beat else None,
+                "stale": stale,
+                "last_error": agent.last_error,
+            }
+        return {
+            "mode": str(self.settings.trading_mode),
+            "exchange": self.settings.exchange,
+            "symbols": self.settings.symbols,
+            "strategies": self.strategy.strategy_names,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "circuit_breaker_active": self.risk_manager.circuit_breaker_active,
+            "agents": agents,
+        }
+
+    # ------------------------------------------------------------------
+    async def _on_snapshot(self, snapshot: PortfolioSnapshot) -> None:
+        """Cada snapshot alimenta o Risk Manager e reavalia o circuit breaker."""
+        self.risk_manager.observe_snapshot(snapshot)
+        self._sync_paper_prices()
+
+        reason = await self.risk_manager.check_circuit_breaker(snapshot)
+        if reason:
+            await self.pause_all(actor="circuit_breaker", reason=reason)
+            await self.notifier.send(
+                "Circuit breaker acionado",
+                f"{reason}\n\nTodos os agentes de decisao foram pausados. "
+                "O rearme e manual, pela interface.",
+            )
+
+    def _sync_paper_prices(self) -> None:
+        """Mantem o PaperBroker com precos de mercado reais.
+
+        Em dry_run o broker simulado nao tem de onde tirar preco sozinho; sem
+        isso ele recusaria toda ordem a mercado por falta de referencia.
+        Brokers reais ignoram esta chamada.
+        """
+        setter = getattr(self._broker, "set_prices", None)
+        if setter is not None:
+            setter(dict(self.market_data.latest_prices))
+
+    async def _listen_alerts(self) -> None:
+        async for alert in self.bus.subscribe(Topics.ALERTS):
+            log.warning("orchestrator.alert", **alert)
+
+    async def _watch_health(self) -> None:
+        """Reinicia agentes que morreram ou pararam de dar sinal de vida.
+
+        Um agente morto em silencio e o pior cenario: o sistema parece saudavel
+        enquanto uma etapa da cadeia deixou de existir.
+        """
+        while True:
+            await asyncio.sleep(WATCHDOG_INTERVAL_SECONDS)
+            now = datetime.now(UTC)
+            for name, agent in self.agents.items():
+                crashed = agent.state is AgentState.ERROR or not agent.is_running
+                stale = (
+                    agent.last_beat is not None
+                    and (now - agent.last_beat) > HEARTBEAT_TIMEOUT
+                    and not agent.is_paused
+                )
+                if crashed or stale:
+                    log.error(
+                        "orchestrator.restarting_agent",
+                        agent=name,
+                        crashed=crashed,
+                        stale=stale,
+                        error=agent.last_error,
+                    )
+                    await self.notifier.send(
+                        f"Agente '{name}' reiniciado",
+                        f"motivo: {'falha' if crashed else 'heartbeat perdido'}\n"
+                        f"ultimo erro: {agent.last_error or 'nenhum'}",
+                    )
+                    with contextlib.suppress(Exception):
+                        await agent.stop()
+                    await agent.start()
+
+    async def _audit(
+        self, action: str, target: str, actor: str, detail: str | None = None
+    ) -> None:
+        async with session_scope(self.settings) as session:
+            await AuditLogRepository(session).append(
+                action=action, actor=actor, target=target, detail=detail
+            )
