@@ -177,6 +177,9 @@ export default function Dashboard({ feed }: { feed: { event: string; data: any; 
                   stroke="#58a6ff"
                   strokeWidth={2}
                   fill="url(#equity)"
+                  // O grafico e reavaliado a cada snapshot de portfolio; sem
+                  // isso a curva se redesenharia do zero a cada minuto.
+                  isAnimationActive={false}
                 />
               </AreaChart>
             </ResponsiveContainer>
@@ -199,9 +202,14 @@ export default function Dashboard({ feed }: { feed: { event: string; data: any; 
                     innerRadius={48}
                     outerRadius={78}
                     // Sem espacamento quando ha uma fatia so: num circulo
-                    // completo o paddingAngle zera o setor e o donut some.
+                    // completo o paddingAngle zera o setor.
                     paddingAngle={allocations.length > 1 ? 2 : 0}
                     stroke="none"
+                    // Sem animacao de entrada: quando ela nao completa, o setor
+                    // fica congelado em um quadro degenerado e o donut some.
+                    // Alem disso o dashboard re-renderiza a cada evento do
+                    // WebSocket, e a animacao recomecaria do zero toda vez.
+                    isAnimationActive={false}
                   >
                     {allocations.map((entry, index) => (
                       <Cell

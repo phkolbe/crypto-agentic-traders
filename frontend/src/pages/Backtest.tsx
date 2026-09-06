@@ -195,6 +195,7 @@ export default function Backtest() {
                       stroke="#58a6ff"
                       strokeWidth={2}
                       dot={false}
+                      isAnimationActive={false}
                     />
                   </LineChart>
                 </ResponsiveContainer>
