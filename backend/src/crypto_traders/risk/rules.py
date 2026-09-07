@@ -71,6 +71,84 @@ class PortfolioState:
         )
 
 
+@dataclass(frozen=True)
+class SizingFeasibility:
+    """Diagnostico: com estes limites e este patrimonio, alguma ordem e possivel?
+
+    Existe porque a combinacao "carteira pequena + limites conservadores" produz
+    o pior estado do sistema: ele sobe, coleta dados, gera sinais e rejeita
+    TODOS em silencio -- heartbeat verde, dashboard atualizando, e o motivo
+    enterrado numa mensagem tecnica em `risk_events`. Parece saudavel e nunca
+    vai operar.
+
+    Exemplo real: R$100 (~19 USDT) com os padroes de fabrica da 2% por ordem, ou
+    seja 39 centavos -- abaixo do minimo de 10 USDT e do proprio minimo da
+    Binance (5 USDT). Nenhuma ordem jamais sairia.
+    """
+
+    feasible: bool
+    portfolio_value: Decimal
+    max_possible_order: Decimal
+    min_order_notional: Decimal
+    binding_limit: str
+    """Qual limite trava o dimensionamento no melhor cenario possivel."""
+
+    minimum_portfolio: Decimal
+    """Patrimonio minimo para que uma ordem passe, sem mexer em nenhum limite."""
+
+    def explain(self, quote_currency: str = "USDT") -> str:
+        if self.feasible:
+            return (
+                f"maior ordem possivel: {self.max_possible_order:.2f} {quote_currency} "
+                f"(limitada por {self.binding_limit})"
+            )
+        return (
+            f"NENHUMA ordem e possivel: o patrimonio de {self.portfolio_value:.2f} "
+            f"{quote_currency} permite no maximo {self.max_possible_order:.2f} "
+            f"(travado por {self.binding_limit}), mas o minimo por ordem e "
+            f"{self.min_order_notional:.2f}. Seriam necessarios ao menos "
+            f"{self.minimum_portfolio:.2f} {quote_currency} para operar com os "
+            f"limites atuais."
+        )
+
+
+def assess_sizing_feasibility(
+    limits: RiskSettings, portfolio_value: Decimal
+) -> SizingFeasibility:
+    """Avalia o MELHOR cenario: carteira toda em caixa, sem posicao no ativo.
+
+    Se nem assim uma ordem passa, nenhuma passara jamais -- e o operador precisa
+    saber disso na subida, nao depois de dias olhando um dashboard que nunca
+    registra operacao.
+    """
+    pct_cap = portfolio_value * Decimal(str(limits.max_order_pct_portfolio))
+    exposure_cap = portfolio_value * Decimal(str(limits.max_asset_exposure_pct))
+
+    candidates = {
+        "teto absoluto por ordem": limits.max_order_notional,
+        f"{limits.max_order_pct_portfolio:.0%} do portfolio por ordem": pct_cap,
+        f"exposicao maxima de {limits.max_asset_exposure_pct:.0%} por ativo": exposure_cap,
+    }
+    binding_limit, max_possible = min(candidates.items(), key=lambda item: item[1])
+
+    # O gargalo e sempre o menor entre o percentual por ordem e a exposicao
+    # maxima -- foi a exposicao que travou o caso de R$100 mesmo depois de
+    # afrouxar o percentual, e apontar o limite errado manda investigar em vao.
+    tightest_pct = Decimal(
+        str(min(limits.max_order_pct_portfolio, limits.max_asset_exposure_pct))
+    )
+    minimum_portfolio = (limits.min_order_notional / tightest_pct).quantize(Decimal("0.01"))
+
+    return SizingFeasibility(
+        feasible=max_possible >= limits.min_order_notional,
+        portfolio_value=portfolio_value,
+        max_possible_order=max_possible,
+        min_order_notional=limits.min_order_notional,
+        binding_limit=binding_limit,
+        minimum_portfolio=minimum_portfolio,
+    )
+
+
 class RiskEngine:
     """Aplica todas as regras de risco a um sinal."""
 

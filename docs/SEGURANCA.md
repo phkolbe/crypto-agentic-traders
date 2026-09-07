@@ -131,6 +131,31 @@ rejeitar:
 Uma estratégia nova, escrita meses depois, não tem como esquecer de definir stop:
 ela nem participa dessa etapa.
 
+### Patrimônio pequeno demais para os limites
+
+Uma combinação silenciosa e enganosa: carteira pequena com limites conservadores
+faz o Risk Manager rejeitar **todo** sinal, e o sistema fica de pé com heartbeat
+verde, dashboard atualizando e nenhuma operação — parecendo saudável.
+
+Números reais: R$100 (~19 USDT) com os padrões de fábrica dá 2% = **39 centavos**
+por ordem, abaixo do mínimo de 10 USDT e do próprio mínimo da Binance (5 USDT).
+Nenhuma ordem sairia jamais. O menor patrimônio que funciona sem mexer em limite
+é ~500 USDT (R$2.600).
+
+Por isso `assess_sizing_feasibility` avalia o **melhor cenário possível** (carteira
+toda em caixa, sem posição no ativo). Se nem assim uma ordem passa, nenhuma
+passará, e isso aparece em três lugares: o `check` falha com código 1, o
+orquestrador dispara alerta no primeiro snapshot, e o dashboard mostra uma faixa
+vermelha no topo.
+
+O alerta sai **uma vez por transição**, não a cada snapshot — o Portfolio Agent
+produz um por minuto, e avisar sempre viraria ruído.
+
+Detalhe que importa no diagnóstico: o gargalo nem sempre é o percentual por
+ordem. Em R$100, mesmo subindo `RISK_MAX_ORDER_PCT_PORTFOLIO` para 55%, quem
+travava era a **exposição máxima por ativo** (30%). A mensagem nomeia o limite
+que de fato está travando, porque apontar o errado manda investigar em vão.
+
 ### Circuit breaker
 
 Se o portfólio cair além do limite configurado (diário ou semanal), todos os

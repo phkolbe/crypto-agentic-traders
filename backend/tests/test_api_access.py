@@ -265,7 +265,10 @@ class TestCheckCommand:
         """Em dry_run o broker é simulado: exigir chave travaria o uso normal."""
         from crypto_traders.cli import _check_credentials
 
-        assert await _check_credentials(settings) is True
+        ok, balance = await _check_credentials(settings)
+        assert ok is True
+        # Sem credencial real, o dimensionamento cai no saldo simulado.
+        assert balance is None
         assert "nao exigida em dry_run" in capsys.readouterr().out
 
     async def test_testnet_without_credentials_fails(self, settings, capsys):
@@ -273,7 +276,8 @@ class TestCheckCommand:
         from crypto_traders.domain.enums import TradingMode
 
         configured = settings.model_copy(update={"trading_mode": TradingMode.TESTNET})
-        assert await _check_credentials(configured) is False
+        ok, _ = await _check_credentials(configured)
+        assert ok is False
         assert "AUSENTE" in capsys.readouterr().out
 
     async def test_denied_credentials_fail_and_show_the_current_ip(
@@ -306,7 +310,8 @@ class TestCheckCommand:
 
         monkeypatch.setattr(cli, "_print_public_ip", fake_ip)
 
-        assert await cli._check_credentials(configured) is False
+        ok, _ = await cli._check_credentials(configured)
+        assert ok is False
         output = capsys.readouterr().out
         assert "ACESSO NEGADO" in output
         assert "203.0.113.7" in output
@@ -333,7 +338,11 @@ class TestCheckCommand:
 
         monkeypatch.setattr("crypto_traders.exchanges.CcxtExchange", Working)
 
-        assert await cli._check_credentials(configured) is True
+        ok, balance = await cli._check_credentials(configured)
+        assert ok is True
+        # O saldo real alimenta a checagem de dimensionamento: em testnet/live o
+        # que vale e o dinheiro na conta, nao o saldo simulado do .env.
+        assert balance == Decimal("1000")
         output = capsys.readouterr().out
         assert "leitura de saldo OK" in output
         assert "BTC" in output and "USDT" in output

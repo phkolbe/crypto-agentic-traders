@@ -165,7 +165,11 @@ async def _check(settings) -> int:
         print(f"    FALHOU — {exc}")
         return 1
 
-    if not await _check_credentials(settings):
+    credentials_ok, quote_balance = await _check_credentials(settings)
+    if not credentials_ok:
+        return 1
+
+    if not _check_sizing(settings, quote_balance):
         return 1
 
     if settings.is_live:
@@ -177,13 +181,60 @@ async def _check(settings) -> int:
     return 0
 
 
-async def _check_credentials(settings) -> bool:
+def _check_sizing(settings, quote_balance: Decimal | None = None) -> bool:
+    """Confere se patrimonio e limites permitem alguma ordem existir.
+
+    Sem esta checagem, o diagnostico diria "tudo pronto" para uma configuracao
+    em que todo sinal sera rejeitado -- e o sistema ficaria dias de pe, com
+    heartbeat verde, sem nunca operar.
+
+    Em `dry_run` usa o saldo simulado. Nos modos reais usa o saldo em moeda de
+    cotacao, que e o poder de compra efetivo.
+    """
+    from .risk.rules import assess_sizing_feasibility
+
+    quote = settings.quote_currency
+    if quote_balance is not None:
+        balance = quote_balance
+        origin = f"saldo real em {quote} na exchange"
+    else:
+        balance = settings.paper_initial_balance
+        origin = f"saldo simulado ({quote})"
+
+    print("\n  Dimensionamento de ordens:")
+    result = assess_sizing_feasibility(settings.risk, balance)
+    print(f"    patrimonio de referencia: {balance:.2f} {quote} — {origin}")
+
+    if result.feasible:
+        print(f"    {result.explain(quote)}")
+        return True
+
+    print("    " + "!" * 62)
+    for line in _wrap(result.explain(quote), 60):
+        print(f"    {line}")
+    print("    Aumente o patrimonio, ou reduza RISK_MIN_ORDER_NOTIONAL e suba")
+    print("    RISK_MAX_ORDER_PCT_PORTFOLIO / RISK_MAX_ASSET_EXPOSURE_PCT.")
+    print("    " + "!" * 62)
+    return False
+
+
+def _wrap(text: str, width: int) -> list[str]:
+    import textwrap
+
+    return textwrap.wrap(text, width=width)
+
+
+async def _check_credentials(settings) -> tuple[bool, Decimal | None]:
     """Valida a credencial contra um endpoint AUTENTICADO da exchange.
 
     A checagem de conectividade acima usa apenas endpoints publicos, que
     funcionam mesmo com a chave bloqueada. Sem esta sonda, o diagnostico diria
     "tudo pronto" para um sistema que nao consegue enviar uma unica ordem --
     e a descoberta viria na primeira tentativa de operar.
+
+    Devolve `(ok, saldo_em_moeda_de_cotacao)`. O saldo alimenta a checagem de
+    dimensionamento: em testnet/live o que vale e o dinheiro que existe na
+    conta, nao o saldo simulado do `.env`.
     """
     from .exchanges import CcxtExchange
     from .exchanges.base import ApiAccessDenied
@@ -194,12 +245,12 @@ async def _check_credentials(settings) -> bool:
         print("\n  Credencial de negociacao: nao exigida em dry_run (broker simulado).")
         if credentials.configured:
             print("    Chave presente no .env, mas nao sera usada neste modo.")
-        return True
+        return True, None
 
     if not credentials.configured:
         print(f"\n  Credencial de negociacao: AUSENTE para '{settings.exchange}'.")
         print(f"    TRADING_MODE={settings.trading_mode} exige chave de API no .env.")
-        return False
+        return False, None
 
     print("\n  Credencial de negociacao (endpoint autenticado):")
     client = CcxtExchange(
@@ -213,17 +264,17 @@ async def _check_credentials(settings) -> bool:
         print("    ACESSO NEGADO pela exchange.")
         print(f"    {exc}")
         await _print_public_ip()
-        return False
+        return False, None
     except Exception as exc:
         print(f"    FALHOU — {exc}")
-        return False
+        return False, None
     finally:
         await client.close()
 
     assets = ", ".join(sorted(balances)) if balances else "nenhum saldo positivo"
     print(f"    leitura de saldo OK — ativos: {assets}")
     print("    (envio de ordem nao e testado aqui: isso exigiria uma ordem real)")
-    return True
+    return True, balances.get(settings.quote_currency)
 
 
 async def _print_public_ip() -> None:

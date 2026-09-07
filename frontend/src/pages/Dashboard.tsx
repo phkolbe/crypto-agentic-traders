@@ -21,6 +21,7 @@ import {
   Empty,
   Loading,
   ModeBanner,
+  SizingBanner,
   Stat,
   useHealth,
 } from '../components/Shared'
@@ -77,6 +78,7 @@ export default function Dashboard({ feed }: { feed: { event: string; data: any; 
       </div>
 
       <ModeBanner health={health.data} />
+      <SizingBanner health={health.data} />
       <CircuitBreakerBanner
         active={health.data?.circuit_breaker_active ?? false}
         onReset={() => reset.mutate()}

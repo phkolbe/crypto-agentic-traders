@@ -175,6 +175,9 @@ export interface Health {
   strategies: string[]
   started_at: string | null
   circuit_breaker_active: boolean
+  /** False quando patrimônio e limites tornam qualquer ordem impossível. */
+  sizing_feasible: boolean
+  sizing_detail: string | null
   agents: Record<string, AgentStatus>
 }
 

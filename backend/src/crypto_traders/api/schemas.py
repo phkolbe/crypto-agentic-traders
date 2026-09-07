@@ -235,6 +235,10 @@ class HealthOut(BaseModel):
     strategies: list[str]
     started_at: datetime | None
     circuit_breaker_active: bool
+    sizing_feasible: bool = True
+    """False quando patrimonio e limites tornam qualquer ordem impossivel."""
+
+    sizing_detail: str | None = None
     agents: dict[str, AgentStatusOut]
 
 

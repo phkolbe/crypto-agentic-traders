@@ -25,6 +25,7 @@ from ..exchanges import build_broker, build_market_data_source
 from ..exchanges.base import Broker, MarketDataSource
 from ..logging_setup import get_logger
 from ..notifications import Notifier, build_notifier
+from ..risk.rules import SizingFeasibility, assess_sizing_feasibility
 from ..strategies import build_strategies
 from .base import BaseAgent
 from .execution import ExecutionAgent
@@ -55,6 +56,9 @@ class Orchestrator:
         self._watchdog: asyncio.Task[None] | None = None
         self._alert_listener: asyncio.Task[None] | None = None
         self.started_at: datetime | None = None
+        self.sizing: SizingFeasibility | None = None
+        self._sizing_alerted = False
+        """Alerta de dimensionamento sai uma vez por transicao, nao a cada snapshot."""
 
         self.market_data: MarketDataAgent
         self.strategy: StrategyAgent
@@ -238,6 +242,10 @@ class Orchestrator:
             "strategies": self.strategy.strategy_names,
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "circuit_breaker_active": self.risk_manager.circuit_breaker_active,
+            "sizing_feasible": self.sizing.feasible if self.sizing else True,
+            "sizing_detail": (
+                self.sizing.explain(self.settings.quote_currency) if self.sizing else None
+            ),
             "agents": agents,
         }
 
@@ -246,6 +254,8 @@ class Orchestrator:
         """Cada snapshot alimenta o Risk Manager e reavalia o circuit breaker."""
         self.risk_manager.observe_snapshot(snapshot)
         self._sync_paper_prices()
+
+        await self._check_sizing(snapshot)
 
         reason = await self.risk_manager.check_circuit_breaker(snapshot)
         if reason:
@@ -271,6 +281,46 @@ class Orchestrator:
                     f"Pares selecionados por liquidez: {', '.join(result.symbols)}\n"
                     f"({result.considered} pares avaliados, "
                     f"{result.rejected_low_volume} abaixo do piso de volume)"
+                ),
+                "timestamp": datetime.now(UTC).isoformat(),
+            },
+        )
+
+    async def _check_sizing(self, snapshot: PortfolioSnapshot) -> None:
+        """Avisa quando patrimonio e limites tornam qualquer ordem impossivel.
+
+        Sem isso o sistema fica no pior estado que existe: de pe, com heartbeat
+        verde e dashboard atualizando, rejeitando todo sinal em silencio -- e o
+        motivo enterrado numa mensagem tecnica em `risk_events`.
+        """
+        result = assess_sizing_feasibility(self.risk_manager.limits, snapshot.total_value)
+        self.sizing = result
+
+        if result.feasible:
+            if self._sizing_alerted:
+                self._sizing_alerted = False
+                log.info(
+                    "orchestrator.sizing_ok",
+                    detail=result.explain(self.settings.quote_currency),
+                )
+            return
+
+        if self._sizing_alerted:
+            return
+
+        self._sizing_alerted = True
+        explanation = result.explain(self.settings.quote_currency)
+        log.error("orchestrator.sizing_infeasible", detail=explanation)
+        await self.bus.publish(
+            Topics.ALERTS,
+            {
+                "type": "sizing_infeasible",
+                "title": "Nenhuma ordem e possivel com o patrimonio atual",
+                "message": (
+                    explanation + "\n\n"
+                    "O sistema vai continuar coletando dados e gerando sinais, mas "
+                    "TODOS serao rejeitados. Aumente o patrimonio ou ajuste os "
+                    "limites de risco na interface."
                 ),
                 "timestamp": datetime.now(UTC).isoformat(),
             },

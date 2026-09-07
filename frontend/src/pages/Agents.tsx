@@ -11,6 +11,7 @@ import {
   Empty,
   Loading,
   ModeBanner,
+  SizingBanner,
   useHealth,
 } from '../components/Shared'
 
@@ -86,6 +87,7 @@ export default function Agents() {
       </div>
 
       <ModeBanner health={health.data} />
+      <SizingBanner health={health.data} />
       <CircuitBreakerBanner
         active={health.data?.circuit_breaker_active ?? false}
         onReset={() => resetBreaker.mutate()}

@@ -95,6 +95,27 @@ export function ModeBanner({ health }: { health: Health | undefined }) {
   )
 }
 
+/**
+ * Aviso de que nenhuma ordem e possivel com o patrimonio e os limites atuais.
+ *
+ * Fica no topo porque o sintoma sem ele e enganoso: o sistema parece saudavel,
+ * coleta dados e gera sinais, mas rejeita todos em silencio.
+ */
+export function SizingBanner({ health }: { health: Health | undefined }) {
+  if (!health || health.sizing_feasible) return null
+  return (
+    <div className="alert-banner">
+      <div>
+        <strong>Nenhuma ordem é possível com o patrimônio atual.</strong>{' '}
+        <span className="muted">
+          {health.sizing_detail} Os agentes continuam gerando sinais, mas todos serão
+          rejeitados. Ajuste os limites em <strong>Risco</strong> ou aumente o patrimônio.
+        </span>
+      </div>
+    </div>
+  )
+}
+
 export function CircuitBreakerBanner({
   active,
   reason,
