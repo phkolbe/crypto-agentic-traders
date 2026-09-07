@@ -88,7 +88,8 @@ export function ModeBanner({ health }: { health: Health | undefined }) {
         <strong>{MODE_LABEL[mode] ?? mode}</strong> · {message}
       </span>
       <span className="faint" style={{ marginLeft: 'auto', fontSize: 12 }}>
-        {health.exchange} · {health.symbols.join(', ')}
+        {health.exchange} · {health.symbols.join(', ') || 'sem pares'}
+        {health.symbols_source === 'descoberta' && ' · descoberta automática'}
       </span>
     </div>
   )

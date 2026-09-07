@@ -96,7 +96,8 @@ export default function ManualTrade() {
                 <label>Exchange</label>
                 <select value={form.exchange} onChange={(e) => update('exchange')(e.target.value)}>
                   <option value="binance">Binance</option>
-                  <option value="coinbase">Coinbase</option>
+                  {/* "outra" continua disponivel: um lancamento manual pode vir
+                      de qualquer lugar, mesmo o sistema operando so na Binance. */}
                   <option value="outra">Outra</option>
                 </select>
               </div>

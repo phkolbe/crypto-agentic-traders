@@ -19,6 +19,11 @@ from .domain.enums import TradingMode
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "crypto_traders.db"
 
+#: Exchanges suportadas nesta fase. A Coinbase esta na fase 5 do roadmap: o
+#: adapter ccxt ja e generico, entao adiciona-la e reintroduzir a credencial e o
+#: nome aqui -- nao ha codigo de agente a mudar.
+SUPPORTED_EXCHANGES = frozenset({"binance"})
+
 
 class ExchangeCredentials(BaseSettings):
     """Credenciais de uma exchange. `SecretStr` evita vazamento acidental em log/repr."""
@@ -183,6 +188,25 @@ class Settings(BaseSettings):
     )
     timeframe: str = "15m"
     candle_history_limit: int = 500
+
+    # --- Descoberta automatica de pares ("mar aberto") --------------------
+    # Vale apenas quando SYMBOLS esta vazio. Ver `discovery.py` para o que isso
+    # muda na camada de seguranca da whitelist.
+    discovery_min_quote_volume_24h: Decimal = Field(
+        default=Decimal("50000000"),
+        gt=0,
+        description="Piso de liquidez em 24h. Dos 487 pares USDT da Binance, 312 movem <1M/dia.",
+    )
+    discovery_max_symbols: int = Field(
+        default=8, ge=1, le=50, description="Teto de pares monitorados na descoberta."
+    )
+    discovery_exclude_assets: Annotated[list[str], NoDecode] = Field(
+        default_factory=list,
+        description="Ativos a excluir alem das stablecoins ja excluidas por padrao.",
+    )
+    discovery_refresh_hours: int = Field(
+        default=24, ge=1, description="Intervalo entre novas varreduras de mercado."
+    )
     market_data_interval_seconds: int = 60
     portfolio_interval_seconds: int = 60
     strategies: Annotated[list[str], NoDecode] = Field(
@@ -195,14 +219,26 @@ class Settings(BaseSettings):
     paper_slippage_pct: Decimal = Decimal("0.0005")
 
     # --- Notificacoes -----------------------------------------------------
-    telegram_bot_token: SecretStr | None = None
-    telegram_chat_id: str | None = None
+    # SEGREDOS dos canais moram aqui, nunca no banco. Liga/desliga e
+    # destinatarios ficam no banco e sao editaveis pela interface.
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_password: SecretStr | None = None
+    smtp_use_tls: bool = True
+    smtp_from: str = ""
+
+    whatsapp_phone_number_id: str = ""
+    whatsapp_access_token: SecretStr | None = None
+    whatsapp_template_name: str = ""
+    whatsapp_template_language: str = "pt_BR"
 
     binance: ExchangeCredentials = Field(default_factory=ExchangeCredentials)
-    coinbase: ExchangeCredentials = Field(default_factory=ExchangeCredentials)
     risk: RiskSettings = Field(default_factory=RiskSettings)
 
-    @field_validator("symbols", "cors_origins", "strategies", mode="before")
+    @field_validator(
+        "symbols", "cors_origins", "strategies", "discovery_exclude_assets", mode="before"
+    )
     @classmethod
     def _split_csv(cls, value: object) -> object:
         if isinstance(value, str):
@@ -210,6 +246,18 @@ class Settings(BaseSettings):
             if stripped.startswith("["):
                 return value
             return [item.strip() for item in stripped.split(",") if item.strip()]
+        return value
+
+    @field_validator("smtp_password", "whatsapp_access_token", mode="before")
+    @classmethod
+    def _blank_secret_is_unset(cls, value: object) -> object:
+        """`SMTP_PASSWORD=` no `.env` e ausencia, nao senha vazia.
+
+        Mesmo motivo das chaves de exchange: `SecretStr('')` e diferente de
+        `None`, e o canal se consideraria configurado para falhar no envio.
+        """
+        if isinstance(value, str) and not value.strip():
+            return None
         return value
 
     @model_validator(mode="after")
@@ -232,6 +280,25 @@ class Settings(BaseSettings):
             )
         return self
 
+    @model_validator(mode="after")
+    def _check_exchange_supported(self) -> Settings:
+        if self.exchange.lower() not in SUPPORTED_EXCHANGES:
+            raise ValueError(
+                f"EXCHANGE='{self.exchange}' nao e suportada nesta fase. "
+                f"Disponiveis: {', '.join(sorted(SUPPORTED_EXCHANGES))}."
+            )
+        return self
+
+    @property
+    def discovery_enabled(self) -> bool:
+        """SYMBOLS vazio significa "descubra os pares", nao "nao faca nada".
+
+        Deixar o sistema de pe sem observar nenhum mercado seria o pior estado
+        possivel: heartbeat verde, dashboard atualizando e nenhuma operacao
+        jamais -- parece saudavel e nao e.
+        """
+        return not self.symbols
+
     @property
     def is_live(self) -> bool:
         return self.trading_mode is TradingMode.LIVE
@@ -242,9 +309,12 @@ class Settings(BaseSettings):
         return self.trading_mode in (TradingMode.LIVE, TradingMode.TESTNET)
 
     def credentials_for(self, exchange: str) -> ExchangeCredentials:
-        return {"binance": self.binance, "coinbase": self.coinbase}.get(
-            exchange.lower(), ExchangeCredentials()
-        )
+        """Credenciais da exchange, ou vazias se ela nao for suportada.
+
+        Devolver vazio (em vez de falhar) mantem o caminho seguro: sem
+        credencial, `build_broker` recusa sair do modo simulado.
+        """
+        return {"binance": self.binance}.get(exchange.lower(), ExchangeCredentials())
 
 
 @lru_cache

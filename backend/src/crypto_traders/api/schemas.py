@@ -229,6 +229,9 @@ class HealthOut(BaseModel):
     mode: str
     exchange: str
     symbols: list[str]
+    symbols_source: str = "configurado"
+    """`configurado` (SYMBOLS no .env) ou `descoberta` (varredura de mercado)."""
+
     strategies: list[str]
     started_at: datetime | None
     circuit_breaker_active: bool
@@ -239,6 +242,43 @@ class StrategyOut(BaseModel):
     name: str
     description: str
     active: bool
+
+
+# ---------------------------------------------------------------------------
+class NotificationChannelStatus(BaseModel):
+    """Se os SEGREDOS do canal estao no `.env`. Nunca devolve o valor deles."""
+
+    configured: bool
+    missing_settings: list[str] = Field(default_factory=list)
+
+
+class NotificationConfigOut(BaseModel):
+    email_enabled: bool
+    email_to: str | None
+    whatsapp_enabled: bool
+    whatsapp_to: str | None
+    email: NotificationChannelStatus
+    whatsapp: NotificationChannelStatus
+
+
+class NotificationConfigIn(BaseModel):
+    """Atualizacao parcial dos canais. Segredos nao passam por aqui."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    email_enabled: bool | None = None
+    email_to: str | None = Field(default=None, max_length=320)
+    whatsapp_enabled: bool | None = None
+    whatsapp_to: str | None = Field(
+        default=None,
+        max_length=32,
+        description="Numero em formato internacional, ex.: 5511999999999",
+    )
+
+
+class NotificationTestOut(BaseModel):
+    results: list[dict[str, Any]]
+    detail: str = ""
 
 
 # ---------------------------------------------------------------------------

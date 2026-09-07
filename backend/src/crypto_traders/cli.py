@@ -78,15 +78,19 @@ async def _check(settings) -> int:
     }[settings.trading_mode]
     print(f"\n  Modo de operacao : {settings.trading_mode}  ->  {mode_label}")
     print(f"  Exchange         : {settings.exchange}")
-    print(f"  Pares            : {', '.join(settings.symbols)}")
+    if settings.discovery_enabled:
+        print("  Pares            : DESCOBERTA AUTOMATICA (SYMBOLS em branco)")
+        print(f"                     ate {settings.discovery_max_symbols} pares com volume 24h "
+              f">= {settings.discovery_min_quote_volume_24h:,.0f} {settings.quote_currency}")
+    else:
+        print(f"  Pares            : {', '.join(settings.symbols)}")
     print(f"  Timeframe        : {settings.timeframe}")
     print(f"  Estrategias      : {', '.join(settings.strategies)}")
 
     print("\n  Credenciais:")
-    for name in ("binance", "coinbase"):
-        credentials = settings.credentials_for(name)
-        status = "configurada" if credentials.configured else "ausente"
-        print(f"    {name:<10} {status}")
+    credentials = settings.credentials_for(settings.exchange)
+    status = "configurada" if credentials.configured else "ausente"
+    print(f"    {settings.exchange:<10} {status}")
     if not settings.sends_real_orders:
         print("    (dados de mercado sao publicos; credenciais so sao exigidas fora do dry_run)")
 
@@ -100,7 +104,14 @@ async def _check(settings) -> int:
     print(f"    circuit breaker   : -{risk.daily_loss_limit_pct:.1%} ao dia, "
           f"-{risk.weekly_loss_limit_pct:.1%} na semana")
     print(f"    cooldown          : {risk.cooldown_seconds}s por par")
-    print(f"    whitelist         : {', '.join(risk.symbol_whitelist)}")
+    if settings.discovery_enabled:
+        # A whitelist do `.env` nao vale neste modo: quem a define e a varredura
+        # de mercado logo abaixo. Mostrar a lista estatica aqui enganaria.
+        print("    whitelist         : definida pela descoberta (ver pares abaixo)")
+        print(f"    max posicoes      : {risk.max_open_positions} "
+              f"— principal defesa no modo automatico")
+    else:
+        print(f"    whitelist         : {', '.join(risk.symbol_whitelist)}")
 
     print("\n  Infraestrutura:")
     dialect = settings.database_url.split(":", 1)[0]
@@ -125,8 +136,29 @@ async def _check(settings) -> int:
 
         source = build_market_data_source(settings.exchange)
         try:
-            ticker = await source.fetch_ticker(settings.symbols[0])
-            print(f"    {ticker.symbol}: {ticker.price}  OK")
+            if settings.discovery_enabled:
+                from .discovery import DEFAULT_EXCLUDED_ASSETS, DiscoveryCriteria, discover
+
+                criteria = DiscoveryCriteria(
+                    quote_currency=settings.quote_currency,
+                    min_quote_volume_24h=settings.discovery_min_quote_volume_24h,
+                    max_symbols=settings.discovery_max_symbols,
+                    exclude_assets=DEFAULT_EXCLUDED_ASSETS
+                    | {a.upper() for a in settings.discovery_exclude_assets},
+                )
+                result = await discover(source, criteria)
+                if not result.symbols:
+                    print("    NENHUM par atingiu o piso de liquidez.")
+                    print("    Reduza DISCOVERY_MIN_QUOTE_VOLUME_24H ou defina SYMBOLS.")
+                    return 1
+                print(f"    {result.considered} pares avaliados, "
+                      f"{result.rejected_low_volume} abaixo do piso de volume")
+                for market in result.markets:
+                    volume = float(market.quote_volume_24h) / 1e6
+                    print(f"      {market.symbol:<14} volume 24h {volume:>8,.0f}M")
+            else:
+                ticker = await source.fetch_ticker(settings.symbols[0])
+                print(f"    {ticker.symbol}: {ticker.price}  OK")
         finally:
             await source.close()
     except Exception as exc:
@@ -219,6 +251,13 @@ async def _backtest(settings, args) -> int:
     from .exchanges import build_market_data_source
     from .strategies import available_strategies, get_strategy
 
+    if not args.symbol and not settings.symbols:
+        print(
+            "SYMBOLS esta em branco (modo de descoberta automatica), entao o backtest "
+            "precisa de um par explicito.\n"
+            "Exemplo: crypto-traders backtest --symbol BTC/USDT"
+        )
+        return 1
     symbol = args.symbol or settings.symbols[0]
     timeframe = args.timeframe or settings.timeframe
     balance = args.balance or settings.paper_initial_balance

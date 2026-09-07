@@ -78,7 +78,8 @@ travaria o Market Data Agent e, com ele, todo o resto.
 ## Persistência
 
 Mesmo schema para SQLite e PostgreSQL/TimescaleDB — os tipos usados existem nos
-dois. Valores monetários são `Numeric(38,18)`, nunca `Float`.
+dois. Valores monetários usam o tipo `Money`: texto no SQLite (decimal exato) e
+`Numeric(38,18)` no PostgreSQL. Nunca `Float`.
 
 No Postgres, `candles` e `portfolio_snapshots` viram *hypertables* do TimescaleDB
 automaticamente no `init_db()`. Se a extensão não existir, o sistema registra um
@@ -100,6 +101,7 @@ o dashboard congela justamente quando há atividade.
 | `agent_runs` | Heartbeats |
 | `audit_log` | Append-only: mudanças de config e ações administrativas |
 | `risk_config` | Limites vigentes + estado do circuit breaker |
+| `notification_config` | Canais de alerta: liga/desliga e destinatários (nunca segredos) |
 
 `trades` é uma tabela só para agentes e lançamentos manuais, distinguidos por
 `origin`. Isso mantém filtros, dashboard e exportação fiscal simples — sem UNION.
@@ -112,3 +114,6 @@ o dashboard congela justamente quando há atividade.
 | `pandas-ta` para indicadores | Indicadores próprios em pandas/numpy | `pandas-ta` não acompanha o pandas 3.0; e o Risk Manager exige cobertura de teste sobre cálculo próprio, não caixa-preta |
 | `vectorbt`/`backtrader` para backtest | Backtester próprio orientado a eventos | Reutiliza o **mesmo** Strategy Agent, Risk Manager e PaperBroker da produção — testa o código real, não uma reimplementação |
 | Celery/APScheduler | Loops `asyncio` no orquestrador | Um processo só; agendamento externo adicionaria infraestrutura sem ganho |
+| Coinbase no MVP | Somente Binance | Coinbase movida para a fase 5; o adapter `ccxt` já é genérico |
+| Whitelist de pares sempre fixa | `SYMBOLS` em branco ativa descoberta automática | Universo escolhido por liquidez, com a lista descoberta virando a whitelist efetiva e indo para o `audit_log` |
+| Alertas por Telegram | E-mail (SMTP) e WhatsApp (Meta Cloud API) | Canais que o operador de fato usa, cada um com liga/desliga na interface |

@@ -8,12 +8,15 @@ sao publicos, e nao ha motivo para este agente ter poder de gastar dinheiro.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from ..bus import EventBus, Topics
 from ..config import Settings
 from ..db.repositories import AgentRunRepository, CandleRepository
 from ..db.session import session_scope
+from ..discovery import DEFAULT_EXCLUDED_ASSETS, DiscoveryCriteria, DiscoveryResult, discover
 from ..domain.models import Candle
 from ..exchanges.base import MarketDataSource
 from .base import BaseAgent
@@ -27,6 +30,7 @@ class MarketDataAgent(BaseAgent):
         bus: EventBus,
         source: MarketDataSource,
         settings: Settings,
+        on_universe_change: Callable[[DiscoveryResult], Awaitable[None]] | None = None,
     ) -> None:
         super().__init__(bus)
         self._source = source
@@ -37,9 +41,86 @@ class MarketDataAgent(BaseAgent):
         self.latest_prices: dict[str, Decimal] = {}
         """Preco corrente por ativo base, consumido pelo Risk e pelo Portfolio."""
 
+        self._on_universe_change = on_universe_change
+        self._discovered: list[str] = []
+        self._last_discovery: datetime | None = None
+        self.discovery: DiscoveryResult | None = None
+
+    # ------------------------------------------------------------------
+    # Universo de pares observados
+    # ------------------------------------------------------------------
+    @property
+    def active_symbols(self) -> list[str]:
+        """Pares realmente observados agora.
+
+        Com `SYMBOLS` preenchido e a lista do `.env`; vazio, e o resultado da
+        ultima descoberta. Nunca "nenhum": subir sem observar mercado nenhum e o
+        estado que mais engana, porque tudo parece saudavel.
+        """
+        if self._settings.symbols:
+            return list(self._settings.symbols)
+        return list(self._discovered)
+
+    @property
+    def discovery_enabled(self) -> bool:
+        return self._settings.discovery_enabled
+
+    def _criteria(self) -> DiscoveryCriteria:
+        extra = {asset.upper() for asset in self._settings.discovery_exclude_assets}
+        return DiscoveryCriteria(
+            quote_currency=self._settings.quote_currency,
+            min_quote_volume_24h=self._settings.discovery_min_quote_volume_24h,
+            max_symbols=self._settings.discovery_max_symbols,
+            exclude_assets=DEFAULT_EXCLUDED_ASSETS | extra,
+        )
+
+    async def discover_symbols(self, force: bool = False) -> list[str]:
+        """Varre a exchange e atualiza o universo de pares.
+
+        Nao faz nada quando `SYMBOLS` esta preenchido: configuracao explicita
+        sempre vence descoberta automatica.
+        """
+        if not self.discovery_enabled:
+            return self.active_symbols
+
+        now = datetime.now(UTC)
+        due = (
+            force
+            or self._last_discovery is None
+            or now - self._last_discovery >= timedelta(hours=self._settings.discovery_refresh_hours)
+        )
+        if not due:
+            return self.active_symbols
+
+        try:
+            result = await discover(self._source, self._criteria())
+        except Exception as exc:
+            # Falha na varredura nao pode derrubar a coleta: seguimos com o
+            # universo anterior, que ainda e melhor do que nenhum mercado.
+            self.log.error("market_data.discovery_failed", error=str(exc))
+            return self.active_symbols
+
+        self._last_discovery = now
+        previous = set(self._discovered)
+        self._discovered = result.symbols
+        self.discovery = result
+
+        if not result.symbols:
+            self.log.error(
+                "market_data.discovery_empty",
+                min_volume=str(self._settings.discovery_min_quote_volume_24h),
+                detail="nenhum par atingiu o piso de liquidez; "
+                "reveja DISCOVERY_MIN_QUOTE_VOLUME_24H",
+            )
+        elif set(result.symbols) != previous and self._on_universe_change is not None:
+            await self._on_universe_change(result)
+
+        return self.active_symbols
+
     async def _run(self) -> None:
         while True:
             await self.wait_if_paused()
+            await self.discover_symbols()
             await self.refresh()
             await self.heartbeat(detail=f"{len(self.latest_prices)} precos")
             if not await self.sleep(self._settings.market_data_interval_seconds):
@@ -47,7 +128,7 @@ class MarketDataAgent(BaseAgent):
 
     async def refresh(self) -> None:
         """Um ciclo de coleta. Publico para o orquestrador poder aquecer o sistema."""
-        for symbol in self._settings.symbols:
+        for symbol in self.active_symbols:
             try:
                 await self._fetch_symbol(symbol)
             except Exception as exc:

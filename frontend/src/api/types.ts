@@ -146,10 +146,32 @@ export interface AgentStatus {
   last_error: string | null
 }
 
+export interface NotificationChannelStatus {
+  configured: boolean
+  missing_settings: string[]
+}
+
+export interface NotificationConfig {
+  email_enabled: boolean
+  email_to: string | null
+  whatsapp_enabled: boolean
+  whatsapp_to: string | null
+  email: NotificationChannelStatus
+  whatsapp: NotificationChannelStatus
+}
+
+export interface NotificationTestResult {
+  channel: string
+  ok: boolean
+  detail: string
+}
+
 export interface Health {
   mode: 'dry_run' | 'testnet' | 'live'
   exchange: string
   symbols: string[]
+  /** `configurado` (SYMBOLS no .env) ou `descoberta` (varredura de mercado). */
+  symbols_source: string
   strategies: string[]
   started_at: string | null
   circuit_breaker_active: boolean

@@ -5,6 +5,7 @@ import Agents from './pages/Agents'
 import Backtest from './pages/Backtest'
 import Dashboard from './pages/Dashboard'
 import ManualTrade from './pages/ManualTrade'
+import Notifications from './pages/Notifications'
 import RiskSettings from './pages/RiskSettings'
 import Trades from './pages/Trades'
 
@@ -14,6 +15,7 @@ const NAV = [
   { to: '/manual', label: 'Lançar manual', icon: '✎' },
   { to: '/risk', label: 'Risco', icon: '⛨' },
   { to: '/agents', label: 'Agentes', icon: '◈' },
+  { to: '/notifications', label: 'Notificações', icon: '✉' },
   { to: '/backtest', label: 'Backtest', icon: '◔' },
 ]
 
@@ -55,6 +57,7 @@ export default function App() {
           <Route path="/manual" element={<ManualTrade />} />
           <Route path="/risk" element={<RiskSettings />} />
           <Route path="/agents" element={<Agents />} />
+          <Route path="/notifications" element={<Notifications />} />
           <Route path="/backtest" element={<Backtest />} />
           <Route path="*" element={<Navigate to="/dashboard" replace />} />
         </Routes>

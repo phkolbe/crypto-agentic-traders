@@ -5,6 +5,8 @@ import type {
   BacktestResult,
   EquityPoint,
   Health,
+  NotificationConfig,
+  NotificationTestResult,
   Order,
   PortfolioSummary,
   RiskConfig,
@@ -91,6 +93,17 @@ export const api = {
   resumeAgent: (name: string) => request<unknown>(`/agents/${name}/resume`, { method: 'POST' }),
   pauseAll: () => request<unknown>('/agents/pause-all', { method: 'POST' }),
   resumeAll: () => request<unknown>('/agents/resume-all', { method: 'POST' }),
+
+  notificationConfig: () => request<NotificationConfig>('/notifications/config'),
+  updateNotificationConfig: (payload: Record<string, unknown>) =>
+    request<NotificationConfig>('/notifications/config', {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    }),
+  testNotification: () =>
+    request<{ results: NotificationTestResult[]; detail: string }>('/notifications/test', {
+      method: 'POST',
+    }),
 
   backtest: (payload: Record<string, unknown>) =>
     request<BacktestResult>('/backtest', { method: 'POST', body: JSON.stringify(payload) }),

@@ -276,6 +276,28 @@ class AuditLog(Base):
     detail: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
+class NotificationConfig(Base):
+    """Canais de alerta: liga/desliga e destinatarios, editaveis pela interface.
+
+    Linha unica (`id=1`). Guarda apenas o que NAO e segredo -- toggles, endereco
+    de e-mail e numero de WhatsApp. Senha de SMTP e token da Meta continuam
+    exclusivamente no `.env`, porque credencial em banco contraria a premissa de
+    seguranca do projeto e um backup do banco passaria a vazar acesso.
+    """
+
+    __tablename__ = "notification_config"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+    email_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    email_to: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    whatsapp_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    whatsapp_to: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    """Numero no formato internacional, so digitos: 5511999999999."""
+
+
 class RiskConfig(Base):
     """Limites de risco vigentes, editaveis pela interface sem mexer em codigo.
 

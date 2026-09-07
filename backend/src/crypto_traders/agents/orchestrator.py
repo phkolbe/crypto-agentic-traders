@@ -18,6 +18,7 @@ from ..bus import EventBus, Topics, build_event_bus
 from ..config import Settings, get_settings
 from ..db.repositories import AuditLogRepository
 from ..db.session import init_db, session_scope
+from ..discovery import DiscoveryResult
 from ..domain.enums import AgentState, TradingMode
 from ..domain.models import PortfolioSnapshot
 from ..exchanges import build_broker, build_market_data_source
@@ -84,7 +85,9 @@ class Orchestrator:
         )
         self._broker = build_broker(self.settings)
 
-        self.market_data = MarketDataAgent(self.bus, self._source, self.settings)
+        self.market_data = MarketDataAgent(
+            self.bus, self._source, self.settings, on_universe_change=self._on_universe_change
+        )
         self.strategy = StrategyAgent(
             self.bus, build_strategies(self.settings.strategies), self.settings
         )
@@ -130,7 +133,12 @@ class Orchestrator:
                 after={
                     "mode": str(self.settings.trading_mode),
                     "exchange": self.settings.exchange,
-                    "symbols": self.settings.symbols,
+                    # Universo real, ja resolvido pela descoberta: registrar a
+                    # config estatica gravaria uma lista vazia em "mar aberto".
+                    "symbols": self.market_data.active_symbols,
+                    "symbols_source": (
+                        "descoberta" if self.settings.discovery_enabled else "configurado"
+                    ),
                     "strategies": self.settings.strategies,
                 },
             )
@@ -139,6 +147,9 @@ class Orchestrator:
     async def _prime_portfolio(self) -> None:
         """Alimenta precos e produz o snapshot inicial."""
         try:
+            # Descoberta ANTES da primeira coleta: sem universo definido, o
+            # refresh nao teria par nenhum para buscar e o sistema subiria cego.
+            await self.market_data.discover_symbols(force=True)
             await self.market_data.refresh()
             self._sync_paper_prices()
             snapshot = await self.portfolio.build_snapshot()
@@ -222,7 +233,8 @@ class Orchestrator:
         return {
             "mode": str(self.settings.trading_mode),
             "exchange": self.settings.exchange,
-            "symbols": self.settings.symbols,
+            "symbols": self.market_data.active_symbols,
+            "symbols_source": "descoberta" if self.market_data.discovery_enabled else "configurado",
             "strategies": self.strategy.strategy_names,
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "circuit_breaker_active": self.risk_manager.circuit_breaker_active,
@@ -241,6 +253,28 @@ class Orchestrator:
             # de notificacao: o Risk Manager ja publicou o alerta ao disparar a
             # trava. Enviar aqui tambem geraria duas mensagens do mesmo evento.
             await self.pause_all(actor="circuit_breaker", reason=reason)
+
+    async def _on_universe_change(self, result: DiscoveryResult) -> None:
+        """A descoberta define o que o Risk Manager passa a aceitar.
+
+        Sem esta ligacao, os pares descobertos seriam coletados mas rejeitados
+        um a um por estarem fora da whitelist estatica -- o sistema pareceria
+        funcionar e nunca operaria.
+        """
+        await self.risk_manager.apply_discovered_universe(result.symbols, result.assets)
+        await self.bus.publish(
+            Topics.ALERTS,
+            {
+                "type": "universe_discovered",
+                "title": "Universo de negociacao atualizado",
+                "message": (
+                    f"Pares selecionados por liquidez: {', '.join(result.symbols)}\n"
+                    f"({result.considered} pares avaliados, "
+                    f"{result.rejected_low_volume} abaixo do piso de volume)"
+                ),
+                "timestamp": datetime.now(UTC).isoformat(),
+            },
+        )
 
     def _sync_paper_prices(self) -> None:
         """Mantem o PaperBroker com precos de mercado reais.

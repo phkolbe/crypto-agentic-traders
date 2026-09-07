@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import abc
 from decimal import Decimal
+from typing import Any
 
 from ..domain.models import Candle, OrderRequest, OrderResult, Position, Ticker
 
@@ -56,6 +57,18 @@ class MarketDataSource(abc.ABC):
 
     @abc.abstractmethod
     async def fetch_ticker(self, symbol: str) -> Ticker: ...
+
+    @abc.abstractmethod
+    async def fetch_markets_and_tickers(
+        self,
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+        """Catalogo de mercados e o resumo de 24h de todos eles.
+
+        Base da descoberta automatica de pares. Devolve os dicionarios crus da
+        exchange de proposito: quem seleciona e `discovery.select_markets`, que
+        e uma funcao pura e testavel sem rede.
+        """
+        ...
 
     @abc.abstractmethod
     async def close(self) -> None: ...

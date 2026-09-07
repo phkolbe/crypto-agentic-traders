@@ -52,9 +52,22 @@ class RiskManagerAgent(BaseAgent):
         self._snapshot: PortfolioSnapshot | None = None
         self._circuit_breaker_active = False
         self._circuit_breaker_reason: str | None = None
+        self._discovered_universe: tuple[list[str], list[str]] | None = None
+        """Whitelist vinda da descoberta automatica: (simbolos, ativos).
+
+        Guardada separada dos limites porque `_load_state()` recarrega os
+        limites do banco a cada sinal -- se o universo morasse dentro deles,
+        cada recarga apagaria o resultado da ultima varredura.
+        """
 
     @property
     def limits(self) -> RiskSettings:
+        """Limites em vigor, ja com o universo descoberto aplicado."""
+        return getattr(self, "_effective_limits", self._limits)
+
+    @property
+    def configured_limits(self) -> RiskSettings:
+        """Limites como configurados, sem o universo da descoberta."""
         return self._limits
 
     @property
@@ -91,11 +104,54 @@ class RiskManagerAgent(BaseAgent):
         if stored:
             try:
                 self._limits = RiskSettings.model_validate(stored)
-                self._engine = RiskEngine(self._limits, self._settings.quote_currency)
             except Exception as exc:
                 # Config invalida no banco nao pode derrubar o guardiao: seguimos
                 # com os limites do .env, que sao conservadores por padrao.
                 self.log.error("risk.stored_limits_invalid", error=str(exc))
+
+        self._rebuild_engine()
+
+    def _rebuild_engine(self) -> None:
+        """Aplica o universo descoberto por cima dos limites vigentes.
+
+        Divisao de responsabilidade: o banco (e a interface) governam os numeros
+        -- tamanho de ordem, stop, exposicao; a descoberta governa QUAIS pares
+        entram. Sem essa separacao, salvar um limite pela interface reverteria a
+        whitelist para a lista estatica do `.env`.
+        """
+        limits = self._limits
+        if self._discovered_universe is not None:
+            symbols, assets = self._discovered_universe
+            limits = limits.model_copy(
+                update={"symbol_whitelist": list(symbols), "asset_whitelist": list(assets)}
+            )
+        self._effective_limits = limits
+        self._engine = RiskEngine(limits, self._settings.quote_currency)
+
+    async def apply_discovered_universe(self, symbols: list[str], assets: list[str]) -> None:
+        """Adota o resultado da descoberta como whitelist efetiva.
+
+        Toda mudanca vai para o audit log: no modo "mar aberto" a whitelist deixa
+        de ser digitada a mao, mas nao deixa de ser rastreavel -- em qualquer
+        instante da para saber o que o sistema podia negociar e desde quando.
+        """
+        previous = self._discovered_universe[0] if self._discovered_universe else []
+        if sorted(previous) == sorted(symbols):
+            return
+
+        self._discovered_universe = (list(symbols), list(assets))
+        self._rebuild_engine()
+
+        async with session_scope(self._settings) as session:
+            await AuditLogRepository(session).append(
+                action="trading_universe_discovered",
+                actor="discovery",
+                target="risk_config",
+                before={"symbols": previous},
+                after={"symbols": list(symbols)},
+                detail="whitelist efetiva definida por descoberta automatica de mercado",
+            )
+        self.log.warning("risk.universe_updated", symbols=symbols)
 
     # ------------------------------------------------------------------
     def observe_snapshot(self, snapshot: PortfolioSnapshot) -> None:
@@ -288,9 +344,9 @@ class RiskManagerAgent(BaseAgent):
             )
 
         self._limits = updated
-        self._engine = RiskEngine(updated, self._settings.quote_currency)
+        self._rebuild_engine()
         self.log.warning("risk.limits_updated", actor=actor, changed=sorted(values))
-        return updated
+        return self.limits
 
 
 def _client_order_id() -> str:

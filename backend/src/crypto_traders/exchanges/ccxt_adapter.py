@@ -171,6 +171,16 @@ class CcxtExchange(MarketDataSource, Broker):
             )
         return candles
 
+    async def fetch_markets_and_tickers(
+        self,
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+        markets = await self._with_retry("load_markets", self._client.load_markets)
+        # `fetch_tickers` sem argumentos traz o resumo de 24h de todos os pares
+        # em UMA chamada; pedir par a par seriam centenas de requisicoes e o
+        # rate limit da exchange derrubaria a varredura.
+        tickers = await self._with_retry("fetch_tickers", self._client.fetch_tickers)
+        return markets, tickers
+
     async def fetch_ticker(self, symbol: str) -> Ticker:
         raw = await self._with_retry("fetch_ticker", self._client.fetch_ticker, symbol)
         price = raw.get("last") or raw.get("close") or raw.get("bid")

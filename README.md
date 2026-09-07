@@ -1,6 +1,6 @@
 # crypto-agentic-traders
 
-Agentes autônomos de negociação de criptomoedas (Binance + Coinbase), com **Risk
+Agentes autônomos de negociação de criptomoedas na **Binance**, com **Risk
 Manager como guardião obrigatório** de toda ordem, backend em Python e dashboard
 em React + TypeScript.
 
@@ -29,6 +29,11 @@ Execution Agent nunca decide** — entre os dois há sempre o Risk Manager, que
 registra em banco toda decisão, aprovada ou rejeitada.
 
 Detalhamento em [`docs/ARQUITETURA.md`](docs/ARQUITETURA.md).
+
+## Escopo atual
+
+Opera **somente na Binance**. A Coinbase está na fase 5 do roadmap — o adapter
+`ccxt` já é genérico, então adicioná-la depois não mexe em código de agente.
 
 ## Requisitos
 
@@ -76,6 +81,29 @@ uv run crypto-traders check
 ```bash
 uv run crypto-traders backtest --symbol BTC/USDT --strategy ma_crossover --days 90
 ```
+
+## Pares negociados
+
+Duas formas:
+
+```dotenv
+SYMBOLS=BTC/USDT,ETH/USDT     # lista fixa
+SYMBOLS=                       # descoberta automática ("mar aberto")
+```
+
+Em branco, o sistema varre a exchange e escolhe os pares mais líquidos sozinho —
+e a lista descoberta vira a **whitelist efetiva** do Risk Manager, registrada no
+`audit_log` a cada mudança.
+
+> Leia [`docs/SEGURANCA.md`](docs/SEGURANCA.md) antes de usar o modo automático:
+> a whitelist deixa de ser uma lista aprovada por você e passa a ser um conjunto
+> de critérios, o que torna `RISK_MAX_OPEN_POSITIONS` e a exposição máxima por
+> ativo as principais defesas.
+
+## Alertas
+
+E-mail (SMTP) e WhatsApp (Meta Cloud API), cada um com liga/desliga na tela
+**Notificações**. Segredos ficam no `.env`; destinatários e toggles no banco.
 
 ## Modos de operação
 

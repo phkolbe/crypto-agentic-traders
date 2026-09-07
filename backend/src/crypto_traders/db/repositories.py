@@ -495,6 +495,32 @@ class AuditLogRepository:
         return list((await self._session.execute(stmt)).scalars().all())
 
 
+class NotificationConfigRepository:
+    """Preferencias de alerta (liga/desliga e destinatarios). Linha unica."""
+
+    ROW_ID = 1
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def get_or_create(self) -> orm.NotificationConfig:
+        config = await self._session.get(orm.NotificationConfig, self.ROW_ID)
+        if config is None:
+            # Ambos desligados por padrao: um canal so passa a existir quando o
+            # operador liga conscientemente e informa o destinatario.
+            config = orm.NotificationConfig(id=self.ROW_ID)
+            self._session.add(config)
+            await self._session.flush()
+        return config
+
+    async def update(self, values: dict) -> orm.NotificationConfig:
+        config = await self.get_or_create()
+        for field in ("email_enabled", "email_to", "whatsapp_enabled", "whatsapp_to"):
+            if field in values:
+                setattr(config, field, values[field])
+        return config
+
+
 class RiskConfigRepository:
     """Linha unica com os limites vigentes e o estado do circuit breaker."""
 

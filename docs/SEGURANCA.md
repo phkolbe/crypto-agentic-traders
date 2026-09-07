@@ -75,6 +75,42 @@ provedor não serve — autoriza milhares de clientes e esvazia a proteção.
 
 ---
 
+### Modo "mar aberto": o que ele custa em segurança
+
+Com `SYMBOLS` em branco o sistema **descobre os pares sozinho**, varrendo a
+exchange e escolhendo os mais líquidos. É conveniente, e tem um preço que
+precisa estar claro.
+
+A **whitelist de ativos** era uma das camadas de proteção do plano original: uma
+lista curta, aprovada por uma pessoa, que impedia o sistema de tocar em token
+ilíquido ou desconhecido. No modo automático ela deixa de ser uma lista aprovada
+a mão e passa a ser um **conjunto de critérios**. Isso é uma proteção mais fraca.
+
+As compensações, todas objetivas:
+
+| Filtro | Por quê |
+|---|---|
+| Volume mínimo em 24h | Dos 487 pares USDT da Binance, **312 movimentam menos de 1M/dia**. Neles a própria ordem move o preço. |
+| Teto de pares | Sem teto, "mar aberto" vira dezenas de posições simultâneas. |
+| Exclusão de stablecoins | USDC/USDT é o **maior volume** da Binance e o pior par possível aqui: o preço não anda, então todo sinal é ruído e toda operação é taxa. |
+| Só mercados spot e ativos | Evita par deslistado ou de outro tipo. |
+
+E o mais importante: **a lista descoberta vira a whitelist efetiva** e vai para
+o `audit_log` a cada mudança. Em qualquer instante existe uma lista concreta e
+inspecionável do que o sistema pode negociar — ela apenas deixou de ser digitada
+a mão.
+
+Com isso, as defesas que passam a carregar o peso são `RISK_MAX_OPEN_POSITIONS`,
+`RISK_MAX_ASSET_EXPOSURE_PCT` e o tamanho máximo por ordem. **Revise esses três
+antes de usar o modo automático.**
+
+Não há filtro de "token alavancado" por sufixo, de propósito: procurar
+`UP`/`DOWN`/`BULL`/`BEAR` no nome marca JUP (Jupiter), SYRUP e SUPER como
+alavancados. Para excluir um ativo específico use `DISCOVERY_EXCLUDE_ASSETS`,
+que é explícito e não erra.
+
+---
+
 ## 2. Controle operacional (o Risk Manager)
 
 Toda ordem passa por ele. As regras são cumulativas — basta uma violação para
@@ -151,7 +187,37 @@ o histórico nunca fica ambíguo sobre o que foi simulado e o que foi real.
 
 ---
 
-## 6. Infraestrutura local
+## 6. Canais de alerta
+
+Dois canais, cada um com liga/desliga próprio na tela **Notificações**: e-mail
+(SMTP) e WhatsApp (Meta Cloud API).
+
+A divisão entre os dois lugares de configuração é deliberada:
+
+- **Segredos ficam só no `.env`** — senha de SMTP e token da Meta. Credencial em
+  banco contraria a premissa do projeto: um backup do banco é um arquivo que
+  circula, e se ele carregasse credenciais, um histórico de negociações vazado
+  viraria também um acesso vazado ao seu e-mail e ao seu WhatsApp.
+- **Preferências ficam no banco** e são editáveis pela interface — ligar cada
+  canal e para onde enviar. A API nunca devolve segredo: informa apenas se está
+  presente e, quando não, quais variáveis faltam.
+
+Ligar um canal sem destinatário é recusado. Um canal "ligado" que nunca entrega
+é pior que um desligado, porque cria a impressão de cobertura.
+
+**Sobre o WhatsApp:** alertas são mensagens proativas e raras, então nunca existe
+uma sessão de 24h aberta — e sem sessão o WhatsApp só aceita **template
+aprovado**, nunca texto livre. É preciso criar no Meta for Developers um template
+de categoria "utility" com dois parâmetros no corpo. A aplicação limpa quebras de
+linha e tabs antes de enviar, porque a Meta rejeita parâmetros com eles — e um
+alerta bem escrito tem exatamente isso.
+
+Use o botão **Enviar teste** depois de configurar. O objetivo é não descobrir que
+a notificação não funciona justamente no dia em que o circuit breaker dispara.
+
+---
+
+## 7. Infraestrutura local
 
 - A API escuta **apenas em `127.0.0.1`**. O default nunca é `0.0.0.0`.
 - Os serviços do `docker-compose.yml` publicam portas com prefixo `127.0.0.1:`,
@@ -164,7 +230,7 @@ o histórico nunca fica ambíguo sobre o que foi simulado e o que foi real.
 
 ---
 
-## 7. Antes de ligar o LIVE
+## 8. Antes de ligar o LIVE
 
 Uma sequência, não uma escolha:
 
