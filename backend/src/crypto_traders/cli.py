@@ -133,6 +133,9 @@ async def _check(settings) -> int:
         print(f"    FALHOU — {exc}")
         return 1
 
+    if not await _check_credentials(settings):
+        return 1
+
     if settings.is_live:
         print("\n  " + "!" * 62)
         print("  ATENCAO: LIVE_TRADING ativo. Ordens usarao DINHEIRO REAL.")
@@ -140,6 +143,74 @@ async def _check(settings) -> int:
 
     print("\n  Tudo pronto.\n")
     return 0
+
+
+async def _check_credentials(settings) -> bool:
+    """Valida a credencial contra um endpoint AUTENTICADO da exchange.
+
+    A checagem de conectividade acima usa apenas endpoints publicos, que
+    funcionam mesmo com a chave bloqueada. Sem esta sonda, o diagnostico diria
+    "tudo pronto" para um sistema que nao consegue enviar uma unica ordem --
+    e a descoberta viria na primeira tentativa de operar.
+    """
+    from .exchanges import CcxtExchange
+    from .exchanges.base import ApiAccessDenied
+
+    credentials = settings.credentials_for(settings.exchange)
+
+    if not settings.sends_real_orders:
+        print("\n  Credencial de negociacao: nao exigida em dry_run (broker simulado).")
+        if credentials.configured:
+            print("    Chave presente no .env, mas nao sera usada neste modo.")
+        return True
+
+    if not credentials.configured:
+        print(f"\n  Credencial de negociacao: AUSENTE para '{settings.exchange}'.")
+        print(f"    TRADING_MODE={settings.trading_mode} exige chave de API no .env.")
+        return False
+
+    print("\n  Credencial de negociacao (endpoint autenticado):")
+    client = CcxtExchange(
+        settings.exchange,
+        credentials,
+        testnet=settings.trading_mode is TradingMode.TESTNET,
+    )
+    try:
+        balances = await client.fetch_balances()
+    except ApiAccessDenied as exc:
+        print("    ACESSO NEGADO pela exchange.")
+        print(f"    {exc}")
+        await _print_public_ip()
+        return False
+    except Exception as exc:
+        print(f"    FALHOU — {exc}")
+        return False
+    finally:
+        await client.close()
+
+    assets = ", ".join(sorted(balances)) if balances else "nenhum saldo positivo"
+    print(f"    leitura de saldo OK — ativos: {assets}")
+    print("    (envio de ordem nao e testado aqui: isso exigiria uma ordem real)")
+    return True
+
+
+async def _print_public_ip() -> None:
+    """Mostra o IP de saida desta maquina, para comparar com a whitelist.
+
+    Best-effort e apenas neste caminho de erro: e a informacao que resolve o
+    caso mais comum (IP residencial dinamico mudou). Se o servico externo nao
+    responder, o diagnostico segue sem ele.
+    """
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=8) as http:
+            response = await http.get("https://api.ipify.org")
+            response.raise_for_status()
+            print(f"\n    IP de saida desta maquina agora: {response.text.strip()}")
+            print("    Confira se e exatamente este o IP na whitelist da API.")
+    except Exception:
+        print("\n    (nao foi possivel descobrir o IP de saida automaticamente)")
 
 
 # ---------------------------------------------------------------------------

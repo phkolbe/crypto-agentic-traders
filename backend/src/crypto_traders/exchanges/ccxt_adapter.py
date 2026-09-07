@@ -8,6 +8,7 @@ nos agentes.
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -18,7 +19,7 @@ from ..config import ExchangeCredentials
 from ..domain.enums import ExchangeName, OrderStatus, OrderType, Side
 from ..domain.models import Candle, OrderRequest, OrderResult, Position, Ticker
 from ..logging_setup import get_logger
-from .base import Broker, ExchangeError, InsufficientFunds, MarketDataSource
+from .base import ApiAccessDenied, Broker, ExchangeError, InsufficientFunds, MarketDataSource
 
 log = get_logger(__name__)
 
@@ -40,6 +41,24 @@ _RETRYABLE = (
     ccxt.DDoSProtection,
     ccxt.RateLimitExceeded,
 )
+
+#: Credencial recusada. Retentar nunca resolve, e o operador precisa saber AGORA.
+_ACCESS_DENIED = (
+    ccxt.AuthenticationError,
+    ccxt.PermissionDenied,
+)
+
+#: Sinais de que o problema e o IP, e nao a chave em si. Na Binance, `-2015`
+#: cobre "chave invalida, IP ou permissao" -- os tres casos caem na mesma
+#: mensagem, e num setup residencial a causa mais provavel e o IP.
+#:
+#: `-2014` ("API-key format invalid") NAO entra aqui de proposito: e um problema
+#: da chave, e apontar o IP nesse caso mandaria o operador investigar o lugar
+#: errado.
+#:
+#: O `ip` usa limite de palavra de proposito: "ip" como substring solta
+#: casaria com "multiple", "description" e praticamente qualquer mensagem.
+_IP_HINT = re.compile(r"-2015|whitelist|ip", re.IGNORECASE)
 
 
 def _dec(value: Any) -> Decimal:
@@ -98,6 +117,12 @@ class CcxtExchange(MarketDataSource, Broker):
                 return await func(*args, **kwargs)
             except ccxt.InsufficientFunds as exc:
                 raise InsufficientFunds(str(exc)) from exc
+            except _ACCESS_DENIED as exc:
+                raise ApiAccessDenied(
+                    _access_denied_message(self.name, operation, str(exc)),
+                    exchange=self.name,
+                    operation=operation,
+                ) from exc
             except _RETRYABLE as exc:
                 last_error = exc
                 log.warning(
@@ -173,6 +198,11 @@ class CcxtExchange(MarketDataSource, Broker):
                 float(request.price) if request.order_type is OrderType.LIMIT else None,
                 params,
             )
+        except ApiAccessDenied:
+            # Propositalmente NAO virando um OrderResult genérico: quem chama
+            # precisa poder distinguir "esta ordem falhou" de "o sistema perdeu
+            # acesso a exchange", que exige alerta imediato.
+            raise
         except ExchangeError as exc:
             return OrderResult(
                 order_request_id=request.id,
@@ -228,9 +258,23 @@ class CcxtExchange(MarketDataSource, Broker):
             return ExchangeName.BINANCE
 
 
+def _access_denied_message(exchange: str, operation: str, raw: str) -> str:
+    """Mensagem que aponta para a causa provável, em vez de repetir o erro cru."""
+    looks_like_ip = bool(_IP_HINT.search(raw))
+    detail = (
+        "Causa mais provavel: o IP desta maquina mudou e nao esta mais na "
+        "whitelist da API. Confira o IP atual e atualize a whitelist na "
+        "exchange. Verifique tambem se a permissao de negociacao (spot) "
+        "continua habilitada."
+        if looks_like_ip
+        else "Verifique a chave, o segredo e as permissoes da API."
+    )
+    return f"{exchange}.{operation}: acesso negado pela exchange. {detail} (erro original: {raw})"
+
+
 def build_market_data_source(exchange_id: str, testnet: bool = False) -> CcxtExchange:
     """Fonte de mercado publica: nenhuma credencial e passada aqui, de proposito."""
     return CcxtExchange(exchange_id, credentials=None, testnet=testnet)
 
 
-__all__ = ["CcxtExchange", "Side", "build_market_data_source"]
+__all__ = ["ApiAccessDenied", "CcxtExchange", "Side", "build_market_data_source"]

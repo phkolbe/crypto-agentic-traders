@@ -17,13 +17,15 @@ deixaria uma ordem viva na exchange e invisivel aqui.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from ..bus import EventBus, Topics
 from ..config import Settings
 from ..db.repositories import OrderRepository, TradeRepository
 from ..db.session import session_scope
 from ..domain.enums import OrderStatus, TradeOrigin
 from ..domain.models import OrderRequest, OrderResult
-from ..exchanges.base import Broker
+from ..exchanges.base import ApiAccessDenied, Broker
 from .base import BaseAgent
 
 
@@ -35,10 +37,22 @@ class ExecutionAgent(BaseAgent):
         self._broker = broker
         self._settings = settings
         self._mode = str(settings.trading_mode)
+        self._access_denied_since: datetime | None = None
+        """Marca o incidente de acesso negado em curso.
+
+        Existe para alertar **uma vez por incidente**, e nao a cada ordem: com o
+        IP fora da whitelist, toda ordem falha, e um alerta por ordem viraria
+        spam que faz o operador ignorar justamente o aviso que importa.
+        """
 
     @property
     def broker(self) -> Broker:
         return self._broker
+
+    @property
+    def access_denied(self) -> bool:
+        """True enquanto a exchange estiver recusando a credencial."""
+        return self._access_denied_since is not None
 
     async def _run(self) -> None:
         async for request in self.bus.subscribe(Topics.ORDER_REQUESTS):
@@ -75,22 +89,97 @@ class ExecutionAgent(BaseAgent):
             mode=self._mode,
         )
 
+        denied: ApiAccessDenied | None = None
         try:
             result = await self._broker.place_order(request)
+        except ApiAccessDenied as exc:
+            denied = exc
+            result = self._failed(request, str(exc))
         except Exception as exc:
             # Falha na chamada tambem e um desfecho: precisa ficar registrada,
             # senao a ordem fica PENDING para sempre sem explicacao.
-            result = OrderResult(
-                order_request_id=request.id,
-                client_order_id=request.client_order_id,
-                exchange_order_id=None,
-                status=OrderStatus.FAILED,
-                error=str(exc),
-            )
+            result = self._failed(request, str(exc))
 
         await self._record(request, result)
         await self.bus.publish(Topics.ORDER_RESULTS, result)
+
+        if denied is not None:
+            await self._report_access_denied(denied, request)
+        elif result.status is not OrderStatus.FAILED:
+            # Uma ordem que voltou da exchange prova que o acesso voltou.
+            await self._report_access_restored()
+
         return result
+
+    def _failed(self, request: OrderRequest, error: str) -> OrderResult:
+        return OrderResult(
+            order_request_id=request.id,
+            client_order_id=request.client_order_id,
+            exchange_order_id=None,
+            status=OrderStatus.FAILED,
+            error=error,
+        )
+
+    async def _report_access_denied(
+        self, error: ApiAccessDenied, request: OrderRequest
+    ) -> None:
+        """Alerta que o sistema perdeu acesso de escrita a exchange.
+
+        Este e o cenario mais perigoso do sistema, e o menos visivel: os dados de
+        mercado sao publicos e continuam chegando, entao o dashboard segue
+        atualizando normalmente enquanto nenhuma ordem consegue mais sair. Com
+        posicao aberta, o sinal de fechamento e aprovado pelo Risk Manager e a
+        ordem morre na exchange -- stop-loss e take-profit deixam de existir na
+        pratica.
+        """
+        self.log.error(
+            "execution.api_access_denied",
+            exchange=error.exchange or request.exchange,
+            operation=error.operation,
+            symbol=request.symbol,
+            error=str(error),
+        )
+
+        if self._access_denied_since is not None:
+            return  # incidente ja alertado; nao repetir a cada ordem
+
+        self._access_denied_since = datetime.now(UTC)
+        await self.bus.publish(
+            Topics.ALERTS,
+            {
+                "type": "api_access_denied",
+                "title": "Exchange recusou a credencial — nenhuma ordem sai",
+                "message": (
+                    f"{error}\n\n"
+                    "ATENCAO: os dados de mercado continuam chegando, entao o "
+                    "dashboard parece normal, mas o sistema NAO consegue mais "
+                    "enviar ordens. Se houver posicao aberta, o stop-loss nao "
+                    "sera executado. Verifique a whitelist de IP e as permissoes "
+                    "da chave, e considere fechar posicoes manualmente pela "
+                    "exchange enquanto isso nao for resolvido."
+                ),
+                "timestamp": self._access_denied_since.isoformat(),
+            },
+        )
+
+    async def _report_access_restored(self) -> None:
+        if self._access_denied_since is None:
+            return
+        down_for = datetime.now(UTC) - self._access_denied_since
+        self._access_denied_since = None
+        self.log.info("execution.api_access_restored", seconds=int(down_for.total_seconds()))
+        await self.bus.publish(
+            Topics.ALERTS,
+            {
+                "type": "api_access_restored",
+                "title": "Acesso a exchange restabelecido",
+                "message": (
+                    f"Ordens voltaram a ser aceitas apos {int(down_for.total_seconds() / 60)} "
+                    "minuto(s) sem acesso."
+                ),
+                "timestamp": datetime.now(UTC).isoformat(),
+            },
+        )
 
     async def _record(self, request: OrderRequest, result: OrderResult) -> None:
         filled = result.status is OrderStatus.FILLED and result.filled_quantity > 0

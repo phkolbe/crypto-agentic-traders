@@ -17,6 +17,49 @@ inesperado do mercado — e as demais precisam segurar o prejuízo.
 2. **Whitelist de IP**, restrita ao IP desta máquina.
 3. **Rotação periódica**, e imediata a qualquer suspeita de exposição.
 
+### Whitelist de IP: o detalhe que mais morde
+
+Restringir a chave a um IP é a segunda camada mais valiosa depois de negar
+saque. Mas num IP **residencial e dinâmico** — o caso típico no Brasil — ele
+muda sozinho: reinício do modem, renovação da concessão do provedor, ou nada
+aparente.
+
+Quando isso acontece, a falha é silenciosa e assimétrica:
+
+- Os dados de mercado são **públicos** e continuam chegando. O dashboard segue
+  atualizando preços, os agentes continuam com heartbeat verde, e nada na tela
+  indica problema.
+- Nenhuma ordem consegue mais sair. Se houver **posição aberta**, o sinal de
+  fechamento é aprovado pelo Risk Manager e a ordem morre na exchange —
+  **stop-loss e take-profit deixam de existir na prática.**
+
+Ou seja: a proteção contra chave vazada cria uma janela em que a proteção contra
+prejuízo não funciona. Por isso o sistema tem duas defesas específicas:
+
+1. **`crypto-traders check` valida contra um endpoint autenticado.** A checagem
+   de conectividade usa endpoints públicos, que funcionam mesmo com a chave
+   bloqueada; sem a sonda autenticada o diagnóstico diria "tudo pronto" para um
+   sistema incapaz de enviar uma ordem. Quando o acesso é negado, o comando
+   imprime o IP de saída atual da máquina, que é o que resolve o caso na maioria
+   das vezes.
+
+2. **O Execution Agent reconhece esse erro especificamente** (`ApiAccessDenied`)
+   e dispara alerta imediato dizendo que há risco de posição sem stop — em vez
+   de registrar "ordem falhou" junto com um timeout de rede qualquer. O alerta
+   sai **uma vez por incidente**, não por ordem: com o IP fora da whitelist toda
+   ordem falha, e spam faz o operador ignorar justamente o aviso que importa. A
+   recuperação também é anunciada.
+
+Note que `-2015` na Binance ("Invalid API-key, IP, or permissions") é ambíguo por
+natureza — cobre chave, IP e permissão na mesma mensagem. O sistema aponta o IP
+como causa provável nesse código, mas não em `-2014` (formato da chave) nem em
+`-1022` (assinatura), que são problemas da credencial e mandariam investigar o
+lugar errado.
+
+**A solução real é um IP de saída estável**: VPN pessoal com *exit node*
+(Tailscale), IP fixo contratado, ou rodar numa VPS. Whitelist do bloco inteiro do
+provedor não serve — autoriza milhares de clientes e esvazia a proteção.
+
 ### No sistema
 
 - Chaves vivem apenas no `.env`, que está no `.gitignore`.

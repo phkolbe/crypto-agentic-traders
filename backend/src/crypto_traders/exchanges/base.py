@@ -23,6 +23,27 @@ class InsufficientFunds(ExchangeError):
     """Saldo insuficiente: erro de negocio, nao adianta retentar."""
 
 
+class ApiAccessDenied(ExchangeError):
+    """A exchange recusou a credencial: chave invalida, IP fora da whitelist ou
+    permissao ausente.
+
+    Merece um tipo proprio porque a consequencia operacional e diferente de
+    qualquer outra falha. Os dados de mercado sao publicos e continuam chegando,
+    entao o dashboard segue vivo e aparentemente saudavel -- mas o sistema
+    perdeu a capacidade de **sair** de posicao. Se houver posicao aberta, o
+    sinal de fechamento e aprovado pelo Risk Manager e a ordem morre na
+    exchange, sem que nada na tela indique isso.
+
+    Na Binance, o caso mais comum e o IP residencial ter mudado (o endereco da
+    whitelist e dinamico), e o codigo devolvido e `-2015`.
+    """
+
+    def __init__(self, message: str, *, exchange: str = "", operation: str = "") -> None:
+        super().__init__(message)
+        self.exchange = exchange
+        self.operation = operation
+
+
 class MarketDataSource(abc.ABC):
     """Leitura de mercado. Nao requer credenciais."""
 

@@ -243,6 +243,11 @@ class RiskManagerAgent(BaseAgent):
             Topics.ALERTS,
             {
                 "type": "circuit_breaker",
+                "title": "Circuit breaker acionado",
+                "message": (
+                    f"{reason}\n\nOs agentes de decisao foram pausados. O rearme e "
+                    "manual, pela interface."
+                ),
                 "reason": reason,
                 "timestamp": datetime.now(UTC).isoformat(),
             },

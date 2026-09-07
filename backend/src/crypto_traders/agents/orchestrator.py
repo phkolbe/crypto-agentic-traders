@@ -237,12 +237,10 @@ class Orchestrator:
 
         reason = await self.risk_manager.check_circuit_breaker(snapshot)
         if reason:
+            # O aviso ao operador sai por `_listen_alerts`, que e o unico caminho
+            # de notificacao: o Risk Manager ja publicou o alerta ao disparar a
+            # trava. Enviar aqui tambem geraria duas mensagens do mesmo evento.
             await self.pause_all(actor="circuit_breaker", reason=reason)
-            await self.notifier.send(
-                "Circuit breaker acionado",
-                f"{reason}\n\nTodos os agentes de decisao foram pausados. "
-                "O rearme e manual, pela interface.",
-            )
 
     def _sync_paper_prices(self) -> None:
         """Mantem o PaperBroker com precos de mercado reais.
@@ -256,8 +254,23 @@ class Orchestrator:
             setter(dict(self.market_data.latest_prices))
 
     async def _listen_alerts(self) -> None:
+        """Caminho único de notificação: tudo que é crítico passa por aqui.
+
+        Os agentes só publicam em `Topics.ALERTS` e não conhecem o notificador.
+        Assim existe um lugar só que decide o que chega ao operador, e um alerta
+        novo (como o de acesso negado) passa a ser notificado sem que o agente
+        precise saber que Telegram existe.
+        """
         async for alert in self.bus.subscribe(Topics.ALERTS):
             log.warning("orchestrator.alert", **alert)
+            title = alert.get("title") or alert.get("type", "Alerta")
+            message = alert.get("message") or alert.get("reason") or ""
+            try:
+                await self.notifier.send(title, message)
+            except Exception as exc:
+                # Falha ao notificar nunca pode derrubar o loop de alertas: o
+                # evento já está no log, que é a fonte de verdade da auditoria.
+                log.error("orchestrator.alert_delivery_failed", error=str(exc))
 
     async def _watch_health(self) -> None:
         """Reinicia agentes que morreram ou pararam de dar sinal de vida.
@@ -283,10 +296,17 @@ class Orchestrator:
                         stale=stale,
                         error=agent.last_error,
                     )
-                    await self.notifier.send(
-                        f"Agente '{name}' reiniciado",
-                        f"motivo: {'falha' if crashed else 'heartbeat perdido'}\n"
-                        f"ultimo erro: {agent.last_error or 'nenhum'}",
+                    await self.bus.publish(
+                        Topics.ALERTS,
+                        {
+                            "type": "agent_restarted",
+                            "title": f"Agente '{name}' reiniciado",
+                            "message": (
+                                f"motivo: {'falha' if crashed else 'heartbeat perdido'}\n"
+                                f"ultimo erro: {agent.last_error or 'nenhum'}"
+                            ),
+                            "timestamp": now.isoformat(),
+                        },
                     )
                     with contextlib.suppress(Exception):
                         await agent.stop()
