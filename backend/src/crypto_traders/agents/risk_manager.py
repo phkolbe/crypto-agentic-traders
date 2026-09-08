@@ -61,6 +61,9 @@ class RiskManagerAgent(BaseAgent):
         self._snapshot: PortfolioSnapshot | None = None
         self._circuit_breaker_active = False
         self._circuit_breaker_reason: str | None = None
+        self._capital_alerted = False
+        """Aviso de saldo nao autorizado sai uma vez por transicao."""
+
         self._exiting: set[str] = set()
         """Ativos com ordem de protecao em voo.
 
@@ -85,6 +88,11 @@ class RiskManagerAgent(BaseAgent):
     def configured_limits(self) -> RiskSettings:
         """Limites como configurados, sem o universo da descoberta."""
         return self._limits
+
+    @property
+    def last_snapshot(self) -> PortfolioSnapshot | None:
+        """Ultimo retrato recebido do Portfolio Agent."""
+        return self._snapshot
 
     @property
     def circuit_breaker_active(self) -> bool:
@@ -254,6 +262,75 @@ class RiskManagerAgent(BaseAgent):
     def observe_snapshot(self, snapshot: PortfolioSnapshot) -> None:
         """Recebe o retrato mais recente do portfolio, publicado pelo Portfolio Agent."""
         self._snapshot = snapshot
+
+    async def check_capital_authorization(self, snapshot: PortfolioSnapshot) -> Decimal:
+        """Avisa quando existe saldo que o sistema nao pode usar.
+
+        Um deposito nao e uma ordem. Dinheiro que entra na conta por qualquer
+        motivo -- venda de outro ativo, transferencia, reserva para outra
+        finalidade -- nao deveria virar exposicao sem alguem dizer que sim. O
+        portao existe para essa distincao.
+
+        Mas dinheiro autorizado e parado tambem e um problema, e o oposto do
+        anterior: o sistema ficaria de pe com caixa ocioso sem ninguem perceber.
+        Por isso o aviso e ativo, e nao apenas uma linha no `check`.
+
+        O alerta sai **uma vez por transicao**, nao a cada snapshot: com o
+        Portfolio Agent rodando a cada 60s, avisar sempre seriam 1.440 mensagens
+        por dia sobre o mesmo saldo, e um alerta que chega todo minuto deixa de
+        ser lido.
+        """
+        autorizado = self._limits.authorized_capital
+        if autorizado is None:
+            return Decimal(0)
+
+        nao_autorizado = max(Decimal(0), snapshot.total_value - autorizado)
+        moeda = self._settings.trading.quote_currency
+        # Tolerancia: variacao de preco das posicoes move o patrimonio para cima
+        # sem que tenha entrado dinheiro. Avisar por causa disso seria ruido.
+        relevante = nao_autorizado >= self._limits.min_order_notional
+
+        if relevante and not self._capital_alerted:
+            self._capital_alerted = True
+            self.log.warning(
+                "risk.unauthorized_capital",
+                patrimonio=str(snapshot.total_value),
+                autorizado=str(autorizado),
+                parado=str(nao_autorizado),
+            )
+            await self.bus.publish(
+                Topics.ALERTS,
+                {
+                    "type": "unauthorized_capital",
+                    "title": f"{nao_autorizado:.2f} {moeda} disponiveis e nao autorizados",
+                    "detail": (
+                        f"O patrimonio e {snapshot.total_value:.2f} {moeda} e o capital "
+                        f"autorizado a operar e {autorizado:.2f} {moeda}. "
+                        f"O sistema NAO vai usar a diferenca ate voce autorizar. "
+                        f"Autorize em Risco, na interface, para por esse saldo a trabalhar."
+                    ),
+                },
+            )
+        elif not relevante:
+            # Saldo autorizado ou consumido: rearma o aviso para o proximo aporte.
+            self._capital_alerted = False
+
+        return nao_autorizado
+
+    async def authorize_all_capital(self, actor: str = "user") -> RiskSettings:
+        """Autoriza o patrimonio inteiro a operar, no valor apurado agora.
+
+        Deliberadamente grava um NUMERO em vez de desligar o portao: desligar
+        autorizaria tambem todo deposito futuro, que e exatamente o que o portao
+        existe para impedir. Autorizar e um ato sobre o saldo de hoje.
+        """
+        if self._snapshot is None:
+            raise ValueError(
+                "portfolio ainda nao apurado; aguarde o primeiro snapshot para autorizar"
+            )
+        return await self.update_limits(
+            {"authorized_capital": str(self._snapshot.total_value)}, actor=actor
+        )
 
     async def enforce_protective_exits(self, snapshot: PortfolioSnapshot) -> list[OrderRequest]:
         """Fecha posicoes que romperam stop-loss ou take-profit.

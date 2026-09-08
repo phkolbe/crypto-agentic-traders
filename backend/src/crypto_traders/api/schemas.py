@@ -173,10 +173,10 @@ class AuditEntryOut(BaseModel):
 
 # ---------------------------------------------------------------------------
 class RiskConfigOut(MoneyModel):
-    max_order_notional: Decimal
+    max_order_notional: Decimal | None
     max_order_pct_portfolio: float
     max_asset_exposure_pct: float
-    max_open_positions: int
+    max_open_positions: int | None
     min_order_notional: Decimal
     stop_loss_pct: float
     take_profit_pct: float
@@ -187,6 +187,7 @@ class RiskConfigOut(MoneyModel):
     symbol_whitelist: list[str]
     cooldown_seconds: int
     mvrv_max_percentile: float
+    authorized_capital: Decimal | None = None
     circuit_breaker_active: bool = False
     circuit_breaker_reason: str | None = None
 
@@ -197,9 +198,20 @@ class RiskConfigIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     max_order_notional: Decimal | None = Field(default=None, gt=0)
+    clear_max_order_notional: bool = Field(
+        default=False,
+        description=(
+            "Remove o teto absoluto por ordem, deixando o percentual mandar. "
+            "Existe como campo proprio porque num PUT parcial `null` significa "
+            "'nao enviei', e nao 'apague'."
+        ),
+    )
     max_order_pct_portfolio: float | None = Field(default=None, gt=0, le=1)
     max_asset_exposure_pct: float | None = Field(default=None, gt=0, le=1)
     max_open_positions: int | None = Field(default=None, ge=1)
+    clear_max_open_positions: bool = Field(
+        default=False, description="Remove o limite de posicoes; o caixa passa a limitar."
+    )
     min_order_notional: Decimal | None = Field(default=None, gt=0)
     stop_loss_pct: float | None = Field(default=None, gt=0, lt=1)
     take_profit_pct: float | None = Field(default=None, gt=0, lt=5)
@@ -215,11 +227,33 @@ class RiskConfigIn(BaseModel):
         le=1,
         description="1.0 desliga o filtro de regime. Ver docs/SEGURANCA.md antes de baixar.",
     )
+    authorized_capital: Decimal | None = Field(
+        default=None,
+        ge=0,
+        description="Capital que o sistema pode por para trabalhar, na moeda de cotacao.",
+    )
+    clear_authorized_capital: bool = Field(
+        default=False,
+        description=(
+            "Remove o portao de autorizacao: todo o patrimonio, INCLUSIVE "
+            "depositos futuros, fica disponivel sem novo aval."
+        ),
+    )
 
     confirm: bool = Field(
         default=False,
         description="Confirmacao explicita: alterar limites afeta dinheiro real.",
     )
+
+
+class CapitalStatusOut(MoneyModel):
+    """Quanto capital esta autorizado, e quanto esta parado esperando aval."""
+
+    total_value: Decimal
+    authorized_capital: Decimal | None
+    unauthorized_value: Decimal
+    gate_active: bool
+    quote_currency: str
 
 
 # ---------------------------------------------------------------------------

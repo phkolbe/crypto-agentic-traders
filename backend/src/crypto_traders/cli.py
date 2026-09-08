@@ -120,8 +120,15 @@ async def _check(settings) -> int:
 
     print("\n  Limites de risco:")
     risk = settings.risk
-    print(f"    ordem maxima      : {risk.max_order_notional} {settings.trading.quote_currency} "
-          f"ou {risk.max_order_pct_portfolio:.1%} do portfolio (o menor)")
+    moeda = settings.trading.quote_currency
+    if risk.max_order_notional is None:
+        # Sem teto absoluto a ordem acompanha a carteira. Imprimir "None BRL"
+        # deixaria o leitor sem saber se e ausencia de limite ou erro de leitura.
+        print(f"    ordem maxima      : {risk.max_order_pct_portfolio:.1%} do capital "
+              f"(sem teto absoluto — a ordem acompanha o saldo)")
+    else:
+        print(f"    ordem maxima      : {risk.max_order_notional} {moeda} "
+              f"ou {risk.max_order_pct_portfolio:.1%} do portfolio (o menor)")
     print(f"    ordem minima      : {risk.min_order_notional} {settings.trading.quote_currency}")
     print(f"    exposicao maxima  : {risk.max_asset_exposure_pct:.0%} por ativo")
     print(f"    stop / alvo       : -{risk.stop_loss_pct:.1%} / +{risk.take_profit_pct:.1%} "
@@ -129,6 +136,15 @@ async def _check(settings) -> int:
     print(f"    circuit breaker   : -{risk.daily_loss_limit_pct:.1%} ao dia, "
           f"-{risk.weekly_loss_limit_pct:.1%} na semana")
     print(f"    cooldown          : {risk.cooldown_seconds}s por par")
+    posicoes = risk.max_open_positions
+    print(
+        "    posicoes abertas  : "
+        + (
+            f"no maximo {posicoes}"
+            if posicoes is not None
+            else "sem limite — o caixa limita, cada ordem consome dinheiro"
+        )
+    )
     if settings.trading.discovery_enabled:
         # A whitelist configurada nao vale neste modo: quem a define e a
         # varredura de mercado logo abaixo. Mostrar a lista salva aqui enganaria.
@@ -138,6 +154,7 @@ async def _check(settings) -> int:
     else:
         print(f"    whitelist         : {', '.join(risk.symbol_whitelist)}")
 
+    _check_capital_gate(settings)
     _check_protection_scope(settings)
     await _check_regime_filter(settings)
 
@@ -231,6 +248,27 @@ async def _load_business_config(settings) -> None:
     if not existia:
         print("    Primeira subida: os valores de negocio foram gravados com os")
         print("    padroes. Ajuste-os em Configuracoes, na interface web.")
+
+
+def _check_capital_gate(settings) -> None:
+    """Mostra o portao de capital: quanto o sistema pode por para trabalhar.
+
+    Sem esta linha, um saldo parado por falta de autorizacao seria
+    indistinguivel de "o sistema nao acha oportunidade" -- o mesmo modo de falha
+    silenciosa que o filtro de regime e o dimensionamento ja tiveram aqui.
+    """
+    autorizado = settings.risk.authorized_capital
+    moeda = settings.trading.quote_currency
+    print("\n  Portao de capital:")
+    if autorizado is None:
+        print("    DESLIGADO — todo o patrimonio esta disponivel, e depositos")
+        print("    futuros entram em operacao sem novo aval.")
+        return
+    print(f"    autorizado : {autorizado} {moeda}")
+    print("    Saldo acima disto fica PARADO e gera notificacao pedindo")
+    print("    autorizacao. Um deposito nao e uma ordem: dinheiro que entra")
+    print("    por outro motivo nao deveria virar exposicao sozinho.")
+    print("    Para liberar: botao em Risco, na interface.")
 
 
 def _check_protection_scope(settings) -> None:

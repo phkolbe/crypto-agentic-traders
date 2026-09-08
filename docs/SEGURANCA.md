@@ -544,7 +544,82 @@ que a exchange não faz em spot.
 
 ---
 
-## 12. Ambiente e negócio: a fronteira, e por que ela é rígida
+## 12. O portão de capital: auto-ajuste com aval humano
+
+O sistema acompanha o saldo sozinho, e não usa saldo que ninguém autorizou. As
+duas coisas ao mesmo tempo, porque resolvem problemas opostos.
+
+### O que travava o auto-ajuste
+
+Dois limites não escalavam com a carteira:
+
+- **Teto absoluto por ordem** (era R$25 fixo). Acima de ~R$167 de patrimônio ele
+  passava a mandar, e a ordem parava de crescer. Em R$5.000 o sistema operaria
+  1,5% da carteira.
+- **Número de posições** (era 3). O capital aplicado travava em 3 × teto,
+  independente do saldo.
+
+Os dois passaram a aceitar **ausência de limite**:
+
+| Campo | Vazio significa |
+|---|---|
+| Valor máximo por ordem | sem teto — o percentual manda e a ordem acompanha o saldo |
+| Máximo de posições abertas | sem limite — o caixa limita, porque cada ordem consome dinheiro |
+
+Com 15% por ordem e sem esses tetos, a carteira enche em **7 posições, 100% do
+capital autorizado**, em qualquer escala:
+
+| Autorizado | Ordem | Posições | Aplicado |
+|---|---|---|---|
+| R$150 | R$22,50 | 7 | R$150 (100%) |
+| R$650 | R$97,50 | 7 | R$650 (100%) |
+| R$2.650 | R$397,50 | 7 | R$2.650 (100%) |
+
+A última ordem é menor que as outras (limitada pelo caixa restante), e é isso que
+fecha os 100% sem sobra.
+
+### Por que existe um portão, se o objetivo é usar o saldo
+
+**Um depósito não é uma ordem.** Dinheiro entra numa conta de exchange por muitos
+motivos — venda de outro ativo, transferência que ia para outra finalidade,
+reserva temporária. Nenhum deles significa "aumente minha exposição em cripto".
+
+O campo **capital autorizado** é o teto de dinheiro que o sistema pode pôr para
+trabalhar. Saldo acima dele:
+
+- **não é usado** — nem para dimensionar ordens, nem para financiá-las;
+- **gera notificação** pedindo autorização, uma vez por transição.
+
+Autorizar grava um **número**, não desliga o portão. Desligar autorizaria também
+todo depósito futuro, que é exatamente o que o portão existe para impedir.
+Autorizar é um ato sobre o saldo de hoje, e vai para o `audit_log`.
+
+### Duas armadilhas que o desenho fecha
+
+**Reciclagem.** Se o portão olhasse apenas o caixa livre, vender uma posição e
+recomprar outra manteria exposição acima do autorizado. Por isso as posições
+abertas **consomem** a autorização: o que pode ser gasto é o autorizado menos o
+que já está aplicado.
+
+**Ruído no alerta.** Posição valorizando move o patrimônio para cima sem ninguém
+depositar nada. O alerta só sai quando o saldo não autorizado passa da ordem
+mínima, e uma vez por transição — a cada 60s o mesmo saldo geraria 1.440
+mensagens por dia, e um alerta que chega sempre deixa de ser lido.
+
+### O outro lado: dinheiro parado também é problema
+
+O aviso é ativo, e não uma linha no `check`, justamente porque o modo de falha
+silenciosa aqui é o mesmo que já apareceu duas vezes neste projeto: o sistema de
+pé, heartbeat verde, dashboard atualizando, e nada acontecendo por um motivo que
+ninguém vê. Saldo parado por falta de autorização seria indistinguível de "não há
+oportunidade".
+
+Por isso o `check` também imprime o portão, e a tela de Risco mostra uma faixa
+com o valor parado e um botão para liberar.
+
+---
+
+## 13. Ambiente e negócio: a fronteira, e por que ela é rígida
 
 O `.env` descreve **a instalação**. O banco guarda **o que negociar e com quanto
 risco**. Nenhuma variável mora nos dois lugares, e escrever uma variável de
@@ -613,7 +688,7 @@ acabou de criá-la com os padrões de fábrica.
 
 ---
 
-## 13. Antes de ligar o LIVE
+## 14. Antes de ligar o LIVE
 
 > ⚠️ **Leia a seção 11 antes.** O stop-loss existe em software, no Risk Manager,
 > e **não** na exchange. Ele não age se o processo morrer, se a máquina

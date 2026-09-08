@@ -4,8 +4,8 @@ import { useQuery } from '@tanstack/react-query'
 import type { ReactNode } from 'react'
 
 import { api } from '../api/client'
-import { MODE_LABEL, signedPercent } from '../api/format'
-import type { Health } from '../api/types'
+import { MODE_LABEL, money, signedPercent } from '../api/format'
+import type { CapitalStatus, Health } from '../api/types'
 
 export function useHealth() {
   return useQuery<Health>({
@@ -121,6 +121,46 @@ export function SizingBanner({ health }: { health: Health | undefined }) {
           rejeitados. Ajuste os limites em <strong>Risco</strong> ou aumente o patrimônio.
         </span>
       </div>
+    </div>
+  )
+}
+
+/**
+ * Saldo disponível que o sistema não pode usar até você autorizar.
+ *
+ * O portão existe porque um depósito não é uma ordem: dinheiro que entra na
+ * conta por qualquer motivo não deveria virar exposição sozinho. Mas dinheiro
+ * autorizado e parado é o problema oposto — e é por isso que este aviso pede
+ * ação em vez de apenas informar.
+ */
+export function CapitalGateBanner({
+  status,
+  onAuthorize,
+  authorizing,
+}: {
+  status: CapitalStatus | undefined
+  onAuthorize: () => void
+  authorizing?: boolean
+}) {
+  if (!status || !status.gate_active) return null
+  const parado = Number(status.unauthorized_value)
+  if (!(parado > 0)) return null
+
+  return (
+    <div className="alert-banner">
+      <div>
+        <strong>
+          {money(parado)} {status.quote_currency} disponíveis e não autorizados.
+        </strong>{' '}
+        <span className="muted">
+          O patrimônio é {money(Number(status.total_value))} e o capital autorizado a operar é{' '}
+          {money(Number(status.authorized_capital ?? 0))}. O sistema{' '}
+          <strong>não vai usar a diferença</strong> até você autorizar.
+        </span>
+      </div>
+      <button className="btn btn-primary" onClick={onAuthorize} disabled={authorizing}>
+        {authorizing ? 'Autorizando…' : 'Autorizar todo o saldo'}
+      </button>
     </div>
   )
 }

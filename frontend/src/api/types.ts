@@ -119,11 +119,20 @@ export interface Order {
   error: string | null
 }
 
+/** Capital autorizado a operar, e quanto está parado esperando aval. */
+export interface CapitalStatus {
+  total_value: Money
+  authorized_capital: Money | null
+  unauthorized_value: Money
+  gate_active: boolean
+  quote_currency: string
+}
+
 export interface RiskConfig {
-  max_order_notional: Money
+  max_order_notional: Money | null
   max_order_pct_portfolio: number
   max_asset_exposure_pct: number
-  max_open_positions: number
+  max_open_positions: number | null
   min_order_notional: Money
   stop_loss_pct: number
   take_profit_pct: number
@@ -134,6 +143,7 @@ export interface RiskConfig {
   symbol_whitelist: string[]
   cooldown_seconds: number
   mvrv_max_percentile: number
+  authorized_capital: Money | null
   circuit_breaker_active: boolean
   circuit_breaker_reason: string | null
 }

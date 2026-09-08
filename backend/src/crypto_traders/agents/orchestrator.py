@@ -291,6 +291,13 @@ class Orchestrator:
         except Exception as exc:
             log.error("orchestrator.protective_exit_failed", error=str(exc))
 
+        # Saldo que entrou e ninguem autorizou: o sistema nao o usa, e avisar e
+        # a unica forma de isso nao virar caixa ocioso silencioso.
+        try:
+            await self.risk_manager.check_capital_authorization(snapshot)
+        except Exception as exc:
+            log.error("orchestrator.capital_check_failed", error=str(exc))
+
         await self._check_sizing(snapshot)
 
         reason = await self.risk_manager.check_circuit_breaker(snapshot)

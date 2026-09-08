@@ -3,9 +3,10 @@ import { useEffect, useState } from 'react'
 
 import { ApiError, api } from '../api/client'
 import { dateTime } from '../api/format'
-import type { AuditEntry, RiskConfig } from '../api/types'
+import type { AuditEntry, CapitalStatus, RiskConfig } from '../api/types'
 import {
   AgentsOffline,
+  CapitalGateBanner,
   Card,
   CircuitBreakerBanner,
   Empty,
@@ -23,12 +24,19 @@ const FIELDS: {
   label: string
   help: string
   kind: 'money' | 'percent' | 'int'
+  /** Campo que aceita vazio como "sem limite". */
+  nullable?: boolean
 }[] = [
   {
     key: 'max_order_notional',
     label: 'Valor máximo por ordem',
-    help: 'Teto absoluto de uma única operação. Limita o estrago de um erro de cálculo.',
+    help:
+      'Teto absoluto de uma única operação. DEIXE VAZIO para não ter teto: aí o ' +
+      'percentual manda sozinho e a ordem acompanha a carteira a cada aporte, sem ' +
+      'você reconfigurar nada. Com teto fixo, o sistema para de crescer quando o ' +
+      'patrimônio passa dele.',
     kind: 'money',
+    nullable: true,
   },
   {
     key: 'max_order_pct_portfolio',
@@ -51,8 +59,12 @@ const FIELDS: {
   {
     key: 'max_open_positions',
     label: 'Máximo de posições abertas',
-    help: 'Aumentar uma posição já existente não conta como nova.',
+    help:
+      'Aumentar uma posição já existente não conta como nova. DEIXE VAZIO para não ' +
+      'limitar: quem limita passa a ser o caixa, porque cada ordem consome dinheiro ' +
+      'e a próxima só sai se sobrar acima da ordem mínima.',
     kind: 'int',
+    nullable: true,
   },
   {
     key: 'stop_loss_pct',
@@ -91,6 +103,16 @@ const FIELDS: {
     kind: 'int',
   },
   {
+    key: 'authorized_capital',
+    label: 'Capital autorizado a operar',
+    help:
+      'Teto de dinheiro que o sistema pode pôr para trabalhar. Saldo acima disto fica ' +
+      'parado e gera aviso pedindo autorização — um depósito não é uma ordem. DEIXE ' +
+      'VAZIO para liberar todo o patrimônio, inclusive depósitos futuros, sem novo aval.',
+    kind: 'money',
+    nullable: true,
+  },
+  {
     key: 'mvrv_max_percentile',
     label: 'Filtro de regime MVRV',
     help:
@@ -114,11 +136,38 @@ export default function RiskSettings() {
     retry: false,
   })
   const audit = useQuery<AuditEntry[]>({ queryKey: ['audit'], queryFn: () => api.audit(20) })
+  const capital = useQuery<CapitalStatus>({
+    queryKey: ['capital'],
+    queryFn: api.capitalStatus,
+    retry: false,
+  })
+
+  const authorize = useMutation({
+    mutationFn: api.authorizeCapital,
+    onSuccess: (novo) => {
+      setMessage({
+        ok: true,
+        text:
+          `Capital autorizado: ${novo.authorized_capital} ${novo.quote_currency}. ` +
+          'O saldo passa a ser usado no próximo ciclo, e o registro foi para o log de auditoria.',
+      })
+      queryClient.invalidateQueries({ queryKey: ['capital'] })
+      queryClient.invalidateQueries({ queryKey: ['riskConfig'] })
+      queryClient.invalidateQueries({ queryKey: ['audit'] })
+    },
+    onError: (error) =>
+      setMessage({ ok: false, text: error instanceof ApiError ? error.message : String(error) }),
+  })
 
   useEffect(() => {
     if (!config.data) return
     const initial: Record<string, string> = {}
-    for (const field of FIELDS) initial[field.key] = String(config.data[field.key])
+    for (const field of FIELDS) {
+      const valor = config.data[field.key]
+      // `null` significa "sem limite": mostrar a palavra "null" num campo
+      // numérico convidaria a digitar por cima sem entender o que havia ali.
+      initial[field.key] = valor === null || valor === undefined ? '' : String(valor)
+    }
     initial.asset_whitelist = config.data.asset_whitelist.join(', ')
     initial.symbol_whitelist = config.data.symbol_whitelist.join(', ')
     setDraft(initial)
@@ -153,8 +202,13 @@ export default function RiskSettings() {
   }
   if (config.isLoading) return <Loading />
 
+  const atual = (field: (typeof FIELDS)[number]) => {
+    const valor = config.data?.[field.key]
+    return valor === null || valor === undefined ? '' : String(valor)
+  }
+
   const changed = FIELDS.some(
-    (field) => draft[field.key] !== undefined && draft[field.key] !== String(config.data?.[field.key]),
+    (field) => draft[field.key] !== undefined && draft[field.key] !== atual(field),
   ) ||
     draft.asset_whitelist !== config.data?.asset_whitelist.join(', ') ||
     draft.symbol_whitelist !== config.data?.symbol_whitelist.join(', ')
@@ -163,7 +217,14 @@ export default function RiskSettings() {
     const payload: Record<string, unknown> = {}
     for (const field of FIELDS) {
       const value = draft[field.key]
-      if (value === undefined || value === String(config.data?.[field.key])) continue
+      if (value === undefined || value === atual(field)) continue
+      if (value === '' && field.nullable) {
+        // Num PUT parcial `null` significa "não enviei", então apagar um limite
+        // precisa de um gesto próprio no contrato da API.
+        payload[`clear_${field.key}`] = true
+        continue
+      }
+      if (value === '') continue
       payload[field.key] = field.kind === 'money' ? value : Number(value)
     }
     const assets = splitList(draft.asset_whitelist)
@@ -188,6 +249,12 @@ export default function RiskSettings() {
         </div>
       </div>
 
+      <CapitalGateBanner
+        status={capital.data}
+        onAuthorize={() => authorize.mutate()}
+        authorizing={authorize.isPending}
+      />
+
       <CircuitBreakerBanner
         active={config.data?.circuit_breaker_active ?? false}
         reason={config.data?.circuit_breaker_reason}
@@ -208,11 +275,13 @@ export default function RiskSettings() {
               <label>
                 {field.label}
                 {field.kind === 'percent' && <span className="faint"> (0–1)</span>}
+                {field.nullable && <span className="faint"> — vazio = sem limite</span>}
               </label>
               <input
                 type="number"
                 step={field.kind === 'int' ? '1' : 'any'}
                 min="0"
+                placeholder={field.nullable ? 'vazio = sem limite' : undefined}
                 value={draft[field.key] ?? ''}
                 onChange={(e) => setDraft({ ...draft, [field.key]: e.target.value })}
               />

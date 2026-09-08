@@ -79,6 +79,35 @@ class PortfolioState:
             mvrv_percentile=self.mvrv_percentile,
         )
 
+    def working_value(self, authorized: Decimal | None) -> Decimal:
+        """Patrimonio que o sistema pode dimensionar contra.
+
+        Com portao ativo, e o menor entre o patrimonio real e o autorizado --
+        entao um deposito nao autorizado nao aumenta o tamanho das ordens.
+        """
+        if authorized is None:
+            return self.total_value
+        return min(self.total_value, authorized)
+
+    def usable_cash(self, authorized: Decimal | None) -> Decimal:
+        """Caixa que pode ser gasto, respeitando a autorizacao.
+
+        As posicoes ja abertas consomem capital autorizado, entao o que resta
+        para gastar e o autorizado MENOS o que ja esta aplicado. Sem essa
+        subtracao, o portao seria furado pela reciclagem: vender uma posicao e
+        recomprar outra manteria a exposicao acima do autorizado.
+        """
+        if authorized is None:
+            return self.cash
+        aplicado = self.total_value - self.cash
+        return max(Decimal(0), min(self.cash, authorized - aplicado))
+
+    def unauthorized_value(self, authorized: Decimal | None) -> Decimal:
+        """Quanto do patrimonio esta parado por falta de autorizacao."""
+        if authorized is None:
+            return Decimal(0)
+        return max(Decimal(0), self.total_value - authorized)
+
     def quantity_of(self, asset: str) -> Decimal:
         return self.positions.get(asset, Decimal(0))
 
@@ -147,14 +176,22 @@ def assess_sizing_feasibility(
     saber disso na subida, nao depois de dias olhando um dashboard que nunca
     registra operacao.
     """
+    # O que vale e o capital autorizado: dimensionar contra o patrimonio bruto
+    # diria "tudo pronto" para um saldo que o sistema nao pode tocar.
+    if limits.authorized_capital is not None:
+        portfolio_value = min(portfolio_value, limits.authorized_capital)
+
     pct_cap = portfolio_value * Decimal(str(limits.max_order_pct_portfolio))
     exposure_cap = portfolio_value * Decimal(str(limits.max_asset_exposure_pct))
 
     candidates = {
-        "teto absoluto por ordem": limits.max_order_notional,
         f"{limits.max_order_pct_portfolio:.0%} do portfolio por ordem": pct_cap,
         f"exposicao maxima de {limits.max_asset_exposure_pct:.0%} por ativo": exposure_cap,
     }
+    # Teto ausente nao entra na disputa do gargalo: `None` nao se compara com
+    # Decimal, e um teto que nao existe nunca e o limite que trava.
+    if limits.max_order_notional is not None:
+        candidates["teto absoluto por ordem"] = limits.max_order_notional
     binding_limit, max_possible = min(candidates.items(), key=lambda item: item[1])
 
     # O gargalo e sempre o menor entre o percentual por ordem e a exposicao
@@ -299,7 +336,7 @@ class RiskEngine:
         already_held = state.quantity_of(base) > 0
         # Aumentar uma posicao existente nao abre uma nova, entao o limite de
         # posicoes abertas nao deve bloquear esse caso.
-        if not already_held:
+        if not already_held and limits.max_open_positions is not None:
             open_count = state.open_positions(self.quote_currency, dust)
             if open_count >= limits.max_open_positions:
                 reasons.append(
@@ -316,26 +353,38 @@ class RiskEngine:
             reasons.append("portfolio sem valor apurado; impossivel dimensionar a ordem")
             return self._reject(signal, reasons, state)
 
-        # Tamanho = o MENOR entre o teto absoluto e o teto percentual. Os dois
-        # existem porque protegem de coisas diferentes: o percentual acompanha o
-        # crescimento da carteira, o absoluto limita o estrago de um erro de
-        # calculo no percentual.
-        notional = min(
-            limits.max_order_notional,
-            state.total_value * Decimal(str(limits.max_order_pct_portfolio)),
-        )
+        # Todo dimensionamento acontece sobre o capital AUTORIZADO, nao sobre o
+        # patrimonio bruto. Um deposito nao autorizado nao aumenta ordem nenhuma.
+        working = state.working_value(limits.authorized_capital)
+        if working <= 0:
+            reasons.append(
+                "nenhum capital autorizado para operar "
+                f"(patrimonio {state.total_value:.2f} {self.quote_currency}); "
+                "autorize o uso do saldo na interface"
+            )
+            return self._reject(signal, reasons, state)
 
-        # Nunca gastar mais caixa do que existe.
-        notional = min(notional, state.cash)
+        # Tamanho pelo teto percentual, que acompanha o capital de trabalho...
+        notional = working * Decimal(str(limits.max_order_pct_portfolio))
+        # ...e pelo teto absoluto, se houver. NULO significa "sem teto": o
+        # percentual manda sozinho e a ordem cresce junto com a carteira, sem
+        # ninguem reconfigurar nada a cada aporte.
+        if limits.max_order_notional is not None:
+            notional = min(notional, limits.max_order_notional)
+
+        # Nunca gastar mais caixa do que existe -- nem mais do que o autorizado
+        # ainda nao aplicado.
+        disponivel = state.usable_cash(limits.authorized_capital)
+        notional = min(notional, disponivel)
 
         if notional < limits.min_order_notional:
             reasons.append(
                 f"tamanho disponivel {notional:.2f} {self.quote_currency} abaixo do minimo "
-                f"{limits.min_order_notional} (caixa: {state.cash:.2f})"
+                f"{limits.min_order_notional} (caixa utilizavel: {disponivel:.2f})"
             )
 
         # Exposicao maxima por ativo, contando o que ja existe.
-        exposure_cap = state.total_value * Decimal(str(limits.max_asset_exposure_pct))
+        exposure_cap = working * Decimal(str(limits.max_asset_exposure_pct))
         current_exposure = state.value_of(base)
         headroom = exposure_cap - current_exposure
         if headroom <= 0:
@@ -431,7 +480,16 @@ class RiskEngine:
             "circuit_breaker_active": state.circuit_breaker_active,
             "mvrv_percentile": state.mvrv_percentile,
             "limits": {
-                "max_order_notional": str(self.limits.max_order_notional),
+                "max_order_notional": (
+                    str(self.limits.max_order_notional)
+                    if self.limits.max_order_notional is not None
+                    else None
+                ),
+                "authorized_capital": (
+                    str(self.limits.authorized_capital)
+                    if self.limits.authorized_capital is not None
+                    else None
+                ),
                 "max_order_pct_portfolio": self.limits.max_order_pct_portfolio,
                 "max_asset_exposure_pct": self.limits.max_asset_exposure_pct,
                 "min_signal_confidence": self.limits.min_signal_confidence,

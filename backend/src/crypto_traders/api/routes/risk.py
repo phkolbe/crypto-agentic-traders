@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...agents.orchestrator import Orchestrator
 from ...db.repositories import AuditLogRepository, RiskConfigRepository, RiskEventRepository
 from ..deps import db_session, orchestrator_dep
-from ..schemas import AuditEntryOut, RiskConfigIn, RiskConfigOut, RiskEventOut
+from ..schemas import (
+    AuditEntryOut,
+    CapitalStatusOut,
+    RiskConfigIn,
+    RiskConfigOut,
+    RiskEventOut,
+)
 
 router = APIRouter()
 
@@ -46,7 +54,21 @@ async def update_risk_config(
             detail="alterar limites de risco afeta dinheiro real; envie confirm=true",
         )
 
-    changes = payload.model_dump(exclude_none=True, exclude={"confirm"})
+    limpar = {
+        "max_order_notional": payload.clear_max_order_notional,
+        "max_open_positions": payload.clear_max_open_positions,
+        "authorized_capital": payload.clear_authorized_capital,
+    }
+    changes = payload.model_dump(
+        exclude_none=True,
+        exclude={"confirm", *(f"clear_{campo}" for campo in limpar)},
+    )
+    # Remover um teto e um gesto proprio: num PUT parcial, `null` significa "nao
+    # enviei". Sem os campos `clear_*` nao existiria como apagar um limite.
+    for campo, remover in limpar.items():
+        if remover:
+            changes[campo] = None
+
     if not changes:
         raise HTTPException(status_code=400, detail="nenhum campo enviado")
 
@@ -60,6 +82,52 @@ async def update_risk_config(
         **updated.model_dump(),
         circuit_breaker_active=config.circuit_breaker_active,
         circuit_breaker_reason=config.circuit_breaker_reason,
+    )
+
+
+@router.get("/risk/capital", response_model=CapitalStatusOut)
+async def get_capital_status(
+    orchestrator: Orchestrator = Depends(orchestrator_dep),
+) -> CapitalStatusOut:
+    """Quanto capital esta autorizado a operar, e quanto espera aval."""
+    limits = orchestrator.risk_manager.configured_limits
+    snapshot = orchestrator.risk_manager.last_snapshot
+    total = snapshot.total_value if snapshot else Decimal(0)
+    autorizado = limits.authorized_capital
+    return CapitalStatusOut(
+        total_value=total,
+        authorized_capital=autorizado,
+        unauthorized_value=(
+            max(Decimal(0), total - autorizado) if autorizado is not None else Decimal(0)
+        ),
+        gate_active=autorizado is not None,
+        quote_currency=orchestrator.settings.trading.quote_currency,
+    )
+
+
+@router.post("/risk/capital/authorize", response_model=CapitalStatusOut)
+async def authorize_capital(
+    orchestrator: Orchestrator = Depends(orchestrator_dep),
+) -> CapitalStatusOut:
+    """Autoriza o patrimonio inteiro apurado agora a ser posto para trabalhar.
+
+    Grava um numero em vez de desligar o portao: desligar autorizaria tambem
+    todo deposito futuro, que e exatamente o que o portao existe para impedir.
+    Autorizar e um ato sobre o saldo de hoje, e fica no `audit_log`.
+    """
+    try:
+        limits = await orchestrator.risk_manager.authorize_all_capital(actor="user")
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    snapshot = orchestrator.risk_manager.last_snapshot
+    total = snapshot.total_value if snapshot else Decimal(0)
+    return CapitalStatusOut(
+        total_value=total,
+        authorized_capital=limits.authorized_capital,
+        unauthorized_value=Decimal(0),
+        gate_active=limits.authorized_capital is not None,
+        quote_currency=orchestrator.settings.trading.quote_currency,
     )
 
 

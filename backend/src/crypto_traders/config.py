@@ -88,6 +88,7 @@ RETIRED_ENV_KEYS = frozenset(
         "RISK_SYMBOL_WHITELIST",
         "RISK_COOLDOWN_SECONDS",
         "RISK_MVRV_MAX_PERCENTILE",
+        "RISK_AUTHORIZED_CAPITAL",
     }
 )
 
@@ -149,10 +150,14 @@ class RiskSettings(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    max_order_notional: Decimal = Field(
+    max_order_notional: Decimal | None = Field(
         default=Decimal("50"),
         gt=0,
-        description="Valor maximo absoluto de uma unica ordem, na moeda de cotacao.",
+        description=(
+            "Teto absoluto de uma unica ordem, na moeda de cotacao. "
+            "NULO desliga o teto e deixa o percentual mandar sozinho, o que faz "
+            "a ordem acompanhar a carteira sem ninguem reconfigurar nada."
+        ),
     )
     max_order_pct_portfolio: float = Field(
         default=0.02,
@@ -166,7 +171,15 @@ class RiskSettings(BaseModel):
         le=1,
         description="Fracao maxima do portfolio concentrada em um unico ativo.",
     )
-    max_open_positions: int = Field(default=5, ge=1)
+    max_open_positions: int | None = Field(
+        default=5,
+        ge=1,
+        description=(
+            "Numero maximo de posicoes abertas ao mesmo tempo. NULO remove o "
+            "limite: quem passa a limitar e o caixa, porque cada ordem consome "
+            "dinheiro e a proxima so sai se sobrar acima da ordem minima."
+        ),
+    )
     min_order_notional: Decimal = Field(
         default=Decimal("10"),
         gt=0,
@@ -191,6 +204,20 @@ class RiskSettings(BaseModel):
         ge=0,
         description="Intervalo minimo entre duas ordens do mesmo par, evitando overtrading.",
     )
+    authorized_capital: Decimal | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Teto de capital que o sistema pode POR PARA TRABALHAR, na moeda de "
+            "cotacao. Saldo acima disto e ignorado no dimensionamento e gera "
+            "notificacao pedindo autorizacao. NULO desliga o portao: todo o "
+            "patrimonio fica disponivel. "
+            "Existe porque um deposito nao e uma ordem: dinheiro que entra na "
+            "conta por qualquer motivo -- venda de outro ativo, transferencia, "
+            "reserva para outra finalidade -- nao deveria virar exposicao sem "
+            "alguem dizer que sim."
+        ),
+    )
     mvrv_max_percentile: float = Field(
         default=1.0,
         gt=0,
@@ -211,7 +238,10 @@ class RiskSettings(BaseModel):
 
     @model_validator(mode="after")
     def _check_coherence(self) -> RiskSettings:
-        if self.min_order_notional > self.max_order_notional:
+        if (
+            self.max_order_notional is not None
+            and self.min_order_notional > self.max_order_notional
+        ):
             raise ValueError("a ordem minima nao pode ser maior que a ordem maxima")
         if self.take_profit_pct <= self.stop_loss_pct:
             raise ValueError(

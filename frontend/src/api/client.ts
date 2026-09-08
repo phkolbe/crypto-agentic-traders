@@ -13,6 +13,7 @@ import type {
   RiskEvent,
   Signal,
   StrategyInfo,
+  CapitalStatus,
   TradePage,
   TradingConfig,
 } from './types'
@@ -86,6 +87,10 @@ export const api = {
       // `confirm` e obrigatorio no backend: alterar limites afeta dinheiro real.
       body: JSON.stringify({ ...payload, confirm: true }),
     }),
+  capitalStatus: () => request<CapitalStatus>('/risk/capital'),
+  authorizeCapital: () =>
+    request<CapitalStatus>('/risk/capital/authorize', { method: 'POST' }),
+
   resetCircuitBreaker: () =>
     request<RiskConfig>('/risk/circuit-breaker/reset', { method: 'POST' }),
 
