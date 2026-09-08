@@ -43,6 +43,11 @@ HEARTBEAT_TIMEOUT = timedelta(minutes=10)
 #: Intervalo da vigilancia de saude.
 WATCHDOG_INTERVAL_SECONDS = 60
 
+#: Com que frequencia o loop tenta atualizar a serie on-chain. O provedor tem seu
+#: proprio piso de 12h (`onchain.REFRESH_INTERVAL`), entao acordar de hora em hora
+#: e barato: quase sempre nao faz nada, e cobre o caso de a busca ter falhado.
+ONCHAIN_REFRESH_INTERVAL_SECONDS = 3600
+
 
 class Orchestrator:
     """Dono do ciclo de vida de todos os agentes."""
@@ -56,6 +61,7 @@ class Orchestrator:
         self._broker: Broker | None = None
         self._watchdog: asyncio.Task[None] | None = None
         self._alert_listener: asyncio.Task[None] | None = None
+        self._onchain_refresher: asyncio.Task[None] | None = None
         self.started_at: datetime | None = None
         self.sizing: SizingFeasibility | None = None
         self._sizing_alerted = False
@@ -130,6 +136,9 @@ class Orchestrator:
 
         self._alert_listener = asyncio.create_task(self._listen_alerts(), name="alert-listener")
         self._watchdog = asyncio.create_task(self._watch_health(), name="watchdog")
+        self._onchain_refresher = asyncio.create_task(
+            self._refresh_onchain_forever(), name="onchain-refresher"
+        )
         self.started_at = datetime.now(UTC)
 
         async with session_scope(self.settings) as session:
@@ -155,10 +164,15 @@ class Orchestrator:
         try:
             # Descoberta ANTES da primeira coleta: sem universo definido, o
             # refresh nao teria par nenhum para buscar e o sistema subiria cego.
-            # Serie on-chain antes do primeiro sinal: sem ela o filtro de
-            # regime nao se aplica, e isso precisa ser escolha, nao acidente.
-            if self.settings.risk.mvrv_max_percentile < 1.0:
-                await self.onchain.refresh_mvrv(force=True)
+            #
+            # Serie on-chain antes do primeiro sinal: sem ela o filtro de regime
+            # nao se aplica, e isso precisa ser escolha, nao acidente. Buscamos
+            # SEMPRE, mesmo com o filtro desligado, por dois motivos concretos:
+            # o limiar vigente pode vir do banco (alterado pela interface) e nao
+            # do `.env`, entao condicionar a busca ao `.env` deixaria o filtro
+            # ligado e inerte; e ter a leitura disponivel permite exibi-la e
+            # liga-la pela interface sem reiniciar o processo.
+            await self.onchain.refresh_mvrv(force=True)
             await self.market_data.discover_symbols(force=True)
             await self.market_data.refresh()
             self._sync_paper_prices()
@@ -170,12 +184,12 @@ class Orchestrator:
             log.warning("orchestrator.portfolio_priming_failed", error=str(exc))
 
     async def stop(self) -> None:
-        for task in (self._watchdog, self._alert_listener):
+        for task in (self._watchdog, self._alert_listener, self._onchain_refresher):
             if task is not None:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
-        self._watchdog = self._alert_listener = None
+        self._watchdog = self._alert_listener = self._onchain_refresher = None
 
         for agent in self.agents.values():
             with contextlib.suppress(Exception):
@@ -361,6 +375,24 @@ class Orchestrator:
                 # Falha ao notificar nunca pode derrubar o loop de alertas: o
                 # evento já está no log, que é a fonte de verdade da auditoria.
                 log.error("orchestrator.alert_delivery_failed", error=str(exc))
+
+    async def _refresh_onchain_forever(self) -> None:
+        """Mantem a serie MVRV atualizada enquanto o sistema roda.
+
+        Sem isto a serie congelava no dia do start: o filtro de regime seguiria
+        respondendo com o percentil daquele dia por semanas, e um mercado que
+        esquentou depois passaria batido. Um dado velho que parece atual e pior
+        que dado nenhum, porque o `None` ao menos desliga o filtro de forma
+        visivel no log.
+        """
+        while True:
+            await asyncio.sleep(ONCHAIN_REFRESH_INTERVAL_SECONDS)
+            try:
+                await self.onchain.refresh_mvrv()
+            except Exception as exc:
+                # Provedor externo instavel nao derruba o refresher: na proxima
+                # volta tenta de novo, e o filtro nao depende disto para operar.
+                log.warning("orchestrator.onchain_refresh_failed", error=str(exc))
 
     async def _watch_health(self) -> None:
         """Reinicia agentes que morreram ou pararam de dar sinal de vida.

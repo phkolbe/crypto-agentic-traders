@@ -242,3 +242,108 @@ class TestPersistence:
                 date(2026, 3, 1),
                 2.0,
             )
+
+
+class TestSeriesStaysFresh:
+    """A serie MVRV nao pode congelar no dia do start.
+
+    Com o filtro ligado e a serie parada, o percentil de um dia velho seguiria
+    valendo por semanas. Dado velho que parece atual e pior que dado nenhum: o
+    `None` pelo menos desliga o filtro de forma visivel no log.
+    """
+
+    def _orquestrador(self, settings):
+        from crypto_traders.agents.orchestrator import Orchestrator
+
+        return Orchestrator(settings)
+
+    async def test_priming_fetches_even_with_the_filter_off(self, settings, monkeypatch):
+        """O limiar vigente pode vir do banco, nao do `.env`.
+
+        Condicionar a busca ao `.env` deixaria o filtro ligado pela interface e
+        inerte por falta de dado -- o pior dos dois mundos.
+        """
+        import crypto_traders.agents.orchestrator as mod
+
+        assert settings.risk.mvrv_max_percentile == 1.0
+
+        chamadas: list[bool] = []
+
+        async def falso_refresh(self, force=False):
+            chamadas.append(force)
+            return 0
+
+        monkeypatch.setattr(mod.OnChainProvider, "refresh_mvrv", falso_refresh)
+
+        orch = self._orquestrador(settings)
+        orch.onchain = mod.OnChainProvider(settings)
+        await orch._prime_portfolio()
+
+        assert chamadas == [True]
+
+    async def _rodar_loop(self, orch, monkeypatch, voltas: int) -> None:
+        """Roda o loop por N voltas e o encerra.
+
+        O sleep e substituido por um contador que levanta `CancelledError` na
+        volta N -- exatamente como um `stop()` faria. Nao usamos `create_task`
+        porque trocar `asyncio.sleep` mexe no modulo compartilhado e o proprio
+        teste perderia como ceder controle.
+        """
+        import asyncio
+        import contextlib
+
+        import crypto_traders.agents.orchestrator as mod
+
+        restante = {"n": voltas}
+
+        async def sleep_contado(_segundos):
+            restante["n"] -= 1
+            if restante["n"] < 0:
+                raise asyncio.CancelledError
+
+        monkeypatch.setattr(mod.asyncio, "sleep", sleep_contado)
+        try:
+            with contextlib.suppress(asyncio.CancelledError):
+                await orch._refresh_onchain_forever()
+        finally:
+            monkeypatch.undo()
+
+    async def test_loop_never_forces_the_fetch(self, settings, monkeypatch):
+        """O loop acorda de hora em hora, mas nao busca de hora em hora.
+
+        Quem decide se vale ir a rede e o provedor (piso de 12h). Passar
+        `force=True` aqui furaria esse piso e criaria duas verdades sobre a
+        mesma regra.
+        """
+        import crypto_traders.agents.orchestrator as mod
+
+        chamadas: list[bool] = []
+
+        async def falso_refresh(self, force=False):
+            chamadas.append(force)
+            return 0
+
+        monkeypatch.setattr(mod.OnChainProvider, "refresh_mvrv", falso_refresh)
+
+        orch = self._orquestrador(settings)
+        orch.onchain = mod.OnChainProvider(settings)
+        await self._rodar_loop(orch, monkeypatch, voltas=3)
+
+        assert chamadas == [False, False, False]
+
+    async def test_a_failing_provider_does_not_kill_the_loop(self, settings, monkeypatch):
+        import crypto_traders.agents.orchestrator as mod
+
+        tentativas: list[int] = []
+
+        async def explode(self, force=False):
+            tentativas.append(1)
+            raise RuntimeError("provedor fora do ar")
+
+        monkeypatch.setattr(mod.OnChainProvider, "refresh_mvrv", explode)
+
+        orch = self._orquestrador(settings)
+        orch.onchain = mod.OnChainProvider(settings)
+        await self._rodar_loop(orch, monkeypatch, voltas=3)
+
+        assert len(tentativas) == 3, "o loop parou na primeira falha"

@@ -131,6 +131,9 @@ async def _check(settings) -> int:
         print(f"    conexao   : FALHOU — {exc}")
         return 1
 
+    await _check_stored_limits(settings)
+    await _check_regime_filter(settings)
+
     print("\n  Conectividade com a exchange (endpoints publicos):")
     markets: dict = {}
     tickers: dict = {}
@@ -195,6 +198,94 @@ async def _check(settings) -> int:
 
     print("\n  Tudo pronto.\n")
     return 0
+
+
+async def _check_stored_limits(settings) -> None:
+    """Avisa quando o banco tem limites diferentes do `.env`.
+
+    A partir da primeira subida o banco passa a ser a fonte da verdade, e o
+    `.env` deixa de ter efeito sobre os limites. Sem este aviso, o diagnostico
+    imprimiria os numeros do arquivo enquanto o sistema opera por outros -- o
+    tipo de divergencia silenciosa que so aparece depois de uma ordem estranha.
+    """
+    from .db.repositories import RiskConfigRepository
+
+    try:
+        async with session_scope(settings) as session:
+            gravado = dict((await RiskConfigRepository(session).get_or_create({})).values or {})
+    except Exception as exc:
+        print(f"\n  Limites gravados : nao foi possivel ler — {exc}")
+        return
+
+    if not gravado:
+        print("\n  Limites gravados : nenhum; o `.env` vale na proxima subida.")
+        return
+
+    do_env = settings.risk.model_dump(mode="json")
+    ignorar = {"symbol_whitelist", "asset_whitelist"}
+    divergentes = [
+        (campo, gravado[campo], do_env[campo])
+        for campo in do_env
+        if campo in gravado and campo not in ignorar and str(gravado[campo]) != str(do_env[campo])
+    ]
+
+    if not divergentes:
+        print("\n  Limites gravados : iguais ao `.env`.")
+        return
+
+    print("\n  Limites gravados no banco DIVERGEM do `.env`:")
+    print(f"    {'campo':<28}{'vale (banco)':>16}{'ignorado (.env)':>18}")
+    for campo, banco, arquivo in divergentes:
+        print(f"    {campo:<28}{banco!s:>16}{arquivo!s:>18}")
+    print("    Editar o `.env` NAO muda estes valores: use a tela de risco na")
+    print("    interface, que grava no banco e registra no audit_log.")
+
+
+async def _check_regime_filter(settings) -> None:
+    """Mostra a leitura MVRV atual e se ela esta barrando entradas agora.
+
+    Um filtro de regime pode estar corretamente configurado e, ainda assim,
+    bloquear toda compra hoje. Isso e indistinguivel de "o sistema nao acha
+    oportunidades" olhando so o dashboard, entao o diagnostico precisa dizer.
+    """
+    from .db.repositories import RiskConfigRepository
+    from .onchain import OnChainProvider
+
+    limiar = settings.risk.mvrv_max_percentile
+    try:
+        async with session_scope(settings) as session:
+            gravado = dict((await RiskConfigRepository(session).get_or_create({})).values or {})
+        if "mvrv_max_percentile" in gravado:
+            limiar = float(gravado["mvrv_max_percentile"])
+    except Exception:
+        pass
+
+    print("\n  Filtro de regime (MVRV Z-Score):")
+    if limiar >= 1.0:
+        print("    DESLIGADO (limiar 1.0) — nenhuma entrada e barrada por regime.")
+        return
+
+    print(f"    limiar     : percentil <= {limiar:.0%} para ABRIR posicao")
+    provider = OnChainProvider(settings)
+    leitura = await provider.mvrv_reading()
+    if leitura is None:
+        novos = await provider.refresh_mvrv(force=True)
+        leitura = await provider.mvrv_reading()
+        if leitura is None:
+            print("    leitura    : INDISPONIVEL — sem o dado o filtro nao se aplica")
+            print(f"                 (a busca trouxe {novos} pontos; ver logs)")
+            return
+
+    print(f"    leitura    : z = {leitura.value:.2f}, percentil {leitura.percentile:.0%} "
+          f"({leitura.zone})")
+    if leitura.percentile > limiar:
+        print("    AGORA      : ABRIR POSICAO ESTA BLOQUEADO pelo filtro.")
+        print("                 Fechar posicao continua liberado — o filtro nunca")
+        print("                 trava a saida. Sinais de compra serao rejeitados")
+        print("                 com motivo registrado, e isso e o esperado.")
+    else:
+        margem = limiar - leitura.percentile
+        print(f"    AGORA      : liberado (margem de {margem:.0%} ate o bloqueio).")
 
 
 def _check_sizing(settings, quote_balance: Decimal | None = None) -> SizingFeasibility | None:

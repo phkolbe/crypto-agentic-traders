@@ -392,20 +392,53 @@ Em 1d sobre 16 pares BRL (998 dias, incluindo períodos caros de 2024):
 | macd_trend | ≤ 40% | +4,36% | **9,59%** |
 | rsi_reversion | desligado | +40,55% | 40,51% |
 | rsi_reversion | ≤ 40% | −15,81% | 33,58% |
+| as três juntas | desligado | −8,95% | **46,40%** |
+| as três juntas | ≤ 40% | **−7,20%** | **21,37%** |
 
 **A queda máxima cai de forma consistente nas três estratégias.** O retorno cai
 junto, e mais. A razão é estrutural: o MVRV fica alto *durante* as altas, que é
 exatamente quando uma estratégia de tendência ganha dinheiro. Filtrar por "está
 caro" filtra também "está subindo".
 
-Em 4h (166 dias) o filtro não teve efeito nenhum — o percentil variou entre 11%
-e 43% em toda a janela, e nada acima de 60% para bloquear. Avaliar um filtro de
-regime exige uma janela que contenha os dois regimes.
+A linha das três estratégias juntas é a exceção que importa: ali o filtro
+**melhorou o retorno em 1,75 pp e ainda cortou a queda máxima pela metade**. É a
+única configuração medida em que ele não cobra nada pela proteção. Ressalva
+honesta: é uma janela. As linhas individuais, medidas em três janelas
+(2024/2025/2026), mostraram o padrão oposto — proteção paga com retorno.
 
-Por isso `RISK_MVRV_MAX_PERCENTILE=1.0` (desligado) é o padrão. Ligá-lo é uma
-escolha legítima **se o objetivo for preservar capital em vez de maximizar
-retorno** — é o único ajuste do sistema que demonstrou reduzir drawdown de forma
-consistente.
+Em 4h (166 dias) o filtro quase não age: o percentil variou entre 11% e 43% em
+toda a janela e passou de 40% em apenas 10% dos dias. O efeito é pequeno e
+negativo (−3,1 pp no `rsi_reversion`, queda máxima **idêntica**), porque bloquear
+10% dos dias remove entradas sem remover nenhum topo. Avaliar um filtro de regime
+exige uma janela que contenha os dois regimes.
+
+### O que ele faz *hoje*, e não só no histórico
+
+Um filtro de regime pode estar corretamente configurado e, ainda assim, barrar
+**toda** compra hoje. Em 2026-09-07 o Z-Score era 0,91 → percentil **43%**, e com
+o limiar em 40% o sistema não abre posição nenhuma. Isso é indistinguível de "os
+agentes não acham oportunidade" olhando só o dashboard.
+
+Por isso o `check` passou a imprimir a leitura atual e a dizer, em uma linha, se
+abrir posição está bloqueado neste momento. Ligar o filtro sem essa visibilidade
+produz o pior estado do sistema: de pé, saudável, e inerte por decisão própria —
+sem que ninguém saiba.
+
+`RISK_MVRV_MAX_PERCENTILE=1.0` (desligado) segue sendo o padrão de quem clona o
+projeto. Ligá-lo é uma escolha legítima **se o objetivo for preservar capital em
+vez de maximizar retorno** — é o único ajuste do sistema que demonstrou reduzir
+drawdown de forma consistente.
+
+**Nesta instância o filtro está ligado em 0,40**, por decisão registrada
+(D14 no plano). Com o limiar em 0,40 e o percentil em 43%, a consequência prática
+é: nenhuma entrada nova até o MVRV recuar. Sair continua liberado.
+
+### A série não pode congelar
+
+O dado é buscado no start e atualizado a cada 12h por uma tarefa própria do
+orquestrador. Sem essa tarefa a série parava no dia da subida e o filtro seguiria
+respondendo com o percentil daquele dia por semanas. Dado velho que parece atual é
+pior que dado nenhum: o `None` ao menos desliga o filtro de forma visível no log.
 
 Nunca bloqueia fechamento: o indicador diz "está caro", não "fique preso".
 E dado ausente não bloqueia nada — sem o provedor, o sistema volta ao
@@ -413,7 +446,35 @@ comportamento sem filtro, que é o estado conhecido e testado.
 
 ---
 
-## 11. Antes de ligar o LIVE
+## 11. Onde os limites de risco realmente moram
+
+O `.env` semeia os limites **uma única vez**: na primeira subida o Risk Manager
+grava a linha `risk_config` e, a partir daí, **o banco é a fonte da verdade**.
+Editar o `.env` depois disso não muda nada — e não avisa.
+
+Isso não é acidente: os limites são editáveis pela interface, cada alteração vai
+para o `audit_log`, e um arquivo de texto não pode sobrescrever silenciosamente
+uma decisão que alguém tomou e assinou. O problema era a **falta de aviso**: o
+`check` imprimia os números do arquivo enquanto o sistema operava por outros.
+
+Foi o que aconteceu nesta instância. O `.env` dizia ordem máxima de 7 e no máximo
+2 posições; o banco, semeado dias antes com os padrões da época, mandava 50 e 5.
+Sete campos divergiam, incluindo os dois circuit breakers.
+
+Agora o `check` compara os dois e imprime a divergência campo por campo, dizendo
+qual valor vale. Para mudar limites de verdade há dois caminhos:
+
+- **Interface** → tela de risco (grava no banco, exige `confirm`, vai ao audit_log).
+- **Recomeçar do `.env`** → apagar a linha `risk_config` e subir de novo. Só faça
+  isso sabendo que **afrouxar** um limite assim não deixa rastro de quem decidiu.
+
+Regra prática: se o `check` mostrar divergência, resolva antes de operar. Um
+sistema que respeita limites diferentes dos que você acabou de ler é a pior
+combinação possível entre segurança e surpresa.
+
+---
+
+## 12. Antes de ligar o LIVE
 
 Uma sequência, não uma escolha:
 
