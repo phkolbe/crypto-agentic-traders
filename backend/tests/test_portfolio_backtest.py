@@ -197,3 +197,54 @@ class TestMultipleStrategies:
             strategies=[MovingAverageCrossover(fast=3, slow=10), RsiReversion(period=14)],
         ).run(candles)
         assert duas.signals_generated >= uma.signals_generated
+
+
+class TestWarmupAlignment:
+    """`min_warmup` existe para tornar execucoes diferentes comparaveis.
+
+    `macd_trend` exige 105 candles de aquecimento e `ma_crossover` 26. Sem
+    alinhar, cada combinacao comeca a operar -- e a medir o comprar-e-segurar --
+    num ponto distinto da serie. Em candles diarios isso produziu um benchmark
+    de 56% numa linha e 1,7% em outra, sobre a MESMA janela, e fez estrategias
+    parecerem vencer o mercado.
+    """
+
+    async def test_aligned_runs_share_the_same_benchmark(self):
+        symbols = ["A/BRL"]
+        candles = candles_for(symbols, periods=300)
+        rapida = MovingAverageCrossover(fast=3, slow=10)
+        lenta = RsiReversion(period=14)
+
+        alinhados = [
+            await engine(
+                limits(symbols=symbols), strategies=[s], min_warmup=120
+            ).run(candles)
+            for s in (rapida, lenta)
+        ]
+        referencias = {r.buy_and_hold_pct for r in alinhados}
+        assert len(referencias) == 1, "benchmark deve ser identico entre execucoes alinhadas"
+
+    async def test_without_alignment_benchmarks_diverge(self):
+        """Documenta o problema que o alinhamento resolve."""
+        symbols = ["A/BRL"]
+        candles = candles_for(symbols, periods=300)
+
+        curto = await engine(
+            limits(symbols=symbols), strategies=[MovingAverageCrossover(fast=3, slow=10)]
+        ).run(candles)
+        longo = await engine(
+            limits(symbols=symbols), strategies=[RsiReversion(period=14)]
+        ).run(candles)
+
+        assert curto.first_prices != longo.first_prices
+
+    async def test_override_below_strategy_requirement_is_ignored(self):
+        """O aquecimento da estrategia e um piso, nao uma sugestao."""
+        symbols = ["A/BRL"]
+        candles = candles_for(symbols, periods=300)
+        strategy = MovingAverageCrossover(fast=9, slow=21)
+        result = await engine(
+            limits(symbols=symbols), strategies=[strategy], min_warmup=5
+        ).run(candles)
+        fechados = [c for c in candles["A/BRL"] if c.closed]
+        assert result.first_prices["A/BRL"] == fechados[strategy.min_candles].close

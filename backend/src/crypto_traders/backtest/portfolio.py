@@ -163,6 +163,7 @@ class PortfolioBacktestEngine:
         fee_pct: Decimal = Decimal("0.001"),
         slippage_pct: Decimal = Decimal("0.0005"),
         lookback: int = 500,
+        min_warmup: int = 0,
     ) -> None:
         self.strategies = strategies
         self.limits = risk_limits
@@ -172,7 +173,15 @@ class PortfolioBacktestEngine:
         self.fee_pct = fee_pct
         self.slippage_pct = slippage_pct
         self.lookback = lookback
-        self._warmup = max((s.min_candles for s in strategies), default=50)
+        # `min_warmup` alinha o inicio entre execucoes diferentes. E necessario
+        # para comparar estrategias entre si: `macd_trend` exige 105 candles de
+        # aquecimento e `ma_crossover` 26, entao sem alinhar cada uma comeca a
+        # operar -- e a medir o comprar-e-segurar -- num ponto distinto da serie.
+        # Em candles diarios isso foi a diferenca entre um benchmark de 56% e um
+        # de 1,7% na MESMA janela, e fez estrategias parecerem vencer o mercado.
+        self._warmup = max(
+            max((s.min_candles for s in strategies), default=50), min_warmup
+        )
 
     async def run(
         self, candles_by_symbol: dict[str, list[Candle]]
