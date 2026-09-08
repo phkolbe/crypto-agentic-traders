@@ -8,15 +8,17 @@ de volta para `Decimal` na leitura.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import (
     JSON,
     Boolean,
+    Date,
     DateTime,
     Dialect,
+    Float,
     Index,
     Integer,
     Numeric,
@@ -274,6 +276,30 @@ class AuditLog(Base):
     before: Mapped[dict] = mapped_column(JSON, default=dict)
     after: Mapped[dict] = mapped_column(JSON, default=dict)
     detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class OnChainMetric(Base):
+    """Serie diaria de metrica on-chain (hoje: MVRV Z-Score).
+
+    Cacheada porque o dado vem de provedor externo, e nao da exchange: guardar
+    permite backtest sem rede e evita depender de um site de terceiros estar no
+    ar para o sistema decidir. O passado da serie e imutavel, entao gravar uma
+    vez e suficiente.
+    """
+
+    __tablename__ = "onchain_metrics"
+    __table_args__ = (
+        UniqueConstraint("metric", "day", name="uq_onchain_metric_day"),
+        Index("ix_onchain_metric_day", "metric", "day"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    metric: Mapped[str] = mapped_column(String(32))
+    day: Mapped[date] = mapped_column(Date)
+    value: Mapped[float] = mapped_column(Float)
+    """Indicador normalizado, nao dinheiro -- `Float` serve e mantem a query simples."""
+
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class NotificationConfig(Base):

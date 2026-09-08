@@ -355,7 +355,65 @@ de qualidade validada contra resultado — não antes.
 
 ---
 
-## 10. Antes de ligar o LIVE
+## 10. Filtro de regime por MVRV Z-Score
+
+**MVRV** = Market Value to Realized Value. O Z-Score normaliza a diferença entre
+a capitalização e o preço médio que o mercado pagou, pelo desvio da
+capitalização. Alto = lucro não realizado grande (historicamente perto de topo);
+negativo = mercado agregado no prejuízo (historicamente fundo).
+
+Três diferenças em relação aos indicadores de preço, e todas mudam o uso:
+
+1. **É do Bitcoin.** Não existe MVRV por par. Serve como leitura do regime do
+   mercado inteiro, apostando na correlação do resto com o BTC.
+2. **É lento.** Move-se em meses. Em 4h é praticamente constante, então não gera
+   sinal de entrada — serve de filtro.
+3. **Não vem da exchange.** Depende de provedor externo
+   (`bitcoin-data.com`), cacheado em `onchain_metrics`.
+
+### Por que percentil e não o limiar clássico
+
+A literatura cita `z > 7` como topo. Nos 4 anos de série disponíveis o **máximo
+foi 3,35**, e não houve um único dia acima de 4. Um filtro no limiar clássico
+ficaria inerte para sempre. O sistema usa **percentil da história observada**.
+
+O custo dessa escolha: percentil é relativo à amostra. Se a série cobrisse só um
+mercado de baixa, "caro" ali poderia ser barato em termos absolutos.
+
+### O que a medição mostrou
+
+Em 1d sobre 16 pares BRL (998 dias, incluindo períodos caros de 2024):
+
+| Estratégia | Filtro | Retorno | Queda máxima |
+|---|---|---|---|
+| ma_crossover | desligado | −5,24% | **44,29%** |
+| ma_crossover | ≤ 40% | −6,83% | **21,93%** |
+| macd_trend | desligado | +39,53% | **26,75%** |
+| macd_trend | ≤ 40% | +4,36% | **9,59%** |
+| rsi_reversion | desligado | +40,55% | 40,51% |
+| rsi_reversion | ≤ 40% | −15,81% | 33,58% |
+
+**A queda máxima cai de forma consistente nas três estratégias.** O retorno cai
+junto, e mais. A razão é estrutural: o MVRV fica alto *durante* as altas, que é
+exatamente quando uma estratégia de tendência ganha dinheiro. Filtrar por "está
+caro" filtra também "está subindo".
+
+Em 4h (166 dias) o filtro não teve efeito nenhum — o percentil variou entre 11%
+e 43% em toda a janela, e nada acima de 60% para bloquear. Avaliar um filtro de
+regime exige uma janela que contenha os dois regimes.
+
+Por isso `RISK_MVRV_MAX_PERCENTILE=1.0` (desligado) é o padrão. Ligá-lo é uma
+escolha legítima **se o objetivo for preservar capital em vez de maximizar
+retorno** — é o único ajuste do sistema que demonstrou reduzir drawdown de forma
+consistente.
+
+Nunca bloqueia fechamento: o indicador diz "está caro", não "fique preso".
+E dado ausente não bloqueia nada — sem o provedor, o sistema volta ao
+comportamento sem filtro, que é o estado conhecido e testado.
+
+---
+
+## 11. Antes de ligar o LIVE
 
 Uma sequência, não uma escolha:
 

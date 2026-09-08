@@ -53,6 +53,14 @@ class PortfolioState:
     circuit_breaker_active: bool = False
     circuit_breaker_reason: str | None = None
 
+    mvrv_percentile: float | None = None
+    """Posicao do MVRV Z-Score na historia observada, de 0 a 1.
+
+    `None` significa "sem dado" e NAO deve bloquear nada: o provedor on-chain e
+    externo e pode cair, e o estado sem filtro e o mesmo que o sistema teve
+    durante todo o desenvolvimento -- conhecido e testado, nao arriscado.
+    """
+
     def copy(self) -> PortfolioState:
         """Copia rasa com dicionarios proprios.
 
@@ -68,6 +76,7 @@ class PortfolioState:
             last_order_at=dict(self.last_order_at),
             circuit_breaker_active=self.circuit_breaker_active,
             circuit_breaker_reason=self.circuit_breaker_reason,
+            mvrv_percentile=self.mvrv_percentile,
         )
 
     def quantity_of(self, asset: str) -> Decimal:
@@ -258,6 +267,19 @@ class RiskEngine:
                 f"moeda de cotacao '{quote}' difere da configurada '{self.quote_currency}'"
             )
 
+        # Filtro de regime de mercado (MVRV Z-Score). Bloqueia apenas ABERTURA:
+        # o indicador diz "o mercado esta caro", nao "saia da posicao" -- e a
+        # assimetria do sistema e nunca travar uma saida.
+        if (
+            limits.mvrv_max_percentile < 1.0
+            and state.mvrv_percentile is not None
+            and state.mvrv_percentile > limits.mvrv_max_percentile
+        ):
+            reasons.append(
+                f"MVRV no percentil {state.mvrv_percentile:.0%} da historia, acima do "
+                f"limite de {limits.mvrv_max_percentile:.0%} (mercado historicamente caro)"
+            )
+
         if signal.confidence < limits.min_signal_confidence:
             reasons.append(
                 f"confianca {signal.confidence:.2f} abaixo do minimo "
@@ -407,6 +429,7 @@ class RiskEngine:
             "asset_quantity": str(state.quantity_of(base)),
             "asset_exposure": str(state.value_of(base)),
             "circuit_breaker_active": state.circuit_breaker_active,
+            "mvrv_percentile": state.mvrv_percentile,
             "limits": {
                 "max_order_notional": str(self.limits.max_order_notional),
                 "max_order_pct_portfolio": self.limits.max_order_pct_portfolio,

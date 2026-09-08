@@ -8,7 +8,7 @@ sem tocar na logica de negocio.
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -493,6 +493,51 @@ class AuditLogRepository:
             select(orm.AuditLog).order_by(orm.AuditLog.timestamp.desc()).limit(limit).offset(offset)
         )
         return list((await self._session.execute(stmt)).scalars().all())
+
+
+class OnChainMetricRepository:
+    """Serie diaria de metricas on-chain."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def upsert_many(self, metric: str, points: list[tuple[date, float]]) -> int:
+        """Grava ignorando dias que ja existem.
+
+        Rebuscar a serie inteira e o caminho normal (o provedor nao oferece
+        recorte por data), entao colisao na chave natural e o caso esperado.
+        """
+        if not points:
+            return 0
+        rows = [{"metric": metric, "day": day, "value": value} for day, value in points]
+        dialect = self._session.bind.dialect.name if self._session.bind else "sqlite"
+        if dialect == "sqlite":
+            stmt = sqlite_insert(orm.OnChainMetric).values(rows).on_conflict_do_nothing()
+        else:
+            from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+            stmt = pg_insert(orm.OnChainMetric).values(rows).on_conflict_do_nothing()
+        result = await self._session.execute(stmt)
+        return result.rowcount or 0
+
+    async def series(self, metric: str) -> list[tuple[date, float]]:
+        stmt = (
+            select(orm.OnChainMetric.day, orm.OnChainMetric.value)
+            .where(orm.OnChainMetric.metric == metric)
+            .order_by(orm.OnChainMetric.day.asc())
+        )
+        rows = (await self._session.execute(stmt)).all()
+        return [(row[0], float(row[1])) for row in rows]
+
+    async def latest(self, metric: str) -> tuple[date, float] | None:
+        stmt = (
+            select(orm.OnChainMetric.day, orm.OnChainMetric.value)
+            .where(orm.OnChainMetric.metric == metric)
+            .order_by(orm.OnChainMetric.day.desc())
+            .limit(1)
+        )
+        row = (await self._session.execute(stmt)).first()
+        return (row[0], float(row[1])) if row else None
 
 
 class NotificationConfigRepository:

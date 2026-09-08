@@ -106,6 +106,18 @@ class RiskSettings(BaseSettings):
         ge=0,
         description="Intervalo minimo entre duas ordens do mesmo par, evitando overtrading.",
     )
+    mvrv_max_percentile: float = Field(
+        default=1.0,
+        gt=0,
+        le=1.0,
+        description=(
+            "Percentil maximo do MVRV Z-Score para permitir NOVA exposicao. "
+            "1.0 desliga o filtro. 0.80 significa 'nao comprar quando o mercado "
+            "estiver mais caro que 80% dos dias observados'. Usa percentil e nao "
+            "valor absoluto porque o limiar classico de 7 nao foi alcancado "
+            "nenhuma vez desde 2022 -- um filtro fixo ali ficaria inerte."
+        ),
+    )
 
     @field_validator("asset_whitelist", "symbol_whitelist", mode="before")
     @classmethod

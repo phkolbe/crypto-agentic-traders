@@ -25,6 +25,7 @@ from ..exchanges import build_broker, build_market_data_source
 from ..exchanges.base import Broker, MarketDataSource
 from ..logging_setup import get_logger
 from ..notifications import Notifier, build_notifier
+from ..onchain import OnChainProvider
 from ..risk.rules import SizingFeasibility, assess_sizing_feasibility
 from ..strategies import build_strategies
 from .base import BaseAgent
@@ -95,7 +96,8 @@ class Orchestrator:
         self.strategy = StrategyAgent(
             self.bus, build_strategies(self.settings.strategies), self.settings
         )
-        self.risk_manager = RiskManagerAgent(self.bus, self.settings)
+        self.onchain = OnChainProvider(self.settings)
+        self.risk_manager = RiskManagerAgent(self.bus, self.settings, onchain=self.onchain)
         self.execution = ExecutionAgent(self.bus, self._broker, self.settings)
         self.portfolio = PortfolioAgent(
             self.bus,
@@ -153,6 +155,10 @@ class Orchestrator:
         try:
             # Descoberta ANTES da primeira coleta: sem universo definido, o
             # refresh nao teria par nenhum para buscar e o sistema subiria cego.
+            # Serie on-chain antes do primeiro sinal: sem ela o filtro de
+            # regime nao se aplica, e isso precisa ser escolha, nao acidente.
+            if self.settings.risk.mvrv_max_percentile < 1.0:
+                await self.onchain.refresh_mvrv(force=True)
             await self.market_data.discover_symbols(force=True)
             await self.market_data.refresh()
             self._sync_paper_prices()

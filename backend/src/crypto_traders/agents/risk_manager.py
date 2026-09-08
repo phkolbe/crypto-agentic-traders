@@ -39,6 +39,7 @@ from ..domain.enums import (
     SignalDirection,
 )
 from ..domain.models import OrderRequest, PortfolioSnapshot, RiskAssessment, Signal
+from ..onchain import OnChainProvider
 from ..risk.rules import PortfolioState, RiskEngine
 from .base import BaseAgent
 
@@ -46,9 +47,14 @@ from .base import BaseAgent
 class RiskManagerAgent(BaseAgent):
     name = "risk_manager"
 
-    def __init__(self, bus: EventBus, settings: Settings) -> None:
+    def __init__(
+        self, bus: EventBus, settings: Settings, onchain: OnChainProvider | None = None
+    ) -> None:
         super().__init__(bus)
         self._settings = settings
+        self._onchain = onchain
+        """Provedor on-chain opcional. Ausente significa "sem filtro de regime"."""
+
         self._limits = settings.risk
         self._engine = RiskEngine(self._limits, settings.quote_currency)
         self._snapshot: PortfolioSnapshot | None = None
@@ -276,6 +282,17 @@ class RiskManagerAgent(BaseAgent):
         async with session_scope(self._settings) as session:
             last_order = await OrderRepository(session).last_order_time(signal.symbol)
 
+        # Leitura de regime. Falha ou ausencia => None => filtro nao se aplica.
+        mvrv_percentile = None
+        if self._onchain is not None and self._limits.mvrv_max_percentile < 1.0:
+            try:
+                leitura = await self._onchain.mvrv_reading()
+                mvrv_percentile = leitura.percentile if leitura else None
+                if leitura is None:
+                    self.log.warning("risk.mvrv_unavailable", detail="filtro nao aplicado")
+            except Exception as exc:
+                self.log.error("risk.mvrv_read_failed", error=str(exc))
+
         return PortfolioState(
             total_value=snapshot.total_value,
             cash=snapshot.cash_value,
@@ -284,6 +301,7 @@ class RiskManagerAgent(BaseAgent):
             last_order_at={signal.symbol: last_order} if last_order else {},
             circuit_breaker_active=self._circuit_breaker_active,
             circuit_breaker_reason=self._circuit_breaker_reason,
+            mvrv_percentile=mvrv_percentile,
         )
 
     async def _persist_and_publish(self, assessment: RiskAssessment, signal: Signal) -> None:

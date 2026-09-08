@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 
 import pandas as pd
@@ -30,6 +30,7 @@ from ..domain.enums import ExchangeName, OrderStatus, OrderType, RiskDecision, S
 from ..domain.models import Candle, OrderRequest
 from ..exchanges.paper import PaperBroker
 from ..logging_setup import get_logger
+from ..onchain import reading_from_series
 from ..risk.rules import PortfolioState, RiskEngine
 from ..strategies import MarketFrame, Strategy
 
@@ -171,6 +172,7 @@ class PortfolioBacktestEngine:
         slippage_pct: Decimal = Decimal("0.0005"),
         lookback: int = 500,
         min_warmup: int = 0,
+        mvrv_series: list[tuple[date, float]] | None = None,
     ) -> None:
         self.strategies = strategies
         self.limits = risk_limits
@@ -180,6 +182,10 @@ class PortfolioBacktestEngine:
         self.fee_pct = fee_pct
         self.slippage_pct = slippage_pct
         self.lookback = lookback
+        # Serie MVRV opcional. Passada pronta em vez de buscada aqui para o
+        # backtest nao depender de rede -- e o percentil e calculado so com o
+        # passado de cada instante, senao o backtest saberia o futuro.
+        self.mvrv_series = mvrv_series or []
         # `min_warmup` alinha o inicio entre execucoes diferentes. E necessario
         # para comparar estrategias entre si: `macd_trend` exige 105 candles de
         # aquecimento e `ma_crossover` 26, entao sem alinhar cada uma comeca a
@@ -308,12 +314,16 @@ class PortfolioBacktestEngine:
             (amount * prices.get(asset, Decimal(0)) for asset, amount in positions.items()),
             start=Decimal(0),
         )
+        leitura = (
+            reading_from_series(self.mvrv_series, now) if self.mvrv_series else None
+        )
         state = PortfolioState(
             total_value=total,
             cash=cash,
             positions=positions,
             prices=dict(prices),
             last_order_at=dict(last_order_at),
+            mvrv_percentile=leitura.percentile if leitura else None,
         )
 
         aprovados = []
