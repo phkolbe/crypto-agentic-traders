@@ -225,3 +225,49 @@ def test_matches_the_measured_thresholds(brl, expected):
     """Congela os valores apurados com a cotação real: R$2.600 é a virada."""
     usdt = (Decimal(brl) / Decimal("5.1838")).quantize(Decimal("0.01"))
     assert assess_sizing_feasibility(RiskSettings(), usdt).feasible is expected
+
+
+class TestRealBalanceRequired:
+    """Em live/testnet o saldo simulado nao pode servir de referencia."""
+
+    def _live(self, settings):
+        from crypto_traders.domain.enums import TradingMode
+
+        return settings.model_copy(
+            update={"trading_mode": TradingMode.TESTNET, "paper_initial_balance": Decimal("1000")}
+        )
+
+    def test_live_without_quote_balance_fails(self, settings, capsys):
+        """Conta so com BRL e sistema cotado em USDT: nada pode ser comprado.
+
+        Antes desta guarda o check caia no saldo simulado de 1000 e dizia
+        "Tudo pronto" para uma conta sem poder de compra nenhum.
+        """
+        from crypto_traders.cli import _check_sizing
+
+        assert _check_sizing(self._live(settings), quote_balance=None) is None
+        output = capsys.readouterr().out
+        assert "SEM SALDO" in output
+        assert "QUOTE_CURRENCY" in output
+
+    def test_live_with_zero_balance_fails(self, settings):
+        from crypto_traders.cli import _check_sizing
+
+        assert _check_sizing(self._live(settings), quote_balance=Decimal("0")) is None
+
+    def test_live_uses_the_real_balance_not_the_simulated_one(self, settings, capsys):
+        from crypto_traders.cli import _check_sizing
+
+        result = _check_sizing(self._live(settings), quote_balance=Decimal("964.54"))
+        assert result is not None
+        assert result.portfolio_value == Decimal("964.54")
+        assert "saldo real" in capsys.readouterr().out
+
+    def test_dry_run_still_uses_the_simulated_balance(self, settings, capsys):
+        """Em simulacao nao ha conta; o saldo do .env e a referencia legitima."""
+        from crypto_traders.cli import _check_sizing
+
+        configured = settings.model_copy(update={"paper_initial_balance": R5000})
+        result = _check_sizing(configured, quote_balance=None)
+        assert result is not None
+        assert "saldo simulado" in capsys.readouterr().out

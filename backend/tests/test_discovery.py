@@ -258,3 +258,49 @@ class TestRiskManagerUniverse:
         async with session_scope(settings) as session:
             entries = await AuditLogRepository(session).list()
         assert sum(1 for e in entries if e.action == "trading_universe_discovered") == 1
+
+
+class TestQuoteCurrencyBRL:
+    """Operar em pares BRL expõe casos que não aparecem com cotação em USDT."""
+
+    def _brl_markets(self):
+        entries = [
+            ("USDT/BRL", "USDT", 131_749_272),
+            ("BTC/BRL", "BTC", 34_339_733),
+            ("USDC/BRL", "USDC", 27_984_678),
+            ("ETH/BRL", "ETH", 11_783_952),
+            ("SOL/BRL", "SOL", 6_393_089),
+        ]
+        markets = {
+            symbol: {
+                "symbol": symbol,
+                "base": base,
+                "quote": "BRL",
+                "spot": True,
+                "active": True,
+            }
+            for symbol, base, _ in entries
+        }
+        tickers = {symbol: {"quoteVolume": vol} for symbol, _, vol in entries}
+        return markets, tickers
+
+    def test_usdt_pair_is_excluded_despite_being_the_largest(self):
+        """USDT/BRL é o maior volume da Binance no Brasil e o pior par possível.
+
+        Com `QUOTE_CURRENCY=USDT` a ausência de USDT na lista era inofensiva
+        (não existe par USDT/USDT); com BRL, a descoberta o escolheria primeiro.
+        """
+        markets, tickers = self._brl_markets()
+        criteria = DiscoveryCriteria(
+            quote_currency="BRL",
+            min_quote_volume_24h=Decimal("5000000"),
+            max_symbols=5,
+            exclude_assets=DEFAULT_EXCLUDED_ASSETS,
+        )
+        result = select_markets(markets, tickers, criteria)
+        assert "USDT/BRL" not in result.symbols
+        assert "USDC/BRL" not in result.symbols
+        assert result.symbols == ["BTC/BRL", "ETH/BRL", "SOL/BRL"]
+
+    def test_usdt_is_in_the_default_exclusions(self):
+        assert "USDT" in DEFAULT_EXCLUDED_ASSETS

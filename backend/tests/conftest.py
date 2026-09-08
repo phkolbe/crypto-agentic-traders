@@ -11,6 +11,20 @@ from crypto_traders.config import RiskSettings, Settings
 from crypto_traders.db.session import dispose_engine, init_db
 
 
+@pytest.fixture(autouse=True)
+def isolate_from_dotenv(monkeypatch):
+    """Impede que os testes leiam o `.env` da maquina.
+
+    `Settings` e `RiskSettings` carregam `.env` por padrao -- e correto em
+    producao, desastroso em teste: a suite passaria ou falharia conforme a
+    configuracao pessoal de quem roda. Foi exatamente o que aconteceu quando o
+    `.env` local passou a ter limites diferentes dos padroes de fabrica, e 18
+    testes quebraram sem que uma linha de codigo de producao tivesse mudado.
+    """
+    for model in (Settings, RiskSettings):
+        monkeypatch.setitem(model.model_config, "env_file", None)
+
+
 @pytest.fixture
 def risk_limits() -> RiskSettings:
     """Limites previsiveis, independentes do `.env` da maquina."""

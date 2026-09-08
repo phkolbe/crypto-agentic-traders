@@ -49,9 +49,15 @@ log = get_logger(__name__)
 
 #: Stablecoins e moedas fiduciarias tokenizadas. Como base, formam pares que nao
 #: se movem (USDC/USDT); como isso rende sinal nenhum e taxa sempre, ficam fora.
+#:
+#: `USDT` esta na lista por um motivo que so aparece com outra moeda de cotacao:
+#: com `QUOTE_CURRENCY=USDT` nao existe par USDT/USDT e a ausencia era inofensiva,
+#: mas com `QUOTE_CURRENCY=BRL` o USDT/BRL e o MAIOR volume da Binance no Brasil
+#: -- a descoberta o escolheria em primeiro lugar, e negociar stablecoin contra
+#: fiat com estrategia de tendencia e so pagar taxa.
 DEFAULT_EXCLUDED_ASSETS = frozenset(
     {
-        "USDC", "USD1", "FDUSD", "TUSD", "BUSD", "DAI", "USDP", "USDS",
+        "USDT", "USDC", "USD1", "FDUSD", "TUSD", "BUSD", "DAI", "USDP", "USDS",
         "PYUSD", "EUR", "EURI", "AEUR", "GBP", "TRY", "BRL", "ARS", "JPY",
     }
 )

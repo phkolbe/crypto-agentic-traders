@@ -213,14 +213,27 @@ def _check_sizing(settings, quote_balance: Decimal | None = None) -> SizingFeasi
     from .risk.rules import assess_sizing_feasibility
 
     quote = settings.quote_currency
-    if quote_balance is not None:
+    print("\n  Dimensionamento de ordens:")
+
+    if settings.sends_real_orders:
+        # Cair no saldo simulado aqui seria o pior falso positivo do sistema: o
+        # diagnostico aprovaria uma configuracao LIVE usando dinheiro de mentira
+        # como referencia -- exatamente o "esta tudo certo" enganoso que esta
+        # checagem existe para evitar.
+        if quote_balance is None or quote_balance <= 0:
+            print("    " + "!" * 62)
+            print(f"    SEM SALDO em {quote} na conta da exchange.")
+            print(f"    O sistema negocia pares cotados em {quote} e precisa dessa")
+            print("    moeda para comprar. Converta o saldo que voce tem, ou aponte")
+            print("    QUOTE_CURRENCY para a moeda que voce de fato possui.")
+            print("    " + "!" * 62)
+            return None
         balance = quote_balance
         origin = f"saldo real em {quote} na exchange"
     else:
         balance = settings.paper_initial_balance
         origin = f"saldo simulado ({quote})"
 
-    print("\n  Dimensionamento de ordens:")
     result = assess_sizing_feasibility(settings.risk, balance)
     print(f"    patrimonio de referencia: {balance:.2f} {quote} — {origin}")
 
