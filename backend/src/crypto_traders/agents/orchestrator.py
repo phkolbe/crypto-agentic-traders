@@ -282,6 +282,15 @@ class Orchestrator:
         self.risk_manager.observe_snapshot(snapshot)
         self._sync_paper_prices()
 
+        # Protecao antes de qualquer outra coisa: se uma posicao rompeu o stop,
+        # fechar vem primeiro. Falhar aqui nao pode impedir o circuit breaker de
+        # ser reavaliado logo abaixo -- sao duas defesas independentes, e perder
+        # as duas por um erro em uma delas seria o pior desfecho.
+        try:
+            await self.risk_manager.enforce_protective_exits(snapshot)
+        except Exception as exc:
+            log.error("orchestrator.protective_exit_failed", error=str(exc))
+
         await self._check_sizing(snapshot)
 
         reason = await self.risk_manager.check_circuit_breaker(snapshot)

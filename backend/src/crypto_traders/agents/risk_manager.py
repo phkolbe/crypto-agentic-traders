@@ -32,6 +32,7 @@ from ..db.repositories import (
 )
 from ..db.session import session_scope
 from ..domain.enums import (
+    ExchangeName,
     OrderType,
     RiskDecision,
     RiskEventType,
@@ -60,6 +61,13 @@ class RiskManagerAgent(BaseAgent):
         self._snapshot: PortfolioSnapshot | None = None
         self._circuit_breaker_active = False
         self._circuit_breaker_reason: str | None = None
+        self._exiting: set[str] = set()
+        """Ativos com ordem de protecao em voo.
+
+        Sem esta trava, cada snapshot reemitiria o mesmo fechamento enquanto a
+        ordem anterior nao tivesse liquidado -- vendendo a posicao varias vezes.
+        """
+
         self._discovered_universe: tuple[list[str], list[str]] | None = None
         """Whitelist vinda da descoberta automatica: (simbolos, ativos).
 
@@ -246,6 +254,100 @@ class RiskManagerAgent(BaseAgent):
     def observe_snapshot(self, snapshot: PortfolioSnapshot) -> None:
         """Recebe o retrato mais recente do portfolio, publicado pelo Portfolio Agent."""
         self._snapshot = snapshot
+
+    async def enforce_protective_exits(self, snapshot: PortfolioSnapshot) -> list[OrderRequest]:
+        """Fecha posicoes que romperam stop-loss ou take-profit.
+
+        Ate aqui esses niveis eram calculados, gravados na ordem e nunca
+        comparados com preco nenhum -- em producao **nem em backtest**. Uma
+        posicao aberta so fechava se a estrategia emitisse sinal de saida.
+
+        Esta e a versao em software, deliberadamente escolhida em vez de mandar
+        uma OCO para a exchange. O que ela **nao** cobre, e precisa estar claro:
+        morre junto com o processo, e nao age se o sistema perder acesso a
+        exchange (o cenario de IP residencial descrito na secao 1 do
+        `docs/SEGURANCA.md`). Protecao que depende do processo estar vivo cobre
+        oscilacao de mercado, nao queda de infraestrutura.
+
+        Reage a cada snapshot -- por padrao 60s -- comparando o preco corrente
+        com os niveis. Nao ve o pavio dentro do intervalo: uma queda que desce
+        abaixo do stop e volta antes do proximo snapshot passa batida. O backtest,
+        que le a minima do candle, e nesse ponto mais severo que a producao.
+
+        O nivel vem do **preco medio** da posicao, reconstruido pelo Portfolio
+        Agent a partir do historico de trades -- o que inclui lancamentos
+        manuais. Uma posicao comprada fora do sistema tambem passa a ser
+        protegida, o que e o comportamento desejado: o Risk Manager guarda a
+        carteira, nao apenas as ordens que ele originou.
+        """
+        limits = self._limits
+        emitidas: list[OrderRequest] = []
+
+        for position in snapshot.positions:
+            if position.asset == self._settings.trading.quote_currency:
+                continue
+            if position.quantity <= 0 or position.average_price is None:
+                continue
+            if position.current_price is None or position.average_price <= 0:
+                continue
+            if position.asset in self._exiting:
+                # Ordem de protecao ja em voo: reemitir a cada snapshot venderia
+                # a posicao varias vezes.
+                continue
+
+            stop = position.average_price * (Decimal(1) - Decimal(str(limits.stop_loss_pct)))
+            alvo = position.average_price * (Decimal(1) + Decimal(str(limits.take_profit_pct)))
+
+            if position.current_price <= stop:
+                motivo = "stop_loss"
+            elif position.current_price >= alvo:
+                motivo = "take_profit"
+            else:
+                continue
+
+            symbol = f"{position.asset}/{self._settings.trading.quote_currency}"
+            request = OrderRequest(
+                client_order_id=_client_order_id(),
+                signal_id=None,
+                risk_event_id=f"protecao-{motivo}-{position.asset}",
+                exchange=ExchangeName(self._settings.exchange),
+                symbol=symbol,
+                side=Side.SELL,
+                order_type=OrderType.MARKET,
+                quantity=position.quantity,
+                notional=position.quantity * position.current_price,
+                strategy="protecao",
+            )
+
+            self._exiting.add(position.asset)
+            self.log.warning(
+                "risk.protective_exit",
+                motivo=motivo,
+                symbol=symbol,
+                preco=str(position.current_price),
+                nivel=str(stop if motivo == "stop_loss" else alvo),
+                medio=str(position.average_price),
+            )
+            await self.bus.publish(Topics.ORDER_REQUESTS, request)
+            await self.bus.publish(
+                Topics.ALERTS,
+                {
+                    "type": "protective_exit",
+                    "title": f"{'Stop-loss' if motivo == 'stop_loss' else 'Take-profit'} "
+                    f"acionado em {symbol}",
+                    "detail": (
+                        f"preco {position.current_price} contra nivel "
+                        f"{stop if motivo == 'stop_loss' else alvo} "
+                        f"(medio {position.average_price}). Posicao fechada."
+                    ),
+                },
+            )
+            emitidas.append(request)
+
+        # Posicao que deixou de existir liberou a trava: o fechamento saiu.
+        presentes = {p.asset for p in snapshot.positions if p.quantity > 0}
+        self._exiting &= presentes
+        return emitidas
 
     async def _on_signal(self, signal: Signal) -> None:
         if self._snapshot is None:

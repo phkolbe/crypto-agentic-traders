@@ -131,10 +131,12 @@ rejeitar:
 estratégia. Uma estratégia nova, escrita meses depois, não tem como esquecer de
 definir stop: ela nem participa dessa etapa.
 
-> ⚠️ **Calculados, e executados só no backtest.** Em produção esses níveis não
-> chegam à exchange — ver seção 11. A frase "toda posição aberta por um agente
-> tem stop" era falsa neste documento até essa descoberta, e é o tipo de erro que
-> um leitor não teria como pegar: o número aparecia no dashboard.
+> ⚠️ **Executados pelo sistema, não pela exchange.** O Risk Manager compara os
+> níveis a cada snapshot e fecha a posição — ver seção 11 para o que essa escolha
+> não cobre. Até a descoberta do defeito, este documento afirmava que os níveis
+> eram "anexados a toda posição": eram calculados e nunca comparados com preço
+> nenhum. É o tipo de erro que um leitor não teria como pegar, porque o número
+> aparecia no dashboard.
 
 ### Patrimônio pequeno demais para os limites
 
@@ -492,16 +494,38 @@ Contraintuitivo e consistente nas três estratégias medidas:
 Stop largo deixa a perda correr e ainda aumenta a queda máxima. Piora nos dois
 eixos ao mesmo tempo.
 
-### O que ainda NÃO está corrigido
+### Em produção: stop em software, com limitação conhecida
 
-Em produção os níveis **continuam não chegando à exchange**.
-`ccxt_adapter.place_order` chama `create_order` com símbolo, tipo, lado,
-quantidade e preço — sem `stopPrice`, sem OCO. Em LIVE, a posição abre sem
-proteção nenhuma, e o único fechamento possível é a estratégia emitir sinal de
-saída.
+O Risk Manager passou a comparar cada posição aberta contra os níveis a cada
+snapshot do portfólio (60s por padrão) e a emitir o fechamento quando rompem.
+O nível vem do **preço médio** da posição, reconstruído do histórico de trades —
+o que inclui lançamentos manuais. Uma posição comprada fora do sistema também
+passa a ser protegida: o Risk Manager guarda a carteira, não apenas as ordens
+que ele originou.
 
-Consequência prática: **não ligue o LIVE contando com stop-loss.** Ele não
-existe fora do backtest.
+Foi escolhido em vez de mandar uma OCO para a exchange. O que essa escolha
+**não** cobre, e precisa estar claro antes de ligar o LIVE:
+
+| | Stop em software | OCO na exchange |
+|---|---|---|
+| Oscilação de mercado | ✔ | ✔ |
+| Processo morre / máquina reinicia | ✘ | ✔ |
+| Perda de acesso à API (IP mudou) | ✘ | ✔ |
+| Pavio dentro do intervalo de 60s | ✘ | ✔ |
+
+As duas primeiras linhas importam mais do que parecem, e a seção 1 deste
+documento já descreve exatamente esse cenário: quando o IP residencial troca, o
+sistema perde a exchange e uma posição aberta fica sem saída. **Proteção que
+depende do processo estar vivo cobre mercado, não infraestrutura.**
+
+Nota comparativa: o backtest, que lê a mínima do candle, é nesse ponto **mais
+severo** que a produção — ele pega o pavio, a produção não. Um backtest que
+mostra o stop disparando pode corresponder, na prática, a uma posição que
+sobreviveu.
+
+`ccxt_adapter.place_order` continua sem enviar `stopPrice` nem OCO; a proteção é
+inteiramente do lado do sistema. Não há trava impedindo o LIVE: a decisão de
+subir com essa limitação é do operador, e este é o registro dela.
 
 ### As três convenções do backtest, todas pessimistas
 
@@ -591,10 +615,11 @@ acabou de criá-la com os padrões de fábrica.
 
 ## 13. Antes de ligar o LIVE
 
-> ⛔ **Bloqueio atual:** o stop-loss não é enviado à exchange (seção 11). Enquanto
-> isso não for resolvido, uma posição aberta em LIVE não tem proteção automática
-> nenhuma — o único fechamento possível é a estratégia emitir sinal de saída, e
-> ela só o faz no fechamento do candle, se o fizer.
+> ⚠️ **Leia a seção 11 antes.** O stop-loss existe em software, no Risk Manager,
+> e **não** na exchange. Ele não age se o processo morrer, se a máquina
+> reiniciar, ou se o sistema perder acesso à API — e é justamente nesse último
+> cenário que uma posição aberta fica sem saída. Subir em LIVE com essa limitação
+> é uma decisão consciente, não um esquecimento.
 
 Uma sequência, não uma escolha:
 

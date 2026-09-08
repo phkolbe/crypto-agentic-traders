@@ -239,3 +239,119 @@ class TestBookkeeping:
         r = await engine.run({"BTC/USDT": [*AQUECIMENTO, candle(PRIMEIRO, 100, 100, 50, 55)]})
         assert r.exits["stop"] == 0
         assert r.total_return_pct == 0.0
+
+
+class TestProductionProtectiveExits:
+    """A protecao em producao, no Risk Manager.
+
+    Escolhida em vez de OCO na exchange, com uma limitacao aceita
+    deliberadamente: morre junto com o processo. Cobre oscilacao de mercado, nao
+    queda de infraestrutura.
+    """
+
+    async def _agente(self, settings, stop=0.05, alvo=0.10):
+        from crypto_traders.agents.risk_manager import RiskManagerAgent
+        from crypto_traders.bus import InMemoryEventBus
+
+        bus = InMemoryEventBus()
+        await bus.start()
+        configurado = settings.model_copy(
+            update={"risk": settings.risk.model_copy(update={
+                "stop_loss_pct": stop, "take_profit_pct": alvo,
+            })}
+        )
+        return RiskManagerAgent(bus, configurado)
+
+    def _snapshot(self, medio: str | None, atual: str, quantidade: str = "0.01"):
+        from crypto_traders.domain.models import PortfolioSnapshot, Position
+
+        return PortfolioSnapshot(
+            total_value=Decimal("1000"),
+            cash_value=Decimal("500"),
+            positions_value=Decimal("500"),
+            positions=[
+                Position(
+                    exchange=ExchangeName.BINANCE,
+                    asset="BTC",
+                    quantity=Decimal(quantidade),
+                    average_price=Decimal(medio) if medio is not None else None,
+                    current_price=Decimal(atual),
+                ),
+            ],
+        )
+
+    async def test_closes_the_position_below_the_stop(self, settings):
+        agente = await self._agente(settings, stop=0.05)
+        ordens = await agente.enforce_protective_exits(self._snapshot("100", "94"))
+        assert len(ordens) == 1
+        assert ordens[0].symbol == "BTC/USDT"
+        assert str(ordens[0].side) == "sell"
+        assert ordens[0].quantity == Decimal("0.01")
+
+    async def test_closes_the_position_above_the_target(self, settings):
+        agente = await self._agente(settings, alvo=0.10)
+        ordens = await agente.enforce_protective_exits(self._snapshot("100", "111"))
+        assert len(ordens) == 1
+
+    async def test_does_nothing_between_the_levels(self, settings):
+        agente = await self._agente(settings, stop=0.05, alvo=0.10)
+        assert await agente.enforce_protective_exits(self._snapshot("100", "102")) == []
+
+    async def test_does_not_reemit_while_the_order_is_in_flight(self, settings):
+        """Cada snapshot chega a cada 60s; sem trava, venderia a posicao varias vezes."""
+        agente = await self._agente(settings, stop=0.05)
+        snapshot = self._snapshot("100", "94")
+        assert len(await agente.enforce_protective_exits(snapshot)) == 1
+        assert await agente.enforce_protective_exits(snapshot) == []
+
+    async def test_the_lock_clears_when_the_position_is_gone(self, settings):
+        """Posicao liquidada libera a trava, senao uma reentrada ficaria sem stop."""
+        from crypto_traders.domain.models import PortfolioSnapshot
+
+        agente = await self._agente(settings, stop=0.05)
+        assert len(await agente.enforce_protective_exits(self._snapshot("100", "94"))) == 1
+
+        vazio = PortfolioSnapshot(
+            total_value=Decimal("1000"), cash_value=Decimal("1000"),
+            positions_value=Decimal(0), positions=[],
+        )
+        await agente.enforce_protective_exits(vazio)
+        assert len(await agente.enforce_protective_exits(self._snapshot("100", "94"))) == 1
+
+    async def test_a_position_without_average_price_is_skipped(self, settings):
+        """Sem preco medio nao existe nivel. Chutar um seria pior que nao agir."""
+        agente = await self._agente(settings, stop=0.05)
+        assert await agente.enforce_protective_exits(self._snapshot(None, "10")) == []
+
+    async def test_the_quote_currency_is_never_closed(self, settings):
+        """O caixa nao e posicao: vender USDT contra USDT nao existe."""
+        from crypto_traders.domain.models import PortfolioSnapshot, Position
+
+        agente = await self._agente(settings, stop=0.05)
+        snapshot = PortfolioSnapshot(
+            total_value=Decimal("1000"), cash_value=Decimal("1000"),
+            positions_value=Decimal(0),
+            positions=[Position(
+                exchange=ExchangeName.BINANCE, asset="USDT",
+                quantity=Decimal("1000"), average_price=Decimal("1"),
+                current_price=Decimal("1"),
+            )],
+        )
+        assert await agente.enforce_protective_exits(snapshot) == []
+
+    async def test_a_manually_bought_position_is_also_protected(self, settings):
+        """O preco medio vem do historico de trades, que inclui lancamento manual.
+
+        O Risk Manager guarda a carteira, nao apenas as ordens que ele originou.
+        """
+        agente = await self._agente(settings, stop=0.05)
+        ordens = await agente.enforce_protective_exits(self._snapshot("100", "90"))
+        assert len(ordens) == 1
+        assert ordens[0].signal_id is None
+        assert ordens[0].strategy == "protecao"
+
+    async def test_the_order_carries_a_risk_event_id(self, settings):
+        """O Execution Agent recusa `OrderRequest` sem ele."""
+        agente = await self._agente(settings, stop=0.05)
+        ordens = await agente.enforce_protective_exits(self._snapshot("100", "94"))
+        assert ordens[0].risk_event_id
