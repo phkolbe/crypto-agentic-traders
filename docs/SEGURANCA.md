@@ -127,9 +127,14 @@ rejeitar:
 | Cooldown por par | *Overtrading* — o mesmo sinal disparando repetidamente |
 | Circuit breaker diário/semanal | Um dia ruim virar um mês ruim |
 
-**Stop-loss e take-profit são anexados pelo Risk Manager**, não pela estratégia.
-Uma estratégia nova, escrita meses depois, não tem como esquecer de definir stop:
-ela nem participa dessa etapa.
+**Stop-loss e take-profit são calculados pelo Risk Manager**, não pela
+estratégia. Uma estratégia nova, escrita meses depois, não tem como esquecer de
+definir stop: ela nem participa dessa etapa.
+
+> ⚠️ **Calculados, e executados só no backtest.** Em produção esses níveis não
+> chegam à exchange — ver seção 11. A frase "toda posição aberta por um agente
+> tem stop" era falsa neste documento até essa descoberta, e é o tipo de erro que
+> um leitor não teria como pegar: o número aparecia no dashboard.
 
 ### Patrimônio pequeno demais para os limites
 
@@ -359,6 +364,9 @@ de qualidade validada contra resultado — não antes.
 
 ## 10. Filtro de regime por MVRV Z-Score
 
+> **Todos os números desta seção foram refeitos** depois da descoberta de que o
+> backtest não executava stop-loss. Ver seção 11.
+
 **MVRV** = Market Value to Realized Value. O Z-Score normaliza a diferença entre
 a capitalização e o preço médio que o mercado pagou, pelo desvio da
 capitalização. Alto = lucro não realizado grande (historicamente perto de topo);
@@ -382,58 +390,46 @@ ficaria inerte para sempre. O sistema usa **percentil da história observada**.
 O custo dessa escolha: percentil é relativo à amostra. Se a série cobrisse só um
 mercado de baixa, "caro" ali poderia ser barato em termos absolutos.
 
-### O que a medição mostrou
+### O que a medição mostra, com stop funcionando
 
-Em 1d sobre 16 pares BRL (998 dias, incluindo períodos caros de 2024):
+1d, 16 pares BRL, 998 dias, stop 3% / alvo 6%. Comprar e segurar: **−37,37%**.
 
-| Estratégia | Filtro | Retorno | Queda máxima |
-|---|---|---|---|
-| ma_crossover | desligado | −5,24% | **44,29%** |
-| ma_crossover | ≤ 40% | −6,83% | **21,93%** |
-| macd_trend | desligado | +39,53% | **26,75%** |
-| macd_trend | ≤ 40% | +4,36% | **9,59%** |
-| rsi_reversion | desligado | +40,55% | 40,51% |
-| rsi_reversion | ≤ 40% | −15,81% | 33,58% |
-| as três juntas | desligado | −8,95% | **46,40%** |
-| as três juntas | ≤ 40% | **−7,20%** | **21,37%** |
+| Estratégia | MVRV desligado | MVRV ≤ 40% | Queda desligado | Queda ≤ 40% |
+|---|---|---|---|---|
+| rsi_reversion | −16,39% | −5,40% | 20,5% | 10,1% |
+| ma_crossover | **+6,91%** | +5,15% | 7,7% | **4,7%** |
+| macd_trend | −6,07% | −0,24% | 11,2% | 2,4% |
+| as três juntas | −16,66% | −4,62% | 23,8% | 11,2% |
 
-**A queda máxima cai de forma consistente nas três estratégias.** O retorno cai
-junto, e mais. A razão é estrutural: o MVRV fica alto *durante* as altas, que é
-exatamente quando uma estratégia de tendência ganha dinheiro. Filtrar por "está
-caro" filtra também "está subindo".
+Olhando só esta tabela, o filtro melhora quase tudo. **Mas a tabela engana**, e o
+teste por janelas mostra por quê:
 
-A linha das três estratégias juntas é a exceção que importa: ali o filtro
-**melhorou o retorno em 1,75 pp e ainda cortou a queda máxima pela metade**. É a
-única configuração medida em que ele não cobra nada pela proteção. Ressalva
-honesta: é uma janela. As linhas individuais, medidas em três janelas
-(2024/2025/2026), mostraram o padrão oposto — proteção paga com retorno.
+| Estratégia | MVRV | Janela 1 (2023-12→2024-11) | Janela 2 | Janela 3 |
+|---|---|---|---|---|
+| ma_crossover | desligado | +4,39% | +2,03% | +4,80% |
+| ma_crossover | ≤ 40% | **0,00%** | **0,00%** | +4,80% |
+| as três | desligado | −2,60% | −1,04% | −1,17% |
+| as três | ≤ 40% | **0,00%** | **0,00%** | −1,94% |
 
-Em 4h (166 dias) o filtro quase não age: o percentil variou entre 11% e 43% em
-toda a janela e passou de 40% em apenas 10% dos dias. O efeito é pequeno e
-negativo (−3,1 pp no `rsi_reversion`, queda máxima **idêntica**), porque bloquear
-10% dos dias remove entradas sem remover nenhum topo. Avaliar um filtro de regime
-exige uma janela que contenha os dois regimes.
+**Zero por cento com zero de queda significa que o filtro bloqueou TODAS as
+entradas.** Em dois terços do período o sistema não operou nenhuma vez. O
+percentil é calculado só com o passado, e em 2024 o MVRV subia — ficava quase
+sempre acima do percentil 40.
 
-### O que ele faz *hoje*, e não só no histórico
+Ou seja: o ganho aparente do filtro na janela inteira é, em boa parte, **o ganho
+de não ter operado**. Isso não é uma estratégia melhor; é abstenção. E na janela 1
+custou caro: o mercado deu +24,2% e o sistema ficou de fora inteiro.
 
-Um filtro de regime pode estar corretamente configurado e, ainda assim, barrar
-**toda** compra hoje. Em 2026-09-07 o Z-Score era 0,91 → percentil **43%**, e com
-o limiar em 40% o sistema não abre posição nenhuma. Isso é indistinguível de "os
-agentes não acham oportunidade" olhando só o dashboard.
+Em 4h (166 dias) o filtro quase não age e nada fica positivo, exceto
+`macd_trend` com +1,67% — contra +13,3% do comprar e segurar.
 
-Por isso o `check` passou a imprimir a leitura atual e a dizer, em uma linha, se
-abrir posição está bloqueado neste momento. Ligar o filtro sem essa visibilidade
-produz o pior estado do sistema: de pé, saudável, e inerte por decisão própria —
-sem que ninguém saiba.
+`RISK_MVRV_MAX_PERCENTILE=1.0` (desligado) é o padrão. Ligá-lo em 0,40 nesta
+configuração equivale, na prática, a **desligar o sistema** na maior parte do
+tempo. Se é isso que se quer, desligar é mais honesto e mais barato.
 
-`RISK_MVRV_MAX_PERCENTILE=1.0` (desligado) segue sendo o padrão de quem clona o
-projeto. Ligá-lo é uma escolha legítima **se o objetivo for preservar capital em
-vez de maximizar retorno** — é o único ajuste do sistema que demonstrou reduzir
-drawdown de forma consistente.
-
-**Nesta instância o filtro está ligado em 0,40**, por decisão registrada
-(D14 no plano). Com o limiar em 0,40 e o percentil em 43%, a consequência prática
-é: nenhuma entrada nova até o MVRV recuar. Sair continua liberado.
+Nunca bloqueia fechamento: o indicador diz "está caro", não "fique preso".
+E dado ausente não bloqueia nada — sem o provedor, o sistema volta ao
+comportamento sem filtro, que é o estado conhecido e testado.
 
 ### A série não pode congelar
 
@@ -442,13 +438,89 @@ orquestrador. Sem essa tarefa a série parava no dia da subida e o filtro seguir
 respondendo com o percentil daquele dia por semanas. Dado velho que parece atual é
 pior que dado nenhum: o `None` ao menos desliga o filtro de forma visível no log.
 
-Nunca bloqueia fechamento: o indicador diz "está caro", não "fique preso".
-E dado ausente não bloqueia nada — sem o provedor, o sistema volta ao
-comportamento sem filtro, que é o estado conhecido e testado.
+---
+
+## 11. O stop-loss que não existia
+
+Durante todo o desenvolvimento, `stop_loss` e `take_profit` foram calculados pelo
+Risk Manager, gravados na ordem, persistidos no banco e expostos na API — e
+**nunca comparados com preço nenhum**.
+
+Nem no backtest, nem em produção.
+
+### Como isso passou
+
+Um parâmetro inerte não falha. A suíte inteira passava. O `check` dizia "tudo
+pronto". O dashboard mostrava os níveis. A única coisa que denunciou foi uma
+varredura de 768 combinações para responder outra pergunta, em que mudar
+`stop_loss_pct` não alterou **um único** resultado: 480 de 480 pares idênticos.
+
+Testar que um valor é gravado não testa que ele é usado.
+
+### O que isso invalidou
+
+Todas as quedas máximas já medidas eram o retrato de um sistema **sem** stop —
+justamente o número que o stop existe para limitar. Com a execução funcionando,
+os mesmos dados dão outra resposta:
+
+| Estratégia | Retorno antes → depois | Queda antes → depois |
+|---|---|---|
+| rsi_reversion | +40,55% → **−16,39%** | 40,5% → **20,5%** |
+| ma_crossover | −5,24% → **+6,91%** | 44,3% → **7,7%** |
+| macd_trend | +39,53% → **−6,07%** | 26,8% → **11,2%** |
+| as três juntas | −8,95% → −16,66% | 46,4% → **23,8%** |
+
+O stop corta a queda pela metade ou mais em todos os casos — e destrói os dois
+resultados que pareciam bons. O `+40,55%` do `rsi_reversion` vinha de atravessar
+quedas de 40% até a recuperação. Com stop, você sai no fundo e não participa da
+volta. Essa troca é real, não é bug: **o stop compra menos queda com menos
+retorno**, e os `+40%` nunca foram alcançáveis por quem usa stop.
+
+Só o `ma_crossover` melhorou, e é hoje o único resultado consistente do projeto:
++4,39%, +2,03% e +4,80% nas três janelas, com quedas de 3,5%, 3,8% e 4,4%.
+
+### Stop mais apertado foi melhor, não pior
+
+Contraintuitivo e consistente nas três estratégias medidas:
+
+| Estratégia | stop 2% | stop 5% | stop 15% |
+|---|---|---|---|
+| rsi_reversion | −13,39% | −24,17% | −36,91% |
+| macd_trend | −6,09% | −11,34% | −21,08% |
+| as três juntas | −19,31% | −34,87% | −34,84% |
+
+Stop largo deixa a perda correr e ainda aumenta a queda máxima. Piora nos dois
+eixos ao mesmo tempo.
+
+### O que ainda NÃO está corrigido
+
+Em produção os níveis **continuam não chegando à exchange**.
+`ccxt_adapter.place_order` chama `create_order` com símbolo, tipo, lado,
+quantidade e preço — sem `stopPrice`, sem OCO. Em LIVE, a posição abre sem
+proteção nenhuma, e o único fechamento possível é a estratégia emitir sinal de
+saída.
+
+Consequência prática: **não ligue o LIVE contando com stop-loss.** Ele não
+existe fora do backtest.
+
+### As três convenções do backtest, todas pessimistas
+
+1. **Stop e alvo no mesmo candle: o stop vence.** O OHLC não diz qual preço veio
+   primeiro. Supor o alvo seria escolher o desfecho bom com informação que não
+   existe.
+2. **Gap conta contra.** Candle que abre abaixo do stop executa na abertura, não
+   no nível — é assim que stops machucam de verdade. O alvo, ao contrário,
+   executa no nível, sem crédito pelo gap favorável.
+3. **Deslizamento nas duas pontas.**
+
+Os níveis protegem a **posição**, não o lote: ao reforçar uma posição são
+recalculados sobre o preço médio. Manter o stop do primeiro lote deixaria a parte
+nova descoberta, e dois pares de níveis exigiriam fatiar a posição na venda — o
+que a exchange não faz em spot.
 
 ---
 
-## 11. Ambiente e negócio: a fronteira, e por que ela é rígida
+## 12. Ambiente e negócio: a fronteira, e por que ela é rígida
 
 O `.env` descreve **a instalação**. O banco guarda **o que negociar e com quanto
 risco**. Nenhuma variável mora nos dois lugares, e escrever uma variável de
@@ -517,7 +589,12 @@ acabou de criá-la com os padrões de fábrica.
 
 ---
 
-## 12. Antes de ligar o LIVE
+## 13. Antes de ligar o LIVE
+
+> ⛔ **Bloqueio atual:** o stop-loss não é enviado à exchange (seção 11). Enquanto
+> isso não for resolvido, uma posição aberta em LIVE não tem proteção automática
+> nenhuma — o único fechamento possível é a estratégia emitir sinal de saída, e
+> ela só o faz no fechamento do candle, se o fizer.
 
 Uma sequência, não uma escolha:
 
@@ -526,10 +603,16 @@ Uma sequência, não uma escolha:
 3. `testnet`, para validar a integração real com a API da exchange.
 4. **Teste deliberado do circuit breaker** — force o cenário de perda e confirme
    que a paralisação acontece de verdade.
-5. Chaves da exchange sem permissão de saque, com whitelist de IP.
-6. `live` com limites conservadores e valores pequenos.
+5. **Teste deliberado do stop-loss** — abra uma posição em `testnet` e confirme
+   que ela fecha sozinha ao romper o nível. Este passo não existia, e é por isso
+   que o defeito da seção 11 sobreviveu ao desenvolvimento inteiro.
+6. Chaves da exchange sem permissão de saque, com whitelist de IP.
+7. `live` com limites conservadores e valores pequenos.
 
-O passo 4 é o mais fácil de pular e o mais caro de ter pulado.
+Os passos 4 e 5 são os mais fáceis de pular e os mais caros de ter pulado. Ambos
+têm a mesma forma: **provocar a proteção e verificar que ela agiu.** Ler que ela
+está configurada não é a mesma coisa — foi exatamente essa diferença que deixou o
+stop inerte por todo o projeto.
 
 ---
 

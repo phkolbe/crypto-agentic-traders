@@ -95,8 +95,9 @@ const FIELDS: {
     label: 'Filtro de regime MVRV',
     help:
       '1 desliga. 0,40 = não abrir posição quando o mercado estiver mais caro que 40% ' +
-      'dos dias já observados. Medido: reduz a queda máxima e custa retorno, porque ' +
-      'bloqueia entrada durante as altas. Nunca bloqueia fechamento.',
+      'dos dias já observados. ATENÇÃO: medido em 0,40, o filtro bloqueou TODAS as ' +
+      'entradas em dois de três períodos de um ano — o sistema simplesmente não ' +
+      'operou. Ver docs/SEGURANCA.md seção 10. Nunca bloqueia fechamento.',
     kind: 'percent',
   },
 ]

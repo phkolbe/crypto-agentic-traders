@@ -183,6 +183,26 @@ rotas são planas e sem parâmetros, mas mexe em histórico e deep link: categor
 de risco diferente de um renderizador de gráfico, cujo resultado se verifica
 olhando.
 
+## O backtest reusa o código de produção — e por que isso não bastou
+
+O backtester instancia o **mesmo** Strategy Agent, o **mesmo** `RiskEngine` e o
+**mesmo** `PaperBroker` da produção. A intenção é testar o código real, não uma
+reimplementação que divirja com o tempo.
+
+Isso pegou muita coisa. Não pegou o stop-loss, e a razão é instrutiva: reusar o
+componente que **calcula** o nível não diz nada sobre quem o **executa**. O
+`RiskEngine` fazia sua parte corretamente; o elo seguinte não existia, nem no
+backtest nem na produção — e um elo ausente não quebra teste nenhum.
+
+O padrão a lembrar: quando um parâmetro de configuração não muda nenhum
+resultado medido, isso é evidência, não ruído. Foi assim que apareceu — 480 de
+480 pares idênticos ao variar `stop_loss_pct`.
+
+Hoje a execução da proteção existe nos dois motores de backtest
+(`_apply_protective_exits`), com convenções deliberadamente pessimistas
+documentadas na seção 11 de [`SEGURANCA.md`](SEGURANCA.md). Em produção **ainda
+não existe**: `ccxt_adapter.place_order` não envia `stopPrice` nem OCO.
+
 ## Decisões que divergem do plano original
 
 | Plano | Implementado | Motivo |
