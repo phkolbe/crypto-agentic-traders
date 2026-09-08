@@ -316,7 +316,46 @@ se o objetivo é validar o encanamento, use testnet primeiro.
 
 ---
 
-## 9. Antes de ligar o LIVE
+## 9. Seleção de sinais: mecanismo pronto, desligado por evidência
+
+Com muitos pares monitorados, sinais concorrem pelas mesmas vagas de posição.
+Atender por ordem de chegada é arbitrário — num teste de 16 pares em 15m, **369
+sinais foram rejeitados por "posições abertas (3/3)"**, descartados sem qualquer
+comparação de qualidade.
+
+`RiskEngine.evaluate_batch` resolve isso: junta os sinais concorrentes, avalia
+**fechamentos primeiro** (fechar libera caixa e vaga, e travar a saída é a
+armadilha que o sistema evita em todas as camadas) e depois as **aberturas por
+confiança decrescente**, simulando cada aprovação para que a próxima veja o
+caixa já consumido.
+
+**E a medição não sustentou o ganho.** Ligado, o resultado piorou em 8 de 10
+combinações testadas (4h, 5 e 16 pares BRL). A causa aparece ao correlacionar a
+confiança de entrada com o PnL realizado:
+
+| Estratégia | Correlação | Operações |
+|---|---|---|
+| ma_crossover | −0,09 | 92 |
+| rsi_reversion | **−0,65** | 15 |
+| macd_trend | +0,06 | 121 |
+| todas as 4 | +0,05 | 198 |
+
+A `confidence` das estratégias é heurística inventada — separação das médias,
+profundidade do RSI, momento do MACD — e nunca foi validada como preditiva.
+Ordenar por ela ordena por ruído.
+
+O `rsi_reversion` é o caso instrutivo: a confiança cresce com a profundidade da
+sobrevenda, mas cair mais fundo indica tendência de baixa mais forte.
+Economicamente o sinal do coeficiente está invertido. Com 15 operações a
+amostra é pequena para afirmar, mas é forte o suficiente para não usar.
+
+Por isso `SIGNAL_BATCH_WINDOW_SECONDS=0` é o padrão: **o mecanismo existe, a
+métrica que ele ordena não.** Ligá-lo faz sentido depois de construir uma medida
+de qualidade validada contra resultado — não antes.
+
+---
+
+## 10. Antes de ligar o LIVE
 
 Uma sequência, não uma escolha:
 

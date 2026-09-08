@@ -80,6 +80,27 @@ class Signal(DomainModel):
     strategy: str
     direction: SignalDirection
     confidence: float = Field(ge=0.0, le=1.0)
+    """Convicção declarada pela estratégia, entre 0 e 1.
+
+    ATENÇÃO: **não é uma medida validada de qualidade.** As fórmulas atuais são
+    heurísticas (separação das médias, profundidade do RSI, momento do MACD) e a
+    medição contra resultado real, em 4h sobre 16 pares BRL, não sustentou que
+    predigam nada:
+
+    | estratégia | correlação confiança × PnL |
+    |---|---|
+    | ma_crossover | −0,09 |
+    | rsi_reversion | −0,65 |
+    | macd_trend | +0,06 |
+
+    O caso do `rsi_reversion` é instrutivo: a confiança cresce com a
+    profundidade da sobrevenda, mas cair mais fundo indica tendência de baixa
+    mais forte -- economicamente, o sinal do coeficiente está invertido.
+
+    Por isso `min_signal_confidence` (usar como piso) continua valendo, mas a
+    seleção por confiança entre sinais concorrentes vem **desligada** por padrão.
+    """
+
     reason: str
     reference_price: Decimal
     indicators: IndicatorSnapshot = Field(default_factory=IndicatorSnapshot)

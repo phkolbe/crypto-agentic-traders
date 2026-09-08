@@ -46,6 +46,13 @@ class PortfolioTrade:
     price: Decimal
     notional: Decimal
     fee: Decimal
+    confidence: float = 0.0
+    """Confianca do sinal que originou a ordem.
+
+    Registrada para permitir a pergunta que decide se a selecao por confianca
+    faz sentido: confianca alta de fato prediz resultado melhor?
+    """
+
     realized_pnl: Decimal | None = None
 
 
@@ -237,7 +244,10 @@ class PortfolioBacktestEngine:
                 prices[base] = price
                 broker.set_price(base, price)
 
-            # 2) Avalia estrategias par a par, na mesma carteira.
+            # 2) Coleta TODOS os sinais deste instante antes de decidir.
+            #    Avaliar par a par atenderia quem aparece primeiro na iteracao
+            #    dos dicionarios -- ordem arbitraria, nao qualidade.
+            batch = []
             for symbol, frame in frames.items():
                 if now not in frame.index:
                     continue
@@ -254,16 +264,22 @@ class PortfolioBacktestEngine:
                 )
                 for strategy in self.strategies:
                     signal = strategy.evaluate(market)
-                    if signal is None:
-                        continue
-                    result.signals_generated += 1
+                    if signal is not None:
+                        batch.append(signal)
+
+            # 3) Decide o lote inteiro por confianca, e executa os aprovados.
+            if batch:
+                result.signals_generated += len(batch)
+                for signal, assessment in await self._decide_batch(
+                    batch, broker, prices, last_order_at, result, now
+                ):
                     order_seq += 1
-                    await self._handle_signal(
-                        signal, broker, prices, cost_basis, last_order_at,
-                        result, now, order_seq,
+                    await self._execute(
+                        signal, assessment, broker, prices, cost_basis,
+                        last_order_at, result, now, order_seq,
                     )
 
-            # 3) Patrimonio ao fim do instante. Amostrado, nao a cada passo:
+            # 4) Patrimonio ao fim do instante. Amostrado, nao a cada passo:
             #    16 pares x milhares de candles produziriam uma curva gigante
             #    sem ganho de informacao.
             if step % 4 == 0 or now == timeline[-1]:
@@ -279,10 +295,10 @@ class PortfolioBacktestEngine:
         )
         return result
 
-    async def _handle_signal(
-        self, signal, broker, prices, cost_basis, last_order_at, result, now, order_seq
-    ) -> None:
-        base = signal.symbol.partition("/")[0]
+    async def _decide_batch(
+        self, batch, broker, prices, last_order_at, result, now
+    ) -> list:
+        """Aplica as regras de risco ao lote e devolve so os aprovados."""
         balances = await broker.fetch_balances()
         cash = balances.get(self.quote_currency, Decimal(0))
         positions = {
@@ -292,7 +308,6 @@ class PortfolioBacktestEngine:
             (amount * prices.get(asset, Decimal(0)) for asset, amount in positions.items()),
             start=Decimal(0),
         )
-
         state = PortfolioState(
             total_value=total,
             cash=cash,
@@ -300,16 +315,22 @@ class PortfolioBacktestEngine:
             prices=dict(prices),
             last_order_at=dict(last_order_at),
         )
-        assessment = self.engine.evaluate(signal, state, now=now)
 
-        if assessment.decision is RiskDecision.REJECTED:
-            result.signals_rejected += 1
-            for reason in assessment.reasons:
-                result.rejection_reasons[reason.split(":")[0]] += 1
-            return
-        if not assessment.approved_quantity:
-            return
+        aprovados = []
+        for signal, assessment in self.engine.evaluate_batch(batch, state, now=now):
+            if assessment.decision is RiskDecision.REJECTED:
+                result.signals_rejected += 1
+                for reason in assessment.reasons:
+                    result.rejection_reasons[reason.split(":")[0]] += 1
+            elif assessment.approved_quantity:
+                aprovados.append((signal, assessment))
+        return aprovados
 
+    async def _execute(
+        self, signal, assessment, broker, prices, cost_basis, last_order_at,
+        result, now, order_seq,
+    ) -> None:
+        base = signal.symbol.partition("/")[0]
         side = Side.BUY if signal.direction is SignalDirection.LONG else Side.SELL
         request = OrderRequest(
             client_order_id=f"pbt-{order_seq}",
@@ -353,6 +374,7 @@ class PortfolioBacktestEngine:
                 price=fill,
                 notional=quantity * fill,
                 fee=order.fee,
+                confidence=signal.confidence,
                 realized_pnl=realized,
             )
         )

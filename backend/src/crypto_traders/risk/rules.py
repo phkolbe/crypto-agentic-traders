@@ -53,6 +53,23 @@ class PortfolioState:
     circuit_breaker_active: bool = False
     circuit_breaker_reason: str | None = None
 
+    def copy(self) -> PortfolioState:
+        """Copia rasa com dicionarios proprios.
+
+        A avaliacao em lote precisa simular cada aprovacao sobre o estado para
+        que o sinal seguinte enxergue a vaga e o caixa ja consumidos -- e isso
+        nao pode alterar o retrato que o chamador passou.
+        """
+        return PortfolioState(
+            total_value=self.total_value,
+            cash=self.cash,
+            positions=dict(self.positions),
+            prices=dict(self.prices),
+            last_order_at=dict(self.last_order_at),
+            circuit_breaker_active=self.circuit_breaker_active,
+            circuit_breaker_reason=self.circuit_breaker_reason,
+        )
+
     def quantity_of(self, asset: str) -> Decimal:
         return self.positions.get(asset, Decimal(0))
 
@@ -176,6 +193,42 @@ class RiskEngine:
             ["venda a descoberto (SHORT) nao e suportada em spot"],
             state,
         )
+
+    # ------------------------------------------------------------------
+    def evaluate_batch(
+        self, signals: list[Signal], state: PortfolioState, now: datetime | None = None
+    ) -> list[tuple[Signal, RiskAssessment]]:
+        """Avalia sinais que competem pelas mesmas vagas, do melhor para o pior.
+
+        Sem isto, `evaluate` chamado sinal a sinal atende quem chegou primeiro.
+        Com muitos pares monitorados isso e o pior dos mundos: o sistema tem
+        escolhas e gasta as vagas com sinal mediano por ordem de chegada. Foi o
+        que os dados mostraram -- 369 sinais rejeitados por "posicoes abertas"
+        num teste de 16 pares, descartados sem comparacao de qualidade.
+
+        Ordem de avaliacao, deliberada:
+
+        1. **Fechamentos primeiro**, independente de confianca. Fechar libera
+           caixa e vaga, e a assimetria do sistema e nunca travar uma saida.
+        2. **Aberturas por confianca decrescente**, com desempate estavel pelo
+           simbolo para o resultado ser reprodutivel.
+
+        Cada aprovacao e simulada no estado antes do sinal seguinte ser
+        avaliado, senao duas aberturas concorrentes gastariam o mesmo caixa.
+        """
+        now = now or datetime.now(UTC)
+        closes = [s for s in signals if s.direction is SignalDirection.FLAT]
+        opens = [s for s in signals if s.direction is not SignalDirection.FLAT]
+        ordered = closes + sorted(opens, key=lambda s: (-s.confidence, s.symbol))
+
+        working = state.copy()
+        results: list[tuple[Signal, RiskAssessment]] = []
+        for signal in ordered:
+            assessment = self.evaluate(signal, working, now)
+            results.append((signal, assessment))
+            if assessment.decision is RiskDecision.APPROVED:
+                _apply_fill(working, signal, assessment, now)
+        return results
 
     # ------------------------------------------------------------------
     # Abertura / aumento de posicao
@@ -362,6 +415,32 @@ class RiskEngine:
                 "cooldown_seconds": self.limits.cooldown_seconds,
             },
         }
+
+
+def _apply_fill(
+    state: PortfolioState, signal: Signal, assessment: RiskAssessment, now: datetime
+) -> None:
+    """Reflete uma aprovacao no estado, para o proximo sinal do lote ver a realidade.
+
+    Aproximacao deliberada: usa o preco de referencia do sinal e ignora taxa e
+    slippage. O objetivo aqui nao e contabilidade -- e impedir que dois sinais
+    concorrentes sejam ambos aprovados contra o mesmo caixa. Quem contabiliza de
+    verdade e o broker.
+    """
+    base, _ = _split_symbol(signal.symbol)
+    quantity = assessment.approved_quantity or Decimal(0)
+    notional = assessment.approved_notional or Decimal(0)
+
+    if signal.direction is SignalDirection.FLAT:
+        state.cash += notional
+        state.positions[base] = state.quantity_of(base) - quantity
+    else:
+        state.cash -= notional
+        state.positions[base] = state.quantity_of(base) + quantity
+
+    # Marca o cooldown: duas ordens no mesmo par dentro de um lote seriam
+    # overtrading imediato, exatamente o que o cooldown existe para evitar.
+    state.last_order_at[signal.symbol] = now
 
 
 def _split_symbol(symbol: str) -> tuple[str, str]:

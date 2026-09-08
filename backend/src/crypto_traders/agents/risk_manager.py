@@ -15,6 +15,8 @@ Duas garantias estruturais:
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -77,15 +79,96 @@ class RiskManagerAgent(BaseAgent):
     # ------------------------------------------------------------------
     async def _run(self) -> None:
         await self._load_state()
-        async for signal in self.bus.subscribe(Topics.SIGNALS):
-            await self.wait_if_paused()
+
+        # Uma tarefa alimenta a fila; o loop principal a drena em lotes. Iterar
+        # a assinatura direto bloquearia ate o proximo sinal, e sem poder
+        # esperar pela rajada nao ha o que comparar.
+        queue: asyncio.Queue[Signal] = asyncio.Queue()
+
+        async def feed() -> None:
+            async for signal in self.bus.subscribe(Topics.SIGNALS):
+                await queue.put(signal)
+
+        feeder = asyncio.create_task(feed(), name="risk-signal-feed")
+        try:
+            while True:
+                batch = await self._collect_batch(queue)
+                await self.wait_if_paused()
+                try:
+                    await self._on_batch(batch)
+                except Exception as exc:
+                    # Falhar ao avaliar NAO pode virar "aprovado". A excecao e
+                    # registrada e os sinais simplesmente nao geram ordem.
+                    self.log.exception("risk.evaluation_failed", error=str(exc))
+                await self.heartbeat()
+        finally:
+            feeder.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await feeder
+
+    async def _collect_batch(self, queue: asyncio.Queue[Signal]) -> list[Signal]:
+        """Espera o primeiro sinal e junta os que chegarem na janela.
+
+        A janela e o que transforma "quem chegou primeiro" em "qual e o melhor".
+        Quanto maior, melhor a escolha e mais atrasada a execucao; o padrao de 2s
+        cobre a rajada de um ciclo de coleta sem atrasar de forma perceptivel.
+        """
+        batch = [await queue.get()]
+        window = self._settings.signal_batch_window_seconds
+        if window <= 0:
+            return batch
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + window
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
             try:
-                await self._on_signal(signal)
-            except Exception as exc:
-                # Falhar ao avaliar NAO pode virar "aprovado". A excecao e
-                # registrada e o sinal simplesmente nao gera ordem.
-                self.log.exception("risk.evaluation_failed", error=str(exc))
-            await self.heartbeat()
+                batch.append(await asyncio.wait_for(queue.get(), timeout=remaining))
+            except TimeoutError:
+                break
+        return batch
+
+    async def _on_batch(self, batch: list[Signal]) -> None:
+        """Decide o lote inteiro de uma vez, por confianca."""
+        if self._snapshot is None:
+            for signal in batch:
+                await self._persist_and_publish(
+                    RiskAssessment(
+                        signal_id=signal.id,
+                        decision=RiskDecision.REJECTED,
+                        reasons=["portfolio ainda nao apurado (aguardando primeiro snapshot)"],
+                    ),
+                    signal,
+                )
+            return
+
+        await self._load_state()
+        state = await self._build_state(batch[0])
+        for symbol in {s.symbol for s in batch}:
+            base = symbol.partition("/")[0]
+            for signal in batch:
+                if signal.symbol == symbol:
+                    state.prices[base] = signal.reference_price
+                    break
+
+        decisoes = self._engine.evaluate_batch(batch, state)
+        if len(batch) > 1:
+            self.log.info(
+                "risk.batch_evaluated",
+                sinais=len(batch),
+                aprovados=sum(
+                    1 for _, a in decisoes if a.decision is RiskDecision.APPROVED
+                ),
+                ranking=[
+                    f"{s.symbol}@{s.confidence:.2f}"
+                    for s, _ in decisoes
+                    if s.direction is SignalDirection.LONG
+                ],
+            )
+        for signal, assessment in decisoes:
+            await self._persist_and_publish(assessment, signal)
 
     async def _load_state(self) -> None:
         """Carrega limites e estado do circuit breaker do banco.

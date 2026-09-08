@@ -212,6 +212,16 @@ class Settings(BaseSettings):
     strategies: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: ["ma_crossover", "rsi_reversion"]
     )
+    signal_batch_window_seconds: float = Field(
+        default=0.0,
+        ge=0,
+        description=(
+            "Janela para juntar sinais concorrentes antes do Risk Manager decidir "
+            "por confianca. DESLIGADO por padrao (zero) porque a medicao nao "
+            "sustentou o ganho: ver docs/SEGURANCA.md. Ligar so faz sentido apos "
+            "validar que a confianca da estrategia prediz resultado."
+        ),
+    )
 
     # --- Paper trading ----------------------------------------------------
     paper_initial_balance: Decimal = Decimal("1000")
