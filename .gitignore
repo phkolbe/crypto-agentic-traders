@@ -30,6 +30,11 @@ dist/
 .vite/
 *.local
 
+# Cache incremental do TypeScript. `npm run build` roda `tsc -b`, e o build mode
+# sempre regrava este arquivo -- versiona-lo poluiria o diff de todo commit com
+# timestamps e hashes de uma maquina especifica.
+*.tsbuildinfo
+
 # --- Logs ---
 logs/
 *.log
