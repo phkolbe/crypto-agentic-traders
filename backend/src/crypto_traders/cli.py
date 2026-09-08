@@ -124,7 +124,8 @@ async def _check(settings) -> int:
           f"ou {risk.max_order_pct_portfolio:.1%} do portfolio (o menor)")
     print(f"    ordem minima      : {risk.min_order_notional} {settings.trading.quote_currency}")
     print(f"    exposicao maxima  : {risk.max_asset_exposure_pct:.0%} por ativo")
-    print(f"    stop / alvo       : -{risk.stop_loss_pct:.1%} / +{risk.take_profit_pct:.1%}")
+    print(f"    stop / alvo       : -{risk.stop_loss_pct:.1%} / +{risk.take_profit_pct:.1%} "
+          f"— aplicado pelo SISTEMA, nao pela exchange")
     print(f"    circuit breaker   : -{risk.daily_loss_limit_pct:.1%} ao dia, "
           f"-{risk.weekly_loss_limit_pct:.1%} na semana")
     print(f"    cooldown          : {risk.cooldown_seconds}s por par")
@@ -137,6 +138,7 @@ async def _check(settings) -> int:
     else:
         print(f"    whitelist         : {', '.join(risk.symbol_whitelist)}")
 
+    _check_protection_scope(settings)
     await _check_regime_filter(settings)
 
     print("\n  Conectividade com a exchange (endpoints publicos):")
@@ -229,6 +231,30 @@ async def _load_business_config(settings) -> None:
     if not existia:
         print("    Primeira subida: os valores de negocio foram gravados com os")
         print("    padroes. Ajuste-os em Configuracoes, na interface web.")
+
+
+def _check_protection_scope(settings) -> None:
+    """Diz ONDE o stop e aplicado, e o que essa escolha nao cobre.
+
+    A linha "stop / alvo: -3,0% / +6,0%" acima nao diz quem segura a posicao.
+    Lendo so aquilo, a conclusao natural e que a exchange esta segurando -- e
+    durante todo o desenvolvimento a conclusao era pior ainda, porque o nivel
+    nao era comparado com preco nenhum, em lugar nenhum.
+
+    Nomear o alcance da protecao e a licao desse episodio: um numero exibido sem
+    dizer quem o executa e um numero em que se confia sem motivo.
+    """
+    intervalo = settings.trading.portfolio_interval_seconds
+    print("\n  Alcance da protecao (stop / alvo):")
+    print(f"    onde       : no SISTEMA, a cada {intervalo}s — nao na exchange")
+    print("    NAO cobre  : processo encerrado, maquina reiniciada, ou perda de")
+    print("                 acesso a API (IP fora da whitelist). Nesses casos uma")
+    print("                 posicao aberta fica sem saida automatica.")
+    print("                 Tambem nao ve o pavio dentro do intervalo: uma queda")
+    print("                 que rompe o stop e volta antes da proxima leitura")
+    print("                 passa batida. O backtest, que le a minima do candle,")
+    print("                 e nesse ponto MAIS severo que a producao.")
+    print("    ver        : docs/SEGURANCA.md, secao 11")
 
 
 async def _check_regime_filter(settings) -> None:
