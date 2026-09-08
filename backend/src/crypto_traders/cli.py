@@ -16,6 +16,7 @@ from .config import get_settings
 from .db.session import init_db, session_scope
 from .domain.enums import TradingMode
 from .logging_setup import configure_logging, get_logger
+from .risk.rules import SizingFeasibility
 
 log = get_logger(__name__)
 
@@ -131,13 +132,21 @@ async def _check(settings) -> int:
         return 1
 
     print("\n  Conectividade com a exchange (endpoints publicos):")
+    markets: dict = {}
+    tickers: dict = {}
+    active_symbols: list[str] = []
     try:
         from .exchanges import build_market_data_source
 
         source = build_market_data_source(settings.exchange)
         try:
+            # Uma varredura so alimenta a descoberta E a checagem de filtros
+            # logo abaixo: pedir os mercados duas vezes seria desperdicio de
+            # chamada e ainda poderia devolver precos diferentes entre elas.
+            markets, tickers = await source.fetch_markets_and_tickers()
+
             if settings.discovery_enabled:
-                from .discovery import DEFAULT_EXCLUDED_ASSETS, DiscoveryCriteria, discover
+                from .discovery import DEFAULT_EXCLUDED_ASSETS, DiscoveryCriteria, select_markets
 
                 criteria = DiscoveryCriteria(
                     quote_currency=settings.quote_currency,
@@ -146,7 +155,7 @@ async def _check(settings) -> int:
                     exclude_assets=DEFAULT_EXCLUDED_ASSETS
                     | {a.upper() for a in settings.discovery_exclude_assets},
                 )
-                result = await discover(source, criteria)
+                result = select_markets(markets, tickers, criteria)
                 if not result.symbols:
                     print("    NENHUM par atingiu o piso de liquidez.")
                     print("    Reduza DISCOVERY_MIN_QUOTE_VOLUME_24H ou defina SYMBOLS.")
@@ -156,9 +165,12 @@ async def _check(settings) -> int:
                 for market in result.markets:
                     volume = float(market.quote_volume_24h) / 1e6
                     print(f"      {market.symbol:<14} volume 24h {volume:>8,.0f}M")
+                active_symbols = result.symbols
             else:
-                ticker = await source.fetch_ticker(settings.symbols[0])
-                print(f"    {ticker.symbol}: {ticker.price}  OK")
+                active_symbols = list(settings.symbols)
+                for symbol in active_symbols:
+                    price = (tickers.get(symbol) or {}).get("last")
+                    print(f"    {symbol}: {price if price else 'sem cotacao'}  OK")
         finally:
             await source.close()
     except Exception as exc:
@@ -169,7 +181,11 @@ async def _check(settings) -> int:
     if not credentials_ok:
         return 1
 
-    if not _check_sizing(settings, quote_balance):
+    sizing = _check_sizing(settings, quote_balance)
+    if sizing is None:
+        return 1
+
+    if not _check_market_filters(settings, markets, tickers, active_symbols, sizing):
         return 1
 
     if settings.is_live:
@@ -181,7 +197,7 @@ async def _check(settings) -> int:
     return 0
 
 
-def _check_sizing(settings, quote_balance: Decimal | None = None) -> bool:
+def _check_sizing(settings, quote_balance: Decimal | None = None) -> SizingFeasibility | None:
     """Confere se patrimonio e limites permitem alguma ordem existir.
 
     Sem esta checagem, o diagnostico diria "tudo pronto" para uma configuracao
@@ -190,6 +206,9 @@ def _check_sizing(settings, quote_balance: Decimal | None = None) -> bool:
 
     Em `dry_run` usa o saldo simulado. Nos modos reais usa o saldo em moeda de
     cotacao, que e o poder de compra efetivo.
+
+    Devolve o resultado (para a checagem de filtros da exchange saber o tamanho
+    da ordem) ou `None` quando nenhuma ordem e possivel.
     """
     from .risk.rules import assess_sizing_feasibility
 
@@ -207,13 +226,67 @@ def _check_sizing(settings, quote_balance: Decimal | None = None) -> bool:
 
     if result.feasible:
         print(f"    {result.explain(quote)}")
-        return True
+        return result
 
     print("    " + "!" * 62)
     for line in _wrap(result.explain(quote), 60):
         print(f"    {line}")
     print("    Aumente o patrimonio, ou reduza RISK_MIN_ORDER_NOTIONAL e suba")
     print("    RISK_MAX_ORDER_PCT_PORTFOLIO / RISK_MAX_ASSET_EXPOSURE_PCT.")
+    print("    " + "!" * 62)
+    return None
+
+
+def _check_market_filters(
+    settings,
+    markets: dict,
+    tickers: dict,
+    symbols: list[str],
+    sizing: SizingFeasibility,
+) -> bool:
+    """Simula a ordem contra os filtros REAIS da exchange.
+
+    O dimensionamento acima so conhece os nossos limites. A exchange tem os
+    dela: a quantidade e truncada para o passo do lote e so entao o valor
+    minimo e aplicado. Em BTC, com passo de 0,00001 a 79 mil, cada passo vale
+    ~0,79 USDT -- uma ordem de 5,50 vira 4,74 e a Binance recusa, enquanto o
+    mesmo valor passa em ETH ou SOL.
+
+    Sem esta checagem, o diagnostico aprovaria uma configuracao em que toda
+    ordem seria rejeitada, e a descoberta viria operando com dinheiro real.
+    """
+    from .exchanges.filters import check_all
+
+    if not symbols or not markets:
+        return True
+
+    quote = settings.quote_currency
+    notional = sizing.max_possible_order
+    results = check_all(markets, tickers, symbols, notional)
+    if not results:
+        return True
+
+    print(f"\n  Filtros da exchange (ordem de {notional:.2f} {quote}):")
+    blocked = [r for r in results if not r.viable]
+
+    for result in results:
+        mark = "OK " if result.viable else "NAO"
+        print(
+            f"    {mark} {result.symbol:<14} {result.requested_notional:>7.2f} -> "
+            f"{result.effective_notional:>7.2f} {quote}"
+            f"   (minimo da exchange: {result.min_cost:g})"
+        )
+
+    if not blocked:
+        return True
+
+    needed = max(r.suggested_notional for r in blocked)
+    print("    " + "!" * 62)
+    print(f"    {len(blocked)} par(es) rejeitariam a ordem por causa do arredondamento")
+    print("    de lote. Ajustes possiveis:")
+    print(f"      - subir RISK_MIN_ORDER_NOTIONAL para {needed:.2f} (e o teto por")
+    print("        ordem junto, para caber), ou")
+    print(f"      - remover da whitelist: {', '.join(r.symbol for r in blocked)}")
     print("    " + "!" * 62)
     return False
 

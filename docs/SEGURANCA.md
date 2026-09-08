@@ -255,7 +255,68 @@ a notificação não funciona justamente no dia em que o circuit breaker dispara
 
 ---
 
-## 8. Antes de ligar o LIVE
+## 8. Rodar LIVE com carteira pequena
+
+É possível, mas exige entender dois mínimos que se somam.
+
+**O seu**, `RISK_MIN_ORDER_NOTIONAL`, e **o da exchange**, que na Binance são
+dois: um valor mínimo por ordem (5 USDT na maioria dos pares spot) e um passo de
+lote (`stepSize`) para o qual a quantidade é **truncada** antes do envio.
+
+A armadilha está na ordem em que isso acontece. O ccxt trunca a quantidade, e só
+então a Binance aplica o valor mínimo sobre o resultado. Em BTC/USDT o passo é
+0,00001 e, a 79 mil, cada passo vale ~0,79 USDT — uma ordem mirando 5,50 vira
+0,00006 BTC = **4,74 USDT** e é recusada. O mesmo valor passa tranquilo em ETH,
+SOL ou DOGE, cujos passos são finos em relação ao preço.
+
+Por isso o `check` simula a ordem contra os filtros reais de cada par:
+
+```
+Filtros da exchange (ordem de 5.50 USDT):
+  NAO BTC/USDT          5.50 ->    4.75 USDT   (minimo da exchange: 5.0)
+  OK  ETH/USDT          5.50 ->    5.47 USDT   (minimo da exchange: 5.0)
+```
+
+E falha com código 1, sugerindo o valor que funcionaria — com uma folga de um
+passo, porque o preço se move entre a decisão e o envio, e uma ordem exatamente
+na fronteira é rejeitada por qualquer variação contrária.
+
+### Configuração validada para ~R$100 (19 USDT)
+
+```dotenv
+RISK_MAX_ORDER_NOTIONAL=7
+RISK_MAX_ORDER_PCT_PORTFOLIO=0.35
+RISK_MAX_ASSET_EXPOSURE_PCT=0.40
+RISK_MAX_OPEN_POSITIONS=2
+RISK_MIN_ORDER_NOTIONAL=6
+RISK_DAILY_LOSS_LIMIT_PCT=0.08
+```
+
+Ordem resultante: 6,75 USDT, que sobrevive ao arredondamento em BTC (6,33), ETH
+(6,71) e SOL (6,73). O limite diário sobe para 8% porque, com ~70% da carteira
+aplicada, uma queda normal do mercado dispararia o circuit breaker quase todo dia
+em 5%.
+
+### O que essa configuração custa
+
+Não é pouco, e precisa estar explícito:
+
+- **Concentração.** 35% da carteira num único ativo por operação, no máximo 2
+  posições. A diversificação deixa de existir.
+- **As taxas passam a pesar.** 0,1% por lado. Numa ordem de 6,75 são ~0,0135 USDT
+  por ida e volta; a ~40 operações no mês, isso é **~2,8% do patrimônio só em
+  taxa**, antes de qualquer resultado.
+- **O resultado não significa nada estatisticamente.** Poucas operações medem a
+  direção do mercado e sorte, não a qualidade da estratégia. O risco real não é
+  perder o valor — é ter um ganho por acaso e concluir que o sistema funciona.
+
+O que R$100 em live realmente valida é a **integração**: chave, IP, filtros da
+exchange e preenchimento real. O **testnet** entrega exatamente isso de graça —
+se o objetivo é validar o encanamento, use testnet primeiro.
+
+---
+
+## 9. Antes de ligar o LIVE
 
 Uma sequência, não uma escolha:
 

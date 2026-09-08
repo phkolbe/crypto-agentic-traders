@@ -202,7 +202,9 @@ class TestCheckCommand:
         from crypto_traders.cli import _check_sizing
 
         tiny = settings.model_copy(update={"paper_initial_balance": R100})
-        assert _check_sizing(tiny) is False
+        # `None` significa inviavel; quando viavel devolve o resultado, que a
+        # checagem de filtros da exchange usa para simular a ordem.
+        assert _check_sizing(tiny) is None
         output = capsys.readouterr().out
         assert "NENHUMA ordem" in output
         assert "RISK_MAX_ORDER_PCT_PORTFOLIO" in output
@@ -210,7 +212,8 @@ class TestCheckCommand:
     def test_check_passes_with_a_workable_balance(self, settings, capsys):
         from crypto_traders.cli import _check_sizing
 
-        assert _check_sizing(settings.model_copy(update={"paper_initial_balance": R5000})) is True
+        result = _check_sizing(settings.model_copy(update={"paper_initial_balance": R5000}))
+        assert result is not None and result.feasible
         assert "maior ordem possivel" in capsys.readouterr().out
 
 
