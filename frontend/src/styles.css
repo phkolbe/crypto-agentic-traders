@@ -248,6 +248,28 @@ a:hover { text-decoration: underline; }
   background: rgba(255, 255, 255, 0.06);
 }
 
+/* Graficos ---------------------------------------------------------------- */
+/* Caixa de leitura do grafico. `pointer-events: none` e essencial: sob o cursor,
+   uma caixa que captura o mouse roubaria o hover do proprio grafico e piscaria. */
+.chart-tooltip {
+  position: absolute;
+  pointer-events: none;
+  z-index: 2;
+  padding: 7px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: nowrap;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+}
+.chart-tooltip-label {
+  color: var(--text-faint);
+  font-size: 11px;
+  margin-bottom: 2px;
+}
+
 /* Tabelas ----------------------------------------------------------------- */
 .table-wrap { overflow-x: auto; }
 

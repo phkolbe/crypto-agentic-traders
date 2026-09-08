@@ -1,10 +1,9 @@
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { useState } from 'react'
-import { Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
-
 import { ApiError, api } from '../api/client'
 import { money, percent, price, shortDate, signedPercent } from '../api/format'
 import type { BacktestResult, StrategyInfo } from '../api/types'
+import { TimeSeriesChart } from '../components/Charts'
 import { Card, Empty, Stat } from '../components/Shared'
 
 const TIMEFRAMES = ['15m', '30m', '1h', '4h', '1d']
@@ -159,46 +158,14 @@ export default function Backtest() {
               {curve.length < 2 ? (
                 <Empty>Sem pontos suficientes.</Empty>
               ) : (
-                <ResponsiveContainer width="100%" height={280}>
-                  <LineChart data={curve} margin={{ top: 6, right: 6, left: 0, bottom: 0 }}>
-                    <XAxis
-                      dataKey="time"
-                      tickFormatter={shortDate}
-                      stroke="var(--text-faint)"
-                      fontSize={11}
-                      tickLine={false}
-                      axisLine={false}
-                      minTickGap={50}
-                    />
-                    <YAxis
-                      stroke="var(--text-faint)"
-                      fontSize={11}
-                      tickLine={false}
-                      axisLine={false}
-                      width={62}
-                      domain={['dataMin - dataMin * 0.01', 'dataMax + dataMax * 0.01']}
-                      tickFormatter={(value) => Number(value).toFixed(0)}
-                    />
-                    <Tooltip
-                      contentStyle={{
-                        background: 'var(--bg-elevated)',
-                        border: '1px solid var(--border)',
-                        borderRadius: 8,
-                        fontSize: 12,
-                      }}
-                      labelFormatter={(value) => new Date(value as string).toLocaleString('pt-BR')}
-                      formatter={(value) => [money(Number(value)), 'capital']}
-                    />
-                    <Line
-                      type="monotone"
-                      dataKey="value"
-                      stroke="#58a6ff"
-                      strokeWidth={2}
-                      dot={false}
-                      isAnimationActive={false}
-                    />
-                  </LineChart>
-                </ResponsiveContainer>
+                <TimeSeriesChart
+                  data={curve}
+                  height={280}
+                  formatX={shortDate}
+                  formatValue={(value) => money(value)}
+                  valueLabel="capital"
+                  minTickGap={50}
+                />
               )}
             </Card>
           </div>

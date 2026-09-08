@@ -143,6 +143,46 @@ Escrever uma variável de negócio no `.env` faz `Settings` recusar subir. Ver
 seção 11 de [`SEGURANCA.md`](SEGURANCA.md) para o episódio que tornou isso uma
 regra.
 
+## Gráficos
+
+Três gráficos — área do patrimônio, rosca de alocação, linha do backtest — em
+`frontend/src/components/Charts.tsx`, ~380 linhas de SVG.
+
+A medição que motivou sair do Recharts, atribuindo bytes por pacote via
+sourcemap:
+
+| | Antes | Depois |
+|---|---|---|
+| Bundle | 691,6 kB | **268,2 kB** |
+| Comprimido (gzip) | 198,0 kB | **84,5 kB** |
+| Módulos transformados | 706 | **89** |
+| Tempo de build | 4,1 s | **0,74 s** |
+
+Recharts pesava 618 kB de fonte e arrastava lodash (151 kB), decimal.js-light,
+react-smooth, d3-scale/shape/time/format/color e recharts-scale — somando ~60%
+do bundle para desenhar três gráficos.
+
+O que foi preciso reimplementar, e o que cada peça resolve:
+
+- **Interpolação monotônica** (tangentes de Fritsch–Carlson), que era o
+  `type="monotone"`. Uma spline cúbica comum inventa oscilação entre pontos —
+  numa curva de patrimônio isso desenharia prejuízo onde não houve.
+- **Marcações "redondas"** no eixo Y, com o passo arredondado **para cima**:
+  arredondar para baixo respeita o valor redondo e estoura a contagem, e num
+  gráfico de 110 px os rótulos saíam empilhados.
+- **Rarefação do eixo X pela largura do rótulo**, não por um espaçamento fixo:
+  com 500 pontos e datas como "08 de set.", um `minTickGap` de 50 px deixava os
+  rótulos a 50 px de distância e 55 px de largura.
+- **Anel fechado para fatia única**, porque um arco de 360° tem começo e fim no
+  mesmo ponto e não pinta nada. Esse era justamente o caso em que o donut do
+  Recharts sumia, e agora não existe animação nem estado interno para congelar.
+
+O maior item restante é o `react-router` (308 kB de fonte, 48% do que sobrou) —
+mais que o `react-dom`. Trocá-lo por um roteador mínimo é viável, já que as 8
+rotas são planas e sem parâmetros, mas mexe em histórico e deep link: categoria
+de risco diferente de um renderizador de gráfico, cujo resultado se verifica
+olhando.
+
 ## Decisões que divergem do plano original
 
 | Plano | Implementado | Motivo |
@@ -154,4 +194,5 @@ regra.
 | Coinbase no MVP | Somente Binance | Coinbase movida para a fase 5; o adapter `ccxt` já é genérico |
 | Whitelist de pares sempre fixa | Lista de pares vazia ativa descoberta automática | Universo escolhido por liquidez, com a lista descoberta virando a whitelist efetiva e indo para o `audit_log` |
 | Alertas por Telegram | E-mail (SMTP) e WhatsApp (Meta Cloud API) | Canais que o operador de fato usa, cada um com liga/desliga na interface |
+| Recharts para os gráficos | Gráficos próprios em SVG (`components/Charts.tsx`) | Recharts e o que ele arrasta (lodash, d3-*, react-smooth, decimal.js-light) eram **60% do bundle** para desenhar três gráficos: 691 kB -> 268 kB ao sair |
 | Configuração toda no `.env` | `.env` só ambiente; negócio no banco, editável na web | Enquanto os limites viviam nos dois lugares, o banco vencia em silêncio — o `.env` pedia ordem máxima de 7 USDT e o sistema operava com 50 |

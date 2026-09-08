@@ -1,20 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useState } from 'react'
-import {
-  Area,
-  AreaChart,
-  Cell,
-  Pie,
-  PieChart,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from 'recharts'
-
 import { api } from '../api/client'
 import { money, percent, quantity, shortDate, signedPercent, timeOnly } from '../api/format'
 import type { EquityPoint, PortfolioSummary, RiskEvent } from '../api/types'
+import { DonutChart, TimeSeriesChart } from '../components/Charts'
 import {
   Card,
   CircuitBreakerBanner,
@@ -135,56 +124,14 @@ export default function Dashboard({ feed }: { feed: { event: string; data: any; 
               <br />O Portfolio Agent grava um ponto por minuto enquanto o sistema roda.
             </Empty>
           ) : (
-            <ResponsiveContainer width="100%" height={260}>
-              <AreaChart data={curve} margin={{ top: 6, right: 6, left: 0, bottom: 0 }}>
-                <defs>
-                  <linearGradient id="equity" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="#58a6ff" stopOpacity={0.35} />
-                    <stop offset="100%" stopColor="#58a6ff" stopOpacity={0} />
-                  </linearGradient>
-                </defs>
-                <XAxis
-                  dataKey="time"
-                  tickFormatter={(value) => (days <= 1 ? timeOnly(value) : shortDate(value))}
-                  stroke="var(--text-faint)"
-                  fontSize={11}
-                  tickLine={false}
-                  axisLine={false}
-                  minTickGap={40}
-                />
-                <YAxis
-                  stroke="var(--text-faint)"
-                  fontSize={11}
-                  tickLine={false}
-                  axisLine={false}
-                  width={62}
-                  // Escala focada na variacao real: comecar em zero achataria a
-                  // curva e esconderia justamente o que interessa observar.
-                  domain={['dataMin - dataMin * 0.01', 'dataMax + dataMax * 0.01']}
-                  tickFormatter={(value) => Number(value).toFixed(0)}
-                />
-                <Tooltip
-                  contentStyle={{
-                    background: 'var(--bg-elevated)',
-                    border: '1px solid var(--border)',
-                    borderRadius: 8,
-                    fontSize: 12,
-                  }}
-                  labelFormatter={(value) => new Date(value as string).toLocaleString('pt-BR')}
-                  formatter={(value) => [money(Number(value)), 'patrimônio']}
-                />
-                <Area
-                  type="monotone"
-                  dataKey="value"
-                  stroke="#58a6ff"
-                  strokeWidth={2}
-                  fill="url(#equity)"
-                  // O grafico e reavaliado a cada snapshot de portfolio; sem
-                  // isso a curva se redesenharia do zero a cada minuto.
-                  isAnimationActive={false}
-                />
-              </AreaChart>
-            </ResponsiveContainer>
+            <TimeSeriesChart
+              data={curve}
+              height={260}
+              fill
+              formatX={(value) => (days <= 1 ? timeOnly(value) : shortDate(value))}
+              formatValue={(value) => money(value)}
+              valueLabel="patrimônio"
+            />
           )}
         </Card>
 
@@ -193,43 +140,17 @@ export default function Dashboard({ feed }: { feed: { event: string; data: any; 
             <Empty>Sem posições apuradas.</Empty>
           ) : (
             <div className="row" style={{ alignItems: 'center', gap: 18 }}>
-              {/* PieChart com tamanho fixo em vez de ResponsiveContainer: dentro
-                  de um flex, o container responsivo mede 0 e o donut some. */}
+              {/* Tamanho fixo, nao medido: dentro de um flex um container
+                  responsivo mede 0 na primeira renderizacao e o donut some. */}
               <div style={{ flexShrink: 0 }}>
-                <PieChart width={180} height={180}>
-                  <Pie
-                    data={allocations}
-                    dataKey="share"
-                    nameKey="asset"
-                    innerRadius={48}
-                    outerRadius={78}
-                    // Sem espacamento quando ha uma fatia so: num circulo
-                    // completo o paddingAngle zera o setor.
-                    paddingAngle={allocations.length > 1 ? 2 : 0}
-                    stroke="none"
-                    // Sem animacao de entrada: quando ela nao completa, o setor
-                    // fica congelado em um quadro degenerado e o donut some.
-                    // Alem disso o dashboard re-renderiza a cada evento do
-                    // WebSocket, e a animacao recomecaria do zero toda vez.
-                    isAnimationActive={false}
-                  >
-                    {allocations.map((entry, index) => (
-                      <Cell
-                        key={entry.asset}
-                        fill={SLICE_COLORS[index % SLICE_COLORS.length]}
-                      />
-                    ))}
-                  </Pie>
-                  <Tooltip
-                    contentStyle={{
-                      background: 'var(--bg-elevated)',
-                      border: '1px solid var(--border)',
-                      borderRadius: 8,
-                      fontSize: 12,
-                    }}
-                    formatter={(value) => percent(Number(value))}
-                  />
-                </PieChart>
+                <DonutChart
+                  data={allocations.map((entry, index) => ({
+                    label: entry.asset,
+                    value: entry.share,
+                    color: SLICE_COLORS[index % SLICE_COLORS.length]!,
+                  }))}
+                  formatValue={(value) => percent(value)}
+                />
               </div>
 
               <div style={{ flex: 1, minWidth: 160 }}>
