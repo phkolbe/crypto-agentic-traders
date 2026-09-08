@@ -230,6 +230,24 @@ a:hover { text-decoration: underline; }
 }
 .alert-banner strong { color: var(--negative); }
 
+/* Nota de contexto: explica, nao alarma. Cinza-azulado, sem peso de alerta. */
+.info-banner {
+  padding: 11px 15px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  line-height: 1.55;
+  background: rgba(88, 166, 255, 0.06);
+  border: 1px solid rgba(88, 166, 255, 0.2);
+  color: var(--text-muted);
+}
+.info-banner strong { color: var(--text); }
+.info-banner code {
+  font-size: 12px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.06);
+}
+
 /* Tabelas ----------------------------------------------------------------- */
 .table-wrap { overflow-x: auto; }
 

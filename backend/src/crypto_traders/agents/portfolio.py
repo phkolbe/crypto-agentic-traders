@@ -52,11 +52,11 @@ class PortfolioAgent(BaseAgent):
             except Exception as exc:
                 self.log.exception("portfolio.snapshot_failed", error=str(exc))
             await self.heartbeat()
-            if not await self.sleep(self._settings.portfolio_interval_seconds):
+            if not await self.sleep(self._settings.trading.portfolio_interval_seconds):
                 return
 
     async def build_snapshot(self) -> PortfolioSnapshot:
-        quote = self._settings.quote_currency
+        quote = self._settings.trading.quote_currency
         prices = self._price_source()
         positions = await self._broker.fetch_positions(prices)
 

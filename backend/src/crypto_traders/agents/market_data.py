@@ -57,20 +57,20 @@ class MarketDataAgent(BaseAgent):
         ultima descoberta. Nunca "nenhum": subir sem observar mercado nenhum e o
         estado que mais engana, porque tudo parece saudavel.
         """
-        if self._settings.symbols:
-            return list(self._settings.symbols)
+        if self._settings.trading.symbols:
+            return list(self._settings.trading.symbols)
         return list(self._discovered)
 
     @property
     def discovery_enabled(self) -> bool:
-        return self._settings.discovery_enabled
+        return self._settings.trading.discovery_enabled
 
     def _criteria(self) -> DiscoveryCriteria:
-        extra = {asset.upper() for asset in self._settings.discovery_exclude_assets}
+        extra = {asset.upper() for asset in self._settings.trading.discovery_exclude_assets}
         return DiscoveryCriteria(
-            quote_currency=self._settings.quote_currency,
-            min_quote_volume_24h=self._settings.discovery_min_quote_volume_24h,
-            max_symbols=self._settings.discovery_max_symbols,
+            quote_currency=self._settings.trading.quote_currency,
+            min_quote_volume_24h=self._settings.trading.discovery_min_quote_volume_24h,
+            max_symbols=self._settings.trading.discovery_max_symbols,
             exclude_assets=DEFAULT_EXCLUDED_ASSETS | extra,
         )
 
@@ -84,10 +84,9 @@ class MarketDataAgent(BaseAgent):
             return self.active_symbols
 
         now = datetime.now(UTC)
+        intervalo = timedelta(hours=self._settings.trading.discovery_refresh_hours)
         due = (
-            force
-            or self._last_discovery is None
-            or now - self._last_discovery >= timedelta(hours=self._settings.discovery_refresh_hours)
+            force or self._last_discovery is None or now - self._last_discovery >= intervalo
         )
         if not due:
             return self.active_symbols
@@ -108,7 +107,7 @@ class MarketDataAgent(BaseAgent):
         if not result.symbols:
             self.log.error(
                 "market_data.discovery_empty",
-                min_volume=str(self._settings.discovery_min_quote_volume_24h),
+                min_volume=str(self._settings.trading.discovery_min_quote_volume_24h),
                 detail="nenhum par atingiu o piso de liquidez; "
                 "reveja DISCOVERY_MIN_QUOTE_VOLUME_24H",
             )
@@ -123,7 +122,7 @@ class MarketDataAgent(BaseAgent):
             await self.discover_symbols()
             await self.refresh()
             await self.heartbeat(detail=f"{len(self.latest_prices)} precos")
-            if not await self.sleep(self._settings.market_data_interval_seconds):
+            if not await self.sleep(self._settings.trading.market_data_interval_seconds):
                 return
 
     async def refresh(self) -> None:
@@ -138,7 +137,7 @@ class MarketDataAgent(BaseAgent):
 
     async def _fetch_symbol(self, symbol: str) -> None:
         candles = await self._source.fetch_candles(
-            symbol, self._settings.timeframe, self._settings.candle_history_limit
+            symbol, self._settings.trading.timeframe, self._settings.trading.candle_history_limit
         )
         if not candles:
             return
@@ -176,8 +175,8 @@ class MarketDataAgent(BaseAgent):
             return await CandleRepository(session).recent(
                 self._settings.exchange,
                 symbol,
-                self._settings.timeframe,
-                limit or self._settings.candle_history_limit,
+                self._settings.trading.timeframe,
+                limit or self._settings.trading.candle_history_limit,
             )
 
     async def on_stop(self) -> None:

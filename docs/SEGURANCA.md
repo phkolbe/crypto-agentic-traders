@@ -106,7 +106,7 @@ antes de usar o modo automático.**
 
 Não há filtro de "token alavancado" por sufixo, de propósito: procurar
 `UP`/`DOWN`/`BULL`/`BEAR` no nome marca JUP (Jupiter), SYRUP e SUPER como
-alavancados. Para excluir um ativo específico use `DISCOVERY_EXCLUDE_ASSETS`,
+alavancados. Para excluir um ativo específico use **Ativos excluídos** em Configurações,
 que é explícito e não erra.
 
 ---
@@ -152,7 +152,7 @@ O alerta sai **uma vez por transição**, não a cada snapshot — o Portfolio A
 produz um por minuto, e avisar sempre viraria ruído.
 
 Detalhe que importa no diagnóstico: o gargalo nem sempre é o percentual por
-ordem. Em R$100, mesmo subindo `RISK_MAX_ORDER_PCT_PORTFOLIO` para 55%, quem
+ordem. Em R$100, mesmo subindo o **percentual máximo por ordem** para 55%, quem
 travava era a **exposição máxima por ativo** (30%). A mensagem nomeia o limite
 que de fato está travando, porque apontar o errado manda investigar em vão.
 
@@ -283,14 +283,16 @@ na fronteira é rejeitada por qualquer variação contrária.
 
 ### Configuração validada para ~R$100 (19 USDT)
 
-```dotenv
-RISK_MAX_ORDER_NOTIONAL=7
-RISK_MAX_ORDER_PCT_PORTFOLIO=0.35
-RISK_MAX_ASSET_EXPOSURE_PCT=0.40
-RISK_MAX_OPEN_POSITIONS=2
-RISK_MIN_ORDER_NOTIONAL=6
-RISK_DAILY_LOSS_LIMIT_PCT=0.08
-```
+Na tela **Risco** (não no `.env` — ver seção 11):
+
+| Limite | Valor |
+|---|---|
+| Valor máximo por ordem | 7 USDT |
+| Máximo por ordem (% do portfólio) | 0,35 |
+| Exposição máxima por ativo | 0,40 |
+| Máximo de posições abertas | 2 |
+| Valor mínimo por ordem | 6 USDT |
+| Circuit breaker diário | 0,08 |
 
 Ordem resultante: 6,75 USDT, que sobrevive ao arredondamento em BTC (6,33), ETH
 (6,71) e SOL (6,73). O limite diário sobe para 8% porque, com ~70% da carteira
@@ -446,31 +448,72 @@ comportamento sem filtro, que é o estado conhecido e testado.
 
 ---
 
-## 11. Onde os limites de risco realmente moram
+## 11. Ambiente e negócio: a fronteira, e por que ela é rígida
 
-O `.env` semeia os limites **uma única vez**: na primeira subida o Risk Manager
-grava a linha `risk_config` e, a partir daí, **o banco é a fonte da verdade**.
-Editar o `.env` depois disso não muda nada — e não avisa.
+O `.env` descreve **a instalação**. O banco guarda **o que negociar e com quanto
+risco**. Nenhuma variável mora nos dois lugares, e escrever uma variável de
+negócio no `.env` faz o sistema **recusar subir**, listando as chaves.
 
-Isso não é acidente: os limites são editáveis pela interface, cada alteração vai
-para o `audit_log`, e um arquivo de texto não pode sobrescrever silenciosamente
-uma decisão que alguém tomou e assinou. O problema era a **falta de aviso**: o
-`check` imprimia os números do arquivo enquanto o sistema operava por outros.
+| | **Ambiente — `.env`** | **Negócio — banco** |
+|---|---|---|
+| Credenciais da exchange, SMTP, token da Meta | ✔ | |
+| `TRADING_MODE`, `LIVE_TRADING_CONFIRMED` | ✔ | |
+| `EXCHANGE` | ✔ | |
+| Banco, event bus, host/porta da API, CORS, log | ✔ | |
+| Moeda de cotação, pares, timeframe, estratégias | | ✔ |
+| Cadência de coleta, histórico por par, janela de sinais | | ✔ |
+| Critérios de descoberta automática | | ✔ |
+| Todos os limites de risco, incluindo o filtro MVRV | | ✔ |
+| Parâmetros de simulação (saldo, taxa, slippage) | | ✔ |
 
-Foi o que aconteceu nesta instância. O `.env` dizia ordem máxima de 7 e no máximo
-2 posições; o banco, semeado dias antes com os padrões da época, mandava 50 e 5.
-Sete campos divergiam, incluindo os dois circuit breakers.
+### O episódio que tornou isso uma regra
 
-Agora o `check` compara os dois e imprime a divergência campo por campo, dizendo
-qual valor vale. Para mudar limites de verdade há dois caminhos:
+Antes da separação, os limites de risco viviam nos dois lugares: o `.env`
+semeava o banco na primeira subida e, daí em diante, o banco vencia — em
+silêncio. O `.env` desta instalação pedia ordem máxima de **7 USDT** e no máximo
+**2 posições**; o banco, semeado dias antes com os padrões da época, mandava
+**50** e **5**. Sete campos divergiam, incluindo os dois circuit breakers. E o
+`check` imprimia os números do arquivo, não os que valiam.
 
-- **Interface** → tela de risco (grava no banco, exige `confirm`, vai ao audit_log).
-- **Recomeçar do `.env`** → apagar a linha `risk_config` e subir de novo. Só faça
-  isso sabendo que **afrouxar** um limite assim não deixa rastro de quem decidiu.
+Ninguém tinha errado. A configuração é que admitia duas verdades sobre a mesma
+quantia de dinheiro real. Configuração duplicada não é redundância.
 
-Regra prática: se o `check` mostrar divergência, resolva antes de operar. Um
-sistema que respeita limites diferentes dos que você acabou de ler é a pior
-combinação possível entre segurança e surpresa.
+### Como isso é imposto no código
+
+`RiskSettings` e `TradingSettings` são `BaseModel` puros — não `BaseSettings`.
+Não leem ambiente nem por acidente: não existe caminho de código do `.env` até
+eles. E `Settings` carrega uma lista das chaves de negócio aposentadas
+(`RETIRED_ENV_KEYS`), varre o ambiente e o próprio arquivo, e falha com a lista
+do que precisa sair.
+
+Um teste garante que a lista não fica atrás do código: adicionar um campo a
+qualquer um dos dois modelos sem registrá-lo na trava quebra a suíte. Sem isso, a
+próxima variável de negócio voltaria a passar batida pelo `.env`.
+
+### As duas fronteiras que exigiram decisão
+
+**`TRADING_MODE` é ambiente.** Poderia ser negócio — é a decisão mais de negócio
+que existe. Mas ligar dinheiro real deve exigir acesso ao servidor, editar um
+arquivo e reiniciar o processo: três coisas que um clique no navegador não
+alcança. A dupla confirmação (`TRADING_MODE=live` **e**
+`LIVE_TRADING_CONFIRMED=true`) só protege enquanto mora fora da aplicação.
+
+**`EXCHANGE` é ambiente; a moeda de cotação é negócio.** A exchange está amarrada
+a qual credencial existe no arquivo — apontar para uma sem chave é erro de
+instalação. A moeda de cotação define o universo de pares e é escolha de quem
+opera.
+
+### Como mudar cada coisa
+
+- **Negócio** → telas **Configurações** e **Risco**. Exigem `confirm`, validam o
+  resultado do merge (um campo isolado pode ser válido e tornar o conjunto
+  incoerente), valem imediatamente sem reiniciar, e vão ao `audit_log` com o
+  antes e o depois.
+- **Ambiente** → editar o `.env` e reiniciar. Sem rastro, por natureza: é por isso
+  que só ambiente mora lá.
+
+O `check` imprime `negocio : banco` quando leu a linha existente, e avisa quando
+acabou de criá-la com os padrões de fábrica.
 
 ---
 

@@ -37,3 +37,16 @@ def make_candles(
             )
         )
     return candles
+
+
+def com_negocio(settings, **campos):
+    """Copia `settings` trocando campos da configuracao de NEGOCIO.
+
+    `settings.model_copy(update={"paper_initial_balance": ...})` nao falha e nao
+    funciona: cria um atributo solto que ninguem le, porque o campo mora em
+    `settings.trading`. Este helper existe para que o teste nao consiga errar
+    silenciosamente desse jeito -- um campo inexistente aqui levanta erro.
+    """
+    return settings.model_copy(
+        update={"trading": settings.trading.model_copy(update=campos, deep=True)}
+    )

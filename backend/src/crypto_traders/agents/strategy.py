@@ -33,6 +33,18 @@ class StrategyAgent(BaseAgent):
     def strategy_names(self) -> list[str]:
         return [s.name for s in self._strategies]
 
+    def replace_strategies(self, strategies: list[Strategy]) -> None:
+        """Troca as estrategias ativas sem reiniciar o agente.
+
+        Alterar a lista pela interface precisa valer no proximo candle, nao no
+        proximo restart -- se exigisse restart, a tela mostraria uma
+        configuracao que o sistema nao esta usando, que e o modo de falha que
+        esta separacao de ambiente e negocio existe para eliminar.
+        """
+        self._strategies = strategies
+        self._required_candles = max((s.min_candles for s in strategies), default=50)
+        self.log.info("strategy.replaced", estrategias=self.strategy_names)
+
     async def _run(self) -> None:
         async for candle in self.bus.subscribe(Topics.CANDLES):
             await self.wait_if_paused()
@@ -53,7 +65,7 @@ class StrategyAgent(BaseAgent):
                 str(candle.exchange),
                 candle.symbol,
                 candle.timeframe,
-                max(self._required_candles + 10, self._settings.candle_history_limit),
+                max(self._required_candles + 10, self._settings.trading.candle_history_limit),
             )
 
         if len(candles) < self._required_candles:

@@ -3,6 +3,7 @@ import { NavLink, Navigate, Route, Routes } from 'react-router-dom'
 import { useLiveEvents } from './hooks/useLiveEvents'
 import Agents from './pages/Agents'
 import Backtest from './pages/Backtest'
+import Configuration from './pages/Configuration'
 import Dashboard from './pages/Dashboard'
 import ManualTrade from './pages/ManualTrade'
 import Notifications from './pages/Notifications'
@@ -14,6 +15,7 @@ const NAV = [
   { to: '/trades', label: 'Negociações', icon: '☰' },
   { to: '/manual', label: 'Lançar manual', icon: '✎' },
   { to: '/risk', label: 'Risco', icon: '⛨' },
+  { to: '/config', label: 'Configurações', icon: '⚙' },
   { to: '/agents', label: 'Agentes', icon: '◈' },
   { to: '/notifications', label: 'Notificações', icon: '✉' },
   { to: '/backtest', label: 'Backtest', icon: '◔' },
@@ -56,6 +58,7 @@ export default function App() {
           <Route path="/trades" element={<Trades />} />
           <Route path="/manual" element={<ManualTrade />} />
           <Route path="/risk" element={<RiskSettings />} />
+          <Route path="/config" element={<Configuration />} />
           <Route path="/agents" element={<Agents />} />
           <Route path="/notifications" element={<Notifications />} />
           <Route path="/backtest" element={<Backtest />} />

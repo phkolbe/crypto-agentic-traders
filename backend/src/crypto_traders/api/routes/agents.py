@@ -66,7 +66,7 @@ async def resume_all(
 @router.get("/strategies", response_model=list[StrategyOut])
 async def list_strategies(request: Request) -> list[StrategyOut]:
     settings = getattr(request.app.state, "settings", None) or get_settings()
-    active = set(settings.strategies)
+    active = set(settings.trading.strategies)
     return [
         StrategyOut(name=name, description=description, active=name in active)
         for name, description in available_strategies().items()

@@ -15,7 +15,8 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from ..bus import EventBus, Topics, build_event_bus
-from ..config import Settings, get_settings
+from ..business_config import install_business_config, update_trading_config
+from ..config import Settings, TradingSettings, get_settings
 from ..db.repositories import AuditLogRepository
 from ..db.session import init_db, session_scope
 from ..discovery import DiscoveryResult
@@ -89,6 +90,12 @@ class Orchestrator:
 
     async def start(self) -> None:
         await init_db(self.settings)
+
+        # Negocio antes de qualquer agente: `build_broker` e `build_strategies`
+        # abaixo dependem dele. Sem isso os agentes subiriam com os padroes de
+        # codigo e passariam a operar diferente do que a interface mostra.
+        await install_business_config(self.settings)
+
         await self.bus.start()
 
         self._source = build_market_data_source(
@@ -100,7 +107,7 @@ class Orchestrator:
             self.bus, self._source, self.settings, on_universe_change=self._on_universe_change
         )
         self.strategy = StrategyAgent(
-            self.bus, build_strategies(self.settings.strategies), self.settings
+            self.bus, build_strategies(self.settings.trading.strategies), self.settings
         )
         self.onchain = OnChainProvider(self.settings)
         self.risk_manager = RiskManagerAgent(self.bus, self.settings, onchain=self.onchain)
@@ -152,9 +159,9 @@ class Orchestrator:
                     # config estatica gravaria uma lista vazia em "mar aberto".
                     "symbols": self.market_data.active_symbols,
                     "symbols_source": (
-                        "descoberta" if self.settings.discovery_enabled else "configurado"
+                        "descoberta" if self.settings.trading.discovery_enabled else "configurado"
                     ),
-                    "strategies": self.settings.strategies,
+                    "strategies": self.settings.trading.strategies,
                 },
             )
         log.info("orchestrator.started", mode=str(self.settings.trading_mode))
@@ -264,7 +271,7 @@ class Orchestrator:
             "circuit_breaker_active": self.risk_manager.circuit_breaker_active,
             "sizing_feasible": self.sizing.feasible if self.sizing else True,
             "sizing_detail": (
-                self.sizing.explain(self.settings.quote_currency) if self.sizing else None
+                self.sizing.explain(self.settings.trading.quote_currency) if self.sizing else None
             ),
             "agents": agents,
         }
@@ -283,6 +290,37 @@ class Orchestrator:
             # de notificacao: o Risk Manager ja publicou o alerta ao disparar a
             # trava. Enviar aqui tambem geraria duas mensagens do mesmo evento.
             await self.pause_all(actor="circuit_breaker", reason=reason)
+
+    async def update_trading(self, changes: dict, *, actor: str = "user") -> TradingSettings:
+        """Aplica alteracoes de negocio vindas da interface, ja valendo.
+
+        Gravar no banco nao basta: tres coisas dependem de configuracao lida
+        **na construcao** dos agentes, e nao a cada uso. Sem reagir aqui, a tela
+        mostraria uma configuracao que o sistema nao esta usando -- exatamente a
+        divergencia silenciosa que motivou separar ambiente de negocio.
+        """
+        anterior = self.settings.trading
+        novo = await update_trading_config(self.settings, changes, actor=actor)
+        if novo == anterior:
+            return novo
+
+        # As estrategias sao instanciadas uma vez, na construcao do agente.
+        if novo.strategies != anterior.strategies:
+            self.strategy.replace_strategies(build_strategies(novo.strategies))
+
+        # A descoberta so revarre no seu proprio intervalo (24h por padrao):
+        # mudar o criterio e esperar um dia para ele valer nao seria aceitavel.
+        # Universo explicito nao precisa disto -- `active_symbols` le a lista
+        # corrente a cada ciclo de coleta.
+        criterios = ("quote_currency", "discovery_max_symbols",
+                     "discovery_min_quote_volume_24h", "discovery_exclude_assets")
+        mudou_criterio = any(
+            getattr(novo, campo) != getattr(anterior, campo) for campo in criterios
+        )
+        if novo.discovery_enabled and (mudou_criterio or not anterior.discovery_enabled):
+            await self.market_data.discover_symbols(force=True)
+
+        return novo
 
     async def _on_universe_change(self, result: DiscoveryResult) -> None:
         """A descoberta define o que o Risk Manager passa a aceitar.
@@ -321,7 +359,7 @@ class Orchestrator:
                 self._sizing_alerted = False
                 log.info(
                     "orchestrator.sizing_ok",
-                    detail=result.explain(self.settings.quote_currency),
+                    detail=result.explain(self.settings.trading.quote_currency),
                 )
             return
 
@@ -329,7 +367,7 @@ class Orchestrator:
             return
 
         self._sizing_alerted = True
-        explanation = result.explain(self.settings.quote_currency)
+        explanation = result.explain(self.settings.trading.quote_currency)
         log.error("orchestrator.sizing_infeasible", detail=explanation)
         await self.bus.publish(
             Topics.ALERTS,

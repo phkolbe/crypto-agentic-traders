@@ -324,6 +324,25 @@ class NotificationConfig(Base):
     """Numero no formato internacional, so digitos: 5511999999999."""
 
 
+class TradingConfig(Base):
+    """O que negociar e com que cadencia: configuracao de negocio, nunca do `.env`.
+
+    Linha unica (`id=1`), no mesmo formato de `RiskConfig`: um JSON com os campos
+    de `TradingSettings`. Guardar como JSON em vez de uma coluna por campo e
+    deliberado -- estes campos mudam junto com a estrategia do produto, e uma
+    migracao de schema a cada ajuste de negocio seria atrito sem retorno. A
+    validacao mora no modelo Pydantic, que e onde o erro precisa aparecer.
+    """
+
+    __tablename__ = "trading_config"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+    values: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
 class RiskConfig(Base):
     """Limites de risco vigentes, editaveis pela interface sem mexer em codigo.
 

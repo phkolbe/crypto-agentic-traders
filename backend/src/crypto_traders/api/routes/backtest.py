@@ -52,11 +52,11 @@ async def run_backtest(
     engine = BacktestEngine(
         strategy,
         settings.risk,
-        quote_currency=settings.quote_currency,
+        quote_currency=settings.trading.quote_currency,
         initial_balance=payload.initial_balance,
-        fee_pct=settings.paper_fee_pct,
-        slippage_pct=settings.paper_slippage_pct,
-        lookback=settings.candle_history_limit,
+        fee_pct=settings.trading.paper_fee_pct,
+        slippage_pct=settings.trading.paper_slippage_pct,
+        lookback=settings.trading.candle_history_limit,
     )
     try:
         result = await engine.run(candles)

@@ -7,7 +7,7 @@ from decimal import Decimal
 import pytest
 from helpers import make_candles
 
-from crypto_traders.config import RiskSettings, Settings
+from crypto_traders.config import RiskSettings, Settings, TradingSettings
 from crypto_traders.db.session import dispose_engine, init_db
 
 
@@ -15,14 +15,16 @@ from crypto_traders.db.session import dispose_engine, init_db
 def isolate_from_dotenv(monkeypatch):
     """Impede que os testes leiam o `.env` da maquina.
 
-    `Settings` e `RiskSettings` carregam `.env` por padrao -- e correto em
-    producao, desastroso em teste: a suite passaria ou falharia conforme a
-    configuracao pessoal de quem roda. Foi exatamente o que aconteceu quando o
-    `.env` local passou a ter limites diferentes dos padroes de fabrica, e 18
-    testes quebraram sem que uma linha de codigo de producao tivesse mudado.
+    `Settings` carrega `.env` por padrao -- correto em producao, desastroso em
+    teste: a suite passaria ou falharia conforme a configuracao pessoal de quem
+    roda. Foi exatamente o que aconteceu quando o `.env` local passou a ter
+    limites diferentes dos padroes de fabrica, e 18 testes quebraram sem que uma
+    linha de codigo de producao tivesse mudado.
+
+    `RiskSettings` e `TradingSettings` nao aparecem aqui porque nao leem ambiente
+    nenhum: sao configuracao de negocio, e negocio mora no banco.
     """
-    for model in (Settings, RiskSettings):
-        monkeypatch.setitem(model.model_config, "env_file", None)
+    monkeypatch.setitem(Settings.model_config, "env_file", None)
 
 
 @pytest.fixture
@@ -56,10 +58,12 @@ async def settings(tmp_path, risk_limits) -> Settings:
     await dispose_engine()
     configured = Settings(
         database_url=f"sqlite+aiosqlite:///{(tmp_path / 'test.db').as_posix()}",
-        symbols=["BTC/USDT"],
-        strategies=["ma_crossover"],
-        quote_currency="USDT",
-        paper_initial_balance=Decimal("1000"),
+        trading=TradingSettings(
+            symbols=["BTC/USDT"],
+            strategies=["ma_crossover"],
+            quote_currency="USDT",
+            paper_initial_balance=Decimal("1000"),
+        ),
         risk=risk_limits,
     )
     await init_db(configured)

@@ -566,6 +566,35 @@ class NotificationConfigRepository:
         return config
 
 
+class TradingConfigRepository:
+    """Linha unica com a configuracao de negocio vigente."""
+
+    ROW_ID = 1
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def get(self) -> dict | None:
+        """Valores gravados, ou `None` quando a linha ainda nao existe.
+
+        Devolver `None` (e nao um dicionario vazio) permite ao chamador
+        distinguir "nunca configurado" de "configurado com os padroes" -- e essa
+        diferenca decide se a semeadura inicial deve rodar.
+        """
+        config = await self._session.get(orm.TradingConfig, self.ROW_ID)
+        if config is None:
+            return None
+        return dict(config.values or {})
+
+    async def save(self, values: dict) -> None:
+        config = await self._session.get(orm.TradingConfig, self.ROW_ID)
+        if config is None:
+            self._session.add(orm.TradingConfig(id=self.ROW_ID, values=values))
+            await self._session.flush()
+            return
+        config.values = values
+
+
 class RiskConfigRepository:
     """Linha unica com os limites vigentes e o estado do circuit breaker."""
 

@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
+from helpers import com_negocio
 
 from crypto_traders.domain.enums import ExchangeName, RiskDecision, SignalDirection
 from crypto_traders.domain.models import Signal
@@ -195,7 +196,7 @@ class TestAgentBatching:
         from crypto_traders.agents.risk_manager import RiskManagerAgent
         from crypto_traders.bus import InMemoryEventBus
 
-        configurado = settings.model_copy(update={"signal_batch_window_seconds": 0.15})
+        configurado = com_negocio(settings, signal_batch_window_seconds=0.15)
         agent = RiskManagerAgent(InMemoryEventBus(), configurado)
 
         queue: asyncio.Queue[Signal] = asyncio.Queue()
@@ -210,7 +211,7 @@ class TestAgentBatching:
         from crypto_traders.agents.risk_manager import RiskManagerAgent
         from crypto_traders.bus import InMemoryEventBus
 
-        configurado = settings.model_copy(update={"signal_batch_window_seconds": 0})
+        configurado = com_negocio(settings, signal_batch_window_seconds=0)
         agent = RiskManagerAgent(InMemoryEventBus(), configurado)
 
         queue: asyncio.Queue[Signal] = asyncio.Queue()

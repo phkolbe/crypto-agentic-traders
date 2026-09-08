@@ -82,23 +82,47 @@ uv run crypto-traders check
 uv run crypto-traders backtest --symbol BTC/USDT --strategy ma_crossover --days 90
 ```
 
+## Configuração: ambiente e negócio moram em lugares diferentes
+
+Esta separação é uma regra do projeto, não uma preferência de organização.
+
+| | **Ambiente** | **Negócio** |
+|---|---|---|
+| **Onde** | `.env` no servidor | banco de dados |
+| **Como editar** | editar o arquivo e reiniciar | telas **Configurações** e **Risco** |
+| **O quê** | credenciais, banco, event bus, host/porta da API, CORS, log, SMTP/WhatsApp, `EXCHANGE`, `TRADING_MODE` | pares, moeda de cotação, timeframe, estratégias, cadência, limites de risco, filtro MVRV, parâmetros de simulação |
+| **Rastro** | nenhum | `audit_log`, com antes e depois |
+
+Escrever uma variável de negócio no `.env` faz o sistema **recusar subir**,
+listando as chaves. Isso é proposital: antes dessa trava, o `.env` pedia ordem
+máxima de 7 USDT durante dias enquanto o sistema operava com 50 — o arquivo tinha
+semeado o banco na primeira subida e nunca mais fora lido. Um valor que parece ter
+efeito e não tem é pior que valor nenhum.
+
+Duas fronteiras que não são óbvias, e por quê:
+
+- **`TRADING_MODE` é ambiente.** Ligar dinheiro real exige editar um arquivo no
+  servidor e reiniciar o processo — duas travas que um clique no navegador não
+  alcança.
+- **`EXCHANGE` é ambiente, mas a moeda de cotação é negócio.** A exchange está
+  amarrada a qual credencial existe no arquivo; a moeda define o universo de
+  pares negociáveis.
+
 ## Pares negociados
 
-Duas formas:
+Em **Configurações**, o campo de pares aceita duas formas:
 
-```dotenv
-SYMBOLS=BTC/USDT,ETH/USDT     # lista fixa
-SYMBOLS=                       # descoberta automática ("mar aberto")
-```
+- **lista preenchida** — negocia exatamente esses pares;
+- **lista vazia** — descoberta automática ("mar aberto"): o sistema varre a
+  exchange e escolhe os pares mais líquidos sozinho.
 
-Em branco, o sistema varre a exchange e escolhe os pares mais líquidos sozinho —
-e a lista descoberta vira a **whitelist efetiva** do Risk Manager, registrada no
-`audit_log` a cada mudança.
+No modo automático a lista descoberta vira a **whitelist efetiva** do Risk
+Manager, registrada no `audit_log` a cada mudança.
 
 > Leia [`docs/SEGURANCA.md`](docs/SEGURANCA.md) antes de usar o modo automático:
 > a whitelist deixa de ser uma lista aprovada por você e passa a ser um conjunto
-> de critérios, o que torna `RISK_MAX_OPEN_POSITIONS` e a exposição máxima por
-> ativo as principais defesas.
+> de critérios, o que torna o **máximo de posições abertas** e a exposição máxima
+> por ativo as principais defesas.
 
 ## Alertas
 

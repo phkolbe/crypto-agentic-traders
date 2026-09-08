@@ -91,8 +91,8 @@ def banner(settings, with_api: bool) -> None:
     else:
         print("  Nenhuma ordem real sera enviada.")
     print(f"  exchange   : {settings.exchange}")
-    print(f"  pares      : {', '.join(settings.symbols)} ({settings.timeframe})")
-    print(f"  estrategias: {', '.join(settings.strategies)}")
+    print(f"  pares      : {', '.join(settings.trading.symbols)} ({settings.trading.timeframe})")
+    print(f"  estrategias: {', '.join(settings.trading.strategies)}")
     if with_api:
         print(f"  API        : http://{settings.api_host}:{settings.api_port}")
         print(f"  docs       : http://{settings.api_host}:{settings.api_port}/docs")

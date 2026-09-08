@@ -186,6 +186,7 @@ class RiskConfigOut(MoneyModel):
     asset_whitelist: list[str]
     symbol_whitelist: list[str]
     cooldown_seconds: int
+    mvrv_max_percentile: float
     circuit_breaker_active: bool = False
     circuit_breaker_reason: str | None = None
 
@@ -208,10 +209,77 @@ class RiskConfigIn(BaseModel):
     asset_whitelist: list[str] | None = None
     symbol_whitelist: list[str] | None = None
     cooldown_seconds: int | None = Field(default=None, ge=0)
+    mvrv_max_percentile: float | None = Field(
+        default=None,
+        gt=0,
+        le=1,
+        description="1.0 desliga o filtro de regime. Ver docs/SEGURANCA.md antes de baixar.",
+    )
 
     confirm: bool = Field(
         default=False,
         description="Confirmacao explicita: alterar limites afeta dinheiro real.",
+    )
+
+
+# ---------------------------------------------------------------------------
+class TradingConfigOut(MoneyModel):
+    """Configuracao de negocio vigente. Vem do banco, nunca do `.env`."""
+
+    quote_currency: str
+    symbols: list[str]
+    timeframe: str
+    strategies: list[str]
+    candle_history_limit: int
+    market_data_interval_seconds: int
+    portfolio_interval_seconds: int
+    signal_batch_window_seconds: float
+    discovery_min_quote_volume_24h: Decimal
+    discovery_max_symbols: int
+    discovery_exclude_assets: list[str]
+    discovery_refresh_hours: int
+    paper_initial_balance: Decimal
+    paper_fee_pct: Decimal
+    paper_slippage_pct: Decimal
+
+    discovery_enabled: bool
+    """Derivado: `symbols` vazio liga a descoberta automatica."""
+
+    available_strategies: dict[str, str] = Field(default_factory=dict)
+    """Nome -> descricao, para a interface montar a lista sem adivinhar."""
+
+
+class TradingConfigIn(BaseModel):
+    """Atualizacao parcial: apenas os campos enviados sao alterados.
+
+    `symbols` aceita lista vazia -- e como se liga a descoberta automatica --
+    entao o "nao enviado" precisa ser `None`, e nao `[]`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    quote_currency: str | None = Field(default=None, min_length=2)
+    symbols: list[str] | None = None
+    timeframe: str | None = Field(default=None, min_length=2)
+    strategies: list[str] | None = None
+    candle_history_limit: int | None = Field(default=None, ge=50, le=1000)
+    market_data_interval_seconds: int | None = Field(default=None, ge=5)
+    portfolio_interval_seconds: int | None = Field(default=None, ge=5)
+    signal_batch_window_seconds: float | None = Field(default=None, ge=0)
+    discovery_min_quote_volume_24h: Decimal | None = Field(default=None, gt=0)
+    discovery_max_symbols: int | None = Field(default=None, ge=1, le=50)
+    discovery_exclude_assets: list[str] | None = None
+    discovery_refresh_hours: int | None = Field(default=None, ge=1)
+    paper_initial_balance: Decimal | None = Field(default=None, gt=0)
+    paper_fee_pct: Decimal | None = Field(default=None, ge=0, lt=1)
+    paper_slippage_pct: Decimal | None = Field(default=None, ge=0, lt=1)
+
+    confirm: bool = Field(
+        default=False,
+        description=(
+            "Confirmacao explicita. Trocar pares, moeda de cotacao ou "
+            "estrategias muda o que o sistema negocia com dinheiro real."
+        ),
     )
 
 

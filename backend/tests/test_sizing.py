@@ -13,6 +13,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 import pytest
+from helpers import com_negocio
 
 from crypto_traders.config import RiskSettings
 from crypto_traders.risk.rules import assess_sizing_feasibility
@@ -201,18 +202,18 @@ class TestCheckCommand:
         """"Tudo pronto" para um sistema que nunca vai operar seria pior que um erro."""
         from crypto_traders.cli import _check_sizing
 
-        tiny = settings.model_copy(update={"paper_initial_balance": R100})
+        tiny = com_negocio(settings, paper_initial_balance=R100)
         # `None` significa inviavel; quando viavel devolve o resultado, que a
         # checagem de filtros da exchange usa para simular a ordem.
         assert _check_sizing(tiny) is None
         output = capsys.readouterr().out
         assert "NENHUMA ordem" in output
-        assert "RISK_MAX_ORDER_PCT_PORTFOLIO" in output
+        assert "percentual por ordem" in output
 
     def test_check_passes_with_a_workable_balance(self, settings, capsys):
         from crypto_traders.cli import _check_sizing
 
-        result = _check_sizing(settings.model_copy(update={"paper_initial_balance": R5000}))
+        result = _check_sizing(com_negocio(settings, paper_initial_balance=R5000))
         assert result is not None and result.feasible
         assert "maior ordem possivel" in capsys.readouterr().out
 
@@ -248,7 +249,7 @@ class TestRealBalanceRequired:
         assert _check_sizing(self._live(settings), quote_balance=None) is None
         output = capsys.readouterr().out
         assert "SEM SALDO" in output
-        assert "QUOTE_CURRENCY" in output
+        assert "moeda de cotacao" in output
 
     def test_live_with_zero_balance_fails(self, settings):
         from crypto_traders.cli import _check_sizing
@@ -267,7 +268,7 @@ class TestRealBalanceRequired:
         """Em simulacao nao ha conta; o saldo do .env e a referencia legitima."""
         from crypto_traders.cli import _check_sizing
 
-        configured = settings.model_copy(update={"paper_initial_balance": R5000})
+        configured = com_negocio(settings, paper_initial_balance=R5000)
         result = _check_sizing(configured, quote_balance=None)
         assert result is not None
         assert "saldo simulado" in capsys.readouterr().out

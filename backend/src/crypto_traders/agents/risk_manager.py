@@ -56,7 +56,7 @@ class RiskManagerAgent(BaseAgent):
         """Provedor on-chain opcional. Ausente significa "sem filtro de regime"."""
 
         self._limits = settings.risk
-        self._engine = RiskEngine(self._limits, settings.quote_currency)
+        self._engine = RiskEngine(self._limits, settings.trading.quote_currency)
         self._snapshot: PortfolioSnapshot | None = None
         self._circuit_breaker_active = False
         self._circuit_breaker_reason: str | None = None
@@ -120,7 +120,7 @@ class RiskManagerAgent(BaseAgent):
         cobre a rajada de um ciclo de coleta sem atrasar de forma perceptivel.
         """
         batch = [await queue.get()]
-        window = self._settings.signal_batch_window_seconds
+        window = self._settings.trading.signal_batch_window_seconds
         if window <= 0:
             return batch
 
@@ -215,7 +215,7 @@ class RiskManagerAgent(BaseAgent):
                 update={"symbol_whitelist": list(symbols), "asset_whitelist": list(assets)}
             )
         self._effective_limits = limits
-        self._engine = RiskEngine(limits, self._settings.quote_currency)
+        self._engine = RiskEngine(limits, self._settings.trading.quote_currency)
 
     async def apply_discovered_universe(self, symbols: list[str], assets: list[str]) -> None:
         """Adota o resultado da descoberta como whitelist efetiva.
@@ -446,6 +446,13 @@ class RiskManagerAgent(BaseAgent):
 
         self._limits = updated
         self._rebuild_engine()
+
+        # Mantem `settings.risk` em sincronia: o `check`, o backtest e a leitura
+        # de regime consultam de la. Sem isto haveria duas versoes dos limites
+        # no mesmo processo -- a divergencia que a separacao ambiente/negocio
+        # existe para eliminar, reintroduzida por dentro.
+        self._settings.with_business_config(self._settings.trading, updated)
+
         self.log.warning("risk.limits_updated", actor=actor, changed=sorted(values))
         return self.limits
 

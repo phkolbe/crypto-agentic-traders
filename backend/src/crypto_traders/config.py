@@ -1,17 +1,39 @@
-"""Configuracao tipada e validada (Pydantic Settings).
+"""Configuracao da aplicacao, separada em duas naturezas que nao se misturam.
 
-Tudo vem de variaveis de ambiente / `.env`, que fica FORA do controle de versao.
-Nenhuma chave de API mora em codigo, banco ou arquivo versionado.
+**Ambiente** (`Settings`) vem de variaveis de ambiente / `.env`, que fica fora do
+controle de versao. Descreve a *instalacao*: credenciais, banco, event bus,
+host da API, canais de alerta, e as travas de seguranca que precisam estar fora
+do alcance do navegador. Nenhuma chave de API mora em codigo ou banco.
+
+**Negocio** (`TradingSettings`, `RiskSettings`) vive no **banco** e e editada pela
+aplicacao web. Responde "o que eu quero negociar e com quanto risco": pares,
+timeframe, estrategias, cadencia, limites de risco. Estes modelos sao `BaseModel`
+puros -- deliberadamente **nao** leem variaveis de ambiente, para que exista uma
+unica fonte da verdade.
+
+A fronteira nao e estetica. Quando os limites de risco viviam nos dois lugares, o
+banco vencia em silencio: o `.env` dizia ordem maxima de 7 USDT enquanto o
+sistema operava com 50. Configuracao duplicada nao e redundancia, e uma segunda
+verdade sobre dinheiro real.
+
+Duas fronteiras que exigiram decisao explicita, e o porque:
+
+- `TRADING_MODE` e `LIVE_TRADING_CONFIRMED` sao **ambiente**. Ligar dinheiro real
+  deve exigir editar um arquivo no servidor e reiniciar o processo -- duas travas
+  que um clique no navegador nao alcanca.
+- `EXCHANGE` e **ambiente** (esta amarrada a qual credencial existe no arquivo),
+  mas `QUOTE_CURRENCY` e **negocio** (define o universo de pares negociaveis).
 """
 
 from __future__ import annotations
 
+import os
 from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated
 
-from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from .domain.enums import TradingMode
@@ -23,6 +45,67 @@ DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "crypto_traders.db"
 #: adapter ccxt ja e generico, entao adiciona-la e reintroduzir a credencial e o
 #: nome aqui -- nao ha codigo de agente a mudar.
 SUPPORTED_EXCHANGES = frozenset({"binance"})
+
+#: Chaves de negocio que ANTES moravam no `.env` e hoje moram no banco.
+#:
+#: Encontrar uma delas no ambiente e erro de configuracao, nao preferencia: quem
+#: a escreveu espera que ela tenha efeito, e ela nao tem. Falhar alto aqui e a
+#: licao direta do episodio em que o `.env` pedia ordem maxima de 7 e o sistema
+#: operava com 50 sem avisar ninguem.
+RETIRED_ENV_KEYS = frozenset(
+    {
+        # Mercado e universo
+        "QUOTE_CURRENCY",
+        "SYMBOLS",
+        "TIMEFRAME",
+        "STRATEGIES",
+        "CANDLE_HISTORY_LIMIT",
+        # Cadencia
+        "MARKET_DATA_INTERVAL_SECONDS",
+        "PORTFOLIO_INTERVAL_SECONDS",
+        "SIGNAL_BATCH_WINDOW_SECONDS",
+        # Descoberta automatica
+        "DISCOVERY_MIN_QUOTE_VOLUME_24H",
+        "DISCOVERY_MAX_SYMBOLS",
+        "DISCOVERY_EXCLUDE_ASSETS",
+        "DISCOVERY_REFRESH_HOURS",
+        # Paper trading
+        "PAPER_INITIAL_BALANCE",
+        "PAPER_FEE_PCT",
+        "PAPER_SLIPPAGE_PCT",
+        # Limites de risco (todo o prefixo RISK_)
+        "RISK_MAX_ORDER_NOTIONAL",
+        "RISK_MAX_ORDER_PCT_PORTFOLIO",
+        "RISK_MAX_ASSET_EXPOSURE_PCT",
+        "RISK_MAX_OPEN_POSITIONS",
+        "RISK_MIN_ORDER_NOTIONAL",
+        "RISK_STOP_LOSS_PCT",
+        "RISK_TAKE_PROFIT_PCT",
+        "RISK_DAILY_LOSS_LIMIT_PCT",
+        "RISK_WEEKLY_LOSS_LIMIT_PCT",
+        "RISK_MIN_SIGNAL_CONFIDENCE",
+        "RISK_ASSET_WHITELIST",
+        "RISK_SYMBOL_WHITELIST",
+        "RISK_COOLDOWN_SECONDS",
+        "RISK_MVRV_MAX_PERCENTILE",
+    }
+)
+
+
+def _split_csv_value(value: object, *, upper: bool = False) -> object:
+    """Aceita CSV alem de JSON.
+
+    A aplicacao web envia listas como JSON, mas um formulario de texto e o
+    caminho natural para digitar `BTC,ETH` -- aceitar os dois evita transformar
+    a virgula em erro de validacao na cara do usuario.
+    """
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith("["):
+            return value
+        itens = [item.strip() for item in stripped.split(",") if item.strip()]
+        return [item.upper() for item in itens] if upper else itens
+    return value
 
 
 class ExchangeCredentials(BaseSettings):
@@ -53,14 +136,18 @@ class ExchangeCredentials(BaseSettings):
         return self.api_key is not None and self.api_secret is not None
 
 
-class RiskSettings(BaseSettings):
-    """Limites do Risk Manager Agent.
+class RiskSettings(BaseModel):
+    """Limites do Risk Manager Agent. **Configuracao de negocio: mora no banco.**
 
-    Os defaults sao deliberadamente conservadores: se o operador esquecer de
-    configurar, o sistema erra para o lado de arriscar de menos.
+    Os defaults sao deliberadamente conservadores: se ninguem configurar, o
+    sistema erra para o lado de arriscar de menos.
+
+    Note que este e um `BaseModel`, nao `BaseSettings`: ele **nao** le variaveis
+    de ambiente. Um `RISK_*` no `.env` nao tem efeito nenhum aqui, e por isso
+    `Settings` recusa subir quando encontra um.
     """
 
-    model_config = SettingsConfigDict(env_prefix="RISK_", env_file=".env", extra="ignore")
+    model_config = ConfigDict(extra="forbid")
 
     max_order_notional: Decimal = Field(
         default=Decimal("50"),
@@ -95,10 +182,8 @@ class RiskSettings(BaseSettings):
     )
     weekly_loss_limit_pct: float = Field(default=0.12, gt=0, le=1)
     min_signal_confidence: float = Field(default=0.55, ge=0, le=1)
-    asset_whitelist: Annotated[list[str], NoDecode] = Field(
-        default_factory=lambda: ["BTC", "ETH", "SOL"]
-    )
-    symbol_whitelist: Annotated[list[str], NoDecode] = Field(
+    asset_whitelist: list[str] = Field(default_factory=lambda: ["BTC", "ETH", "SOL"])
+    symbol_whitelist: list[str] = Field(
         default_factory=lambda: ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
     )
     cooldown_seconds: int = Field(
@@ -122,37 +207,140 @@ class RiskSettings(BaseSettings):
     @field_validator("asset_whitelist", "symbol_whitelist", mode="before")
     @classmethod
     def _split_csv(cls, value: object) -> object:
-        """Aceita CSV alem de JSON, porque o `.env` e escrito a mao.
-
-        Os campos usam `NoDecode` justamente para chegarem aqui como string
-        crua: sem isso o pydantic-settings tentaria `json.loads` primeiro e
-        falharia em `BTC,ETH` antes deste validador rodar.
-        """
-        if isinstance(value, str):
-            stripped = value.strip()
-            if stripped.startswith("["):
-                return value
-            return [item.strip().upper() for item in stripped.split(",") if item.strip()]
-        return value
+        return _split_csv_value(value, upper=True)
 
     @model_validator(mode="after")
     def _check_coherence(self) -> RiskSettings:
         if self.min_order_notional > self.max_order_notional:
-            raise ValueError(
-                "RISK_MIN_ORDER_NOTIONAL nao pode ser maior que RISK_MAX_ORDER_NOTIONAL"
-            )
+            raise ValueError("a ordem minima nao pode ser maior que a ordem maxima")
         if self.take_profit_pct <= self.stop_loss_pct:
             raise ValueError(
-                "RISK_TAKE_PROFIT_PCT deve ser maior que RISK_STOP_LOSS_PCT "
+                "o alvo de lucro deve ser maior que o stop loss "
                 "(caso contrario a estrategia tem esperanca matematica negativa)"
             )
         if self.weekly_loss_limit_pct < self.daily_loss_limit_pct:
-            raise ValueError("RISK_WEEKLY_LOSS_LIMIT_PCT deve ser >= RISK_DAILY_LOSS_LIMIT_PCT")
+            raise ValueError("o limite semanal de perda deve ser >= o limite diario")
         return self
 
 
+class TradingSettings(BaseModel):
+    """O que negociar, com que frequencia. **Configuracao de negocio: mora no banco.**
+
+    Como `RiskSettings`, e um `BaseModel` puro: nao le ambiente. Cada campo aqui
+    responde a uma pergunta de negocio, e todos sao editaveis pela aplicacao web
+    sem reiniciar o processo.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # --- Universo negociado ----------------------------------------------
+    quote_currency: str = Field(
+        default="USDT",
+        min_length=2,
+        description="Moeda de cotacao. Define quais pares existem e em que moeda o saldo e medido.",
+    )
+    symbols: list[str] = Field(
+        default_factory=lambda: ["BTC/USDT", "ETH/USDT"],
+        description="Pares negociados. VAZIO ativa a descoberta automatica ('mar aberto').",
+    )
+    timeframe: str = Field(default="15m", min_length=2)
+    strategies: list[str] = Field(default_factory=lambda: ["ma_crossover", "rsi_reversion"])
+
+    # --- Cadencia ---------------------------------------------------------
+    candle_history_limit: int = Field(
+        default=500,
+        ge=50,
+        le=1000,
+        description="Quantos candles buscar por par. Define o aquecimento dos indicadores.",
+    )
+    market_data_interval_seconds: int = Field(default=60, ge=5)
+    portfolio_interval_seconds: int = Field(default=60, ge=5)
+    signal_batch_window_seconds: float = Field(
+        default=0.0,
+        ge=0,
+        description=(
+            "Janela para juntar sinais concorrentes antes do Risk Manager decidir "
+            "por confianca. DESLIGADO por padrao (zero) porque a medicao nao "
+            "sustentou o ganho: ver docs/SEGURANCA.md. Ligar so faz sentido apos "
+            "validar que a confianca da estrategia prediz resultado."
+        ),
+    )
+
+    # --- Descoberta automatica de pares ("mar aberto") --------------------
+    # Vale apenas quando `symbols` esta vazio. Ver `discovery.py` para o que isso
+    # muda na camada de seguranca da whitelist.
+    discovery_min_quote_volume_24h: Decimal = Field(
+        default=Decimal("50000000"),
+        gt=0,
+        description="Piso de liquidez em 24h. Dos 487 pares USDT da Binance, 312 movem <1M/dia.",
+    )
+    discovery_max_symbols: int = Field(
+        default=8, ge=1, le=50, description="Teto de pares monitorados na descoberta."
+    )
+    discovery_exclude_assets: list[str] = Field(
+        default_factory=list,
+        description="Ativos a excluir alem das stablecoins ja excluidas por padrao.",
+    )
+    discovery_refresh_hours: int = Field(
+        default=24, ge=1, description="Intervalo entre novas varreduras de mercado."
+    )
+
+    # --- Paper trading (usado em dry_run e no backtest) -------------------
+    paper_initial_balance: Decimal = Field(default=Decimal("1000"), gt=0)
+    paper_fee_pct: Decimal = Field(default=Decimal("0.001"), ge=0, lt=1)
+    paper_slippage_pct: Decimal = Field(default=Decimal("0.0005"), ge=0, lt=1)
+
+    @field_validator("symbols", "strategies", "discovery_exclude_assets", mode="before")
+    @classmethod
+    def _split_csv(cls, value: object) -> object:
+        return _split_csv_value(value)
+
+    @field_validator("quote_currency", mode="before")
+    @classmethod
+    def _upper_quote(cls, value: object) -> object:
+        return value.strip().upper() if isinstance(value, str) else value
+
+    @model_validator(mode="after")
+    def _check_strategies_exist(self) -> TradingSettings:
+        """Nome de estrategia errado nao pode virar "nenhuma estrategia".
+
+        Sem esta checagem, um typo salvo pela interface deixaria o sistema de pe
+        gerando zero sinais -- o mesmo modo de falha silencioso do `SYMBOLS`
+        vazio, mas sem nem a descoberta para compensar.
+        """
+        # Import local: `strategies` nao depende de `config`, mas manter o
+        # import aqui garante que essa direcao nunca se inverta por acidente.
+        from .strategies import available_strategies
+
+        disponiveis = available_strategies()
+        desconhecidas = [nome for nome in self.strategies if nome not in disponiveis]
+        if desconhecidas:
+            raise ValueError(
+                f"estrategia(s) inexistente(s): {', '.join(desconhecidas)}. "
+                f"Disponiveis: {', '.join(sorted(disponiveis))}"
+            )
+        if not self.strategies:
+            raise ValueError("ao menos uma estrategia precisa estar ativa")
+        return self
+
+    @property
+    def discovery_enabled(self) -> bool:
+        """`symbols` vazio significa "descubra os pares", nao "nao faca nada".
+
+        Deixar o sistema de pe sem observar nenhum mercado seria o pior estado
+        possivel: heartbeat verde, dashboard atualizando e nenhuma operacao
+        jamais -- parece saudavel e nao e.
+        """
+        return not self.symbols
+
+
 class Settings(BaseSettings):
-    """Configuracao global da aplicacao."""
+    """Configuracao de **ambiente**: o que descreve esta instalacao.
+
+    Os dois blocos de negocio (`trading` e `risk`) aparecem aqui como atributos
+    por conveniencia de leitura -- `settings.trading.timeframe` -- mas quem os
+    preenche e o banco, na subida, nao o `.env`.
+    """
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -167,6 +355,9 @@ class Settings(BaseSettings):
     log_json: bool = False
 
     # --- Modo de operacao -------------------------------------------------
+    # AMBIENTE por decisao explicita: ligar dinheiro real exige editar arquivo no
+    # servidor e reiniciar o processo. Se isso morasse no banco, um clique no
+    # navegador poderia ligar ordens reais.
     trading_mode: TradingMode = TradingMode.DRY_RUN
     """Padrao de fabrica e DRY_RUN. Ir para LIVE exige duas confirmacoes."""
 
@@ -192,57 +383,15 @@ class Settings(BaseSettings):
         default_factory=lambda: ["http://localhost:5173"]
     )
 
-    # --- Mercado ----------------------------------------------------------
+    # --- Exchange ---------------------------------------------------------
+    # AMBIENTE: esta amarrada a qual credencial existe neste arquivo. Apontar
+    # para uma exchange sem chave configurada e erro de instalacao, nao decisao
+    # de negocio. A moeda de cotacao, ao contrario, esta em `trading`.
     exchange: str = "binance"
-    quote_currency: str = "USDT"
-    symbols: Annotated[list[str], NoDecode] = Field(
-        default_factory=lambda: ["BTC/USDT", "ETH/USDT"]
-    )
-    timeframe: str = "15m"
-    candle_history_limit: int = 500
-
-    # --- Descoberta automatica de pares ("mar aberto") --------------------
-    # Vale apenas quando SYMBOLS esta vazio. Ver `discovery.py` para o que isso
-    # muda na camada de seguranca da whitelist.
-    discovery_min_quote_volume_24h: Decimal = Field(
-        default=Decimal("50000000"),
-        gt=0,
-        description="Piso de liquidez em 24h. Dos 487 pares USDT da Binance, 312 movem <1M/dia.",
-    )
-    discovery_max_symbols: int = Field(
-        default=8, ge=1, le=50, description="Teto de pares monitorados na descoberta."
-    )
-    discovery_exclude_assets: Annotated[list[str], NoDecode] = Field(
-        default_factory=list,
-        description="Ativos a excluir alem das stablecoins ja excluidas por padrao.",
-    )
-    discovery_refresh_hours: int = Field(
-        default=24, ge=1, description="Intervalo entre novas varreduras de mercado."
-    )
-    market_data_interval_seconds: int = 60
-    portfolio_interval_seconds: int = 60
-    strategies: Annotated[list[str], NoDecode] = Field(
-        default_factory=lambda: ["ma_crossover", "rsi_reversion"]
-    )
-    signal_batch_window_seconds: float = Field(
-        default=0.0,
-        ge=0,
-        description=(
-            "Janela para juntar sinais concorrentes antes do Risk Manager decidir "
-            "por confianca. DESLIGADO por padrao (zero) porque a medicao nao "
-            "sustentou o ganho: ver docs/SEGURANCA.md. Ligar so faz sentido apos "
-            "validar que a confianca da estrategia prediz resultado."
-        ),
-    )
-
-    # --- Paper trading ----------------------------------------------------
-    paper_initial_balance: Decimal = Decimal("1000")
-    paper_fee_pct: Decimal = Decimal("0.001")
-    paper_slippage_pct: Decimal = Decimal("0.0005")
 
     # --- Notificacoes -----------------------------------------------------
-    # SEGREDOS dos canais moram aqui, nunca no banco. Liga/desliga e
-    # destinatarios ficam no banco e sao editaveis pela interface.
+    # SEGREDOS e endpoints dos canais moram aqui. Liga/desliga e destinatarios
+    # ficam no banco e sao editaveis pela interface.
     smtp_host: str = ""
     smtp_port: int = 587
     smtp_username: str = ""
@@ -256,19 +405,15 @@ class Settings(BaseSettings):
     whatsapp_template_language: str = "pt_BR"
 
     binance: ExchangeCredentials = Field(default_factory=ExchangeCredentials)
+
+    # --- Negocio (preenchido pelo banco na subida) ------------------------
+    trading: TradingSettings = Field(default_factory=TradingSettings)
     risk: RiskSettings = Field(default_factory=RiskSettings)
 
-    @field_validator(
-        "symbols", "cors_origins", "strategies", "discovery_exclude_assets", mode="before"
-    )
+    @field_validator("cors_origins", mode="before")
     @classmethod
     def _split_csv(cls, value: object) -> object:
-        if isinstance(value, str):
-            stripped = value.strip()
-            if stripped.startswith("["):
-                return value
-            return [item.strip() for item in stripped.split(",") if item.strip()]
-        return value
+        return _split_csv_value(value)
 
     @field_validator("smtp_password", "whatsapp_access_token", mode="before")
     @classmethod
@@ -281,6 +426,31 @@ class Settings(BaseSettings):
         if isinstance(value, str) and not value.strip():
             return None
         return value
+
+    @model_validator(mode="after")
+    def _reject_business_keys(self) -> Settings:
+        """Recusa subir quando uma chave de negocio aparece no ambiente.
+
+        Ignorar em silencio seria repetir o erro que motivou esta separacao: a
+        pessoa edita o arquivo, o valor nao tem efeito, e ninguem descobre ate
+        uma ordem sair do tamanho errado.
+        """
+        encontradas = sorted(chave for chave in RETIRED_ENV_KEYS if chave in os.environ)
+        encontradas += sorted(
+            chave
+            for chave in _keys_in_dotenv(self.model_config.get("env_file"))
+            if chave in RETIRED_ENV_KEYS and chave not in encontradas
+        )
+        if encontradas:
+            raise ValueError(
+                "estas sao configuracoes de NEGOCIO e agora moram no banco, "
+                "editaveis em Configuracoes na interface web:\n    "
+                + "\n    ".join(encontradas)
+                + "\n  Remova essas linhas do `.env`. Enquanto estiverem la, o valor "
+                "escrito no arquivo NAO tem efeito -- e um valor sem efeito que "
+                "parece ter e pior que nenhum valor."
+            )
+        return self
 
     @model_validator(mode="after")
     def _resolve_database_url(self) -> Settings:
@@ -312,16 +482,6 @@ class Settings(BaseSettings):
         return self
 
     @property
-    def discovery_enabled(self) -> bool:
-        """SYMBOLS vazio significa "descubra os pares", nao "nao faca nada".
-
-        Deixar o sistema de pe sem observar nenhum mercado seria o pior estado
-        possivel: heartbeat verde, dashboard atualizando e nenhuma operacao
-        jamais -- parece saudavel e nao e.
-        """
-        return not self.symbols
-
-    @property
     def is_live(self) -> bool:
         return self.trading_mode is TradingMode.LIVE
 
@@ -337,6 +497,47 @@ class Settings(BaseSettings):
         credencial, `build_broker` recusa sair do modo simulado.
         """
         return {"binance": self.binance}.get(exchange.lower(), ExchangeCredentials())
+
+    def with_business_config(
+        self, trading: TradingSettings, risk: RiskSettings
+    ) -> None:
+        """Instala a configuracao de negocio vinda do banco, no lugar.
+
+        Trocar o objeto inteiro (em vez de campo a campo) mantem a leitura
+        atomica: nenhum agente ve metade da configuracao nova. E como todos leem
+        `settings.trading.X` no momento do uso, a troca se propaga sozinha, sem
+        copias envelhecendo em cada agente.
+        """
+        object.__setattr__(self, "trading", trading)
+        object.__setattr__(self, "risk", risk)
+
+
+def _keys_in_dotenv(env_file: object) -> set[str]:
+    """Nomes de variaveis declarados no `.env`, sem interpretar valores.
+
+    Ler o arquivo na mao (em vez de confiar no `extra="ignore"`) e o unico jeito
+    de saber que uma chave foi *escrita*: o pydantic-settings descarta chaves
+    desconhecidas sem deixar rastro.
+    """
+    if not env_file:
+        return set()
+
+    caminho = Path(str(env_file))
+    if not caminho.is_absolute():
+        caminho = Path.cwd() / caminho
+    if not caminho.is_file():
+        return set()
+
+    chaves: set[str] = set()
+    for linha in caminho.read_text(encoding="utf-8", errors="replace").splitlines():
+        limpa = linha.strip()
+        if not limpa or limpa.startswith("#") or "=" not in limpa:
+            continue
+        nome = limpa.split("=", 1)[0].strip()
+        if nome.startswith("export "):
+            nome = nome[len("export ") :].strip()
+        chaves.add(nome.upper())
+    return chaves
 
 
 @lru_cache

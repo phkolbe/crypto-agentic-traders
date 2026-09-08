@@ -133,8 +133,36 @@ export interface RiskConfig {
   asset_whitelist: string[]
   symbol_whitelist: string[]
   cooldown_seconds: number
+  mvrv_max_percentile: number
   circuit_breaker_active: boolean
   circuit_breaker_reason: string | null
+}
+
+/**
+ * Configuração de negócio: o que negociar e com que cadência.
+ *
+ * Vem do banco, nunca do `.env` — o arquivo de ambiente descreve a instalação
+ * (credenciais, banco, portas), e escrever uma variável de negócio nele faz o
+ * backend recusar subir.
+ */
+export interface TradingConfig {
+  quote_currency: string
+  symbols: string[]
+  timeframe: string
+  strategies: string[]
+  candle_history_limit: number
+  market_data_interval_seconds: number
+  portfolio_interval_seconds: number
+  signal_batch_window_seconds: number
+  discovery_min_quote_volume_24h: Money
+  discovery_max_symbols: number
+  discovery_exclude_assets: string[]
+  discovery_refresh_hours: number
+  paper_initial_balance: Money
+  paper_fee_pct: Money
+  paper_slippage_pct: Money
+  discovery_enabled: boolean
+  available_strategies: Record<string, string>
 }
 
 export interface AgentStatus {

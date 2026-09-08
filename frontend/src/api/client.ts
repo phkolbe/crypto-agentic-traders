@@ -14,6 +14,7 @@ import type {
   Signal,
   StrategyInfo,
   TradePage,
+  TradingConfig,
 } from './types'
 
 const BASE = '/api'
@@ -87,6 +88,15 @@ export const api = {
     }),
   resetCircuitBreaker: () =>
     request<RiskConfig>('/risk/circuit-breaker/reset', { method: 'POST' }),
+
+  tradingConfig: () => request<TradingConfig>('/trading/config'),
+  updateTradingConfig: (payload: Record<string, unknown>) =>
+    request<TradingConfig>('/trading/config', {
+      method: 'PUT',
+      // `confirm` e obrigatorio no backend: trocar pares, moeda ou estrategias
+      // muda o que o sistema negocia com dinheiro real.
+      body: JSON.stringify({ ...payload, confirm: true }),
+    }),
 
   strategies: () => request<StrategyInfo[]>('/strategies'),
   pauseAgent: (name: string) => request<unknown>(`/agents/${name}/pause`, { method: 'POST' }),

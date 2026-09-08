@@ -175,15 +175,15 @@ class TestEmptyResult:
 
 class TestSettingsIntegration:
     def test_blank_symbols_enables_discovery(self):
-        from crypto_traders.config import Settings
+        from crypto_traders.config import TradingSettings
 
-        assert Settings(symbols=[]).discovery_enabled is True
+        assert TradingSettings(symbols=[]).discovery_enabled is True
 
     def test_configured_symbols_disable_discovery(self):
         """Configuração explícita sempre vence descoberta automática."""
-        from crypto_traders.config import Settings
+        from crypto_traders.config import TradingSettings
 
-        assert Settings(symbols=["BTC/USDT"]).discovery_enabled is False
+        assert TradingSettings(symbols=["BTC/USDT"]).discovery_enabled is False
 
     def test_unsupported_exchange_is_refused(self):
         """Nesta fase só a Binance; falhar alto evita subir apontando para o nada."""

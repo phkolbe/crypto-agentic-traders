@@ -69,57 +69,17 @@ def main(argv: list[str] | None = None) -> int:
 async def _check(settings) -> int:
     """Diagnostico: o que esta configurado, e o que ainda falta."""
     print("=" * 68)
-    print(" crypto-agentic-traders — diagnostico do ambiente")
+    print(" crypto-agentic-traders — diagnostico")
     print("=" * 68)
 
-    mode_label = {
-        TradingMode.DRY_RUN: "SIMULACAO (nenhuma ordem sai da maquina)",
-        TradingMode.TESTNET: "TESTNET (ordens reais, dinheiro ficticio)",
-        TradingMode.LIVE: "*** DINHEIRO REAL ***",
-    }[settings.trading_mode]
-    print(f"\n  Modo de operacao : {settings.trading_mode}  ->  {mode_label}")
-    print(f"  Exchange         : {settings.exchange}")
-    if settings.discovery_enabled:
-        print("  Pares            : DESCOBERTA AUTOMATICA (SYMBOLS em branco)")
-        print(f"                     ate {settings.discovery_max_symbols} pares com volume 24h "
-              f">= {settings.discovery_min_quote_volume_24h:,.0f} {settings.quote_currency}")
-    else:
-        print(f"  Pares            : {', '.join(settings.symbols)}")
-    print(f"  Timeframe        : {settings.timeframe}")
-    print(f"  Estrategias      : {', '.join(settings.strategies)}")
-
-    print("\n  Credenciais:")
-    credentials = settings.credentials_for(settings.exchange)
-    status = "configurada" if credentials.configured else "ausente"
-    print(f"    {settings.exchange:<10} {status}")
-    if not settings.sends_real_orders:
-        print("    (dados de mercado sao publicos; credenciais so sao exigidas fora do dry_run)")
-
-    print("\n  Limites de risco:")
-    risk = settings.risk
-    print(f"    ordem maxima      : {risk.max_order_notional} {settings.quote_currency} "
-          f"ou {risk.max_order_pct_portfolio:.1%} do portfolio (o menor)")
-    print(f"    ordem minima      : {risk.min_order_notional} {settings.quote_currency}")
-    print(f"    exposicao maxima  : {risk.max_asset_exposure_pct:.0%} por ativo")
-    print(f"    stop / alvo       : -{risk.stop_loss_pct:.1%} / +{risk.take_profit_pct:.1%}")
-    print(f"    circuit breaker   : -{risk.daily_loss_limit_pct:.1%} ao dia, "
-          f"-{risk.weekly_loss_limit_pct:.1%} na semana")
-    print(f"    cooldown          : {risk.cooldown_seconds}s por par")
-    if settings.discovery_enabled:
-        # A whitelist do `.env` nao vale neste modo: quem a define e a varredura
-        # de mercado logo abaixo. Mostrar a lista estatica aqui enganaria.
-        print("    whitelist         : definida pela descoberta (ver pares abaixo)")
-        print(f"    max posicoes      : {risk.max_open_positions} "
-              f"— principal defesa no modo automatico")
-    else:
-        print(f"    whitelist         : {', '.join(risk.symbol_whitelist)}")
-
-    print("\n  Infraestrutura:")
+    # O banco vem primeiro porque e de la que sai toda a configuracao de
+    # negocio. Imprimir os numeros antes de carrega-la mostraria os padroes de
+    # codigo -- um diagnostico que descreve outra instalacao, nao esta.
+    print("\n  Infraestrutura (ambiente, do `.env`):")
     dialect = settings.database_url.split(":", 1)[0]
     print(f"    banco     : {dialect}")
     print(f"    event bus : {settings.event_bus}")
     print(f"    API       : http://{settings.api_host}:{settings.api_port}")
-
     try:
         await init_db(settings)
         async with session_scope(settings) as session:
@@ -131,7 +91,52 @@ async def _check(settings) -> int:
         print(f"    conexao   : FALHOU — {exc}")
         return 1
 
-    await _check_stored_limits(settings)
+    await _load_business_config(settings)
+
+    mode_label = {
+        TradingMode.DRY_RUN: "SIMULACAO (nenhuma ordem sai da maquina)",
+        TradingMode.TESTNET: "TESTNET (ordens reais, dinheiro ficticio)",
+        TradingMode.LIVE: "*** DINHEIRO REAL ***",
+    }[settings.trading_mode]
+    print(f"\n  Modo de operacao : {settings.trading_mode}  ->  {mode_label}")
+    print(f"  Exchange         : {settings.exchange}")
+    if settings.trading.discovery_enabled:
+        print("  Pares            : DESCOBERTA AUTOMATICA (lista de pares vazia)")
+        descoberta = settings.trading
+        print(f"                     ate {descoberta.discovery_max_symbols} pares com volume "
+              f"24h >= {descoberta.discovery_min_quote_volume_24h:,.0f} "
+              f"{descoberta.quote_currency}")
+    else:
+        print(f"  Pares            : {', '.join(settings.trading.symbols)}")
+    print(f"  Timeframe        : {settings.trading.timeframe}")
+    print(f"  Estrategias      : {', '.join(settings.trading.strategies)}")
+
+    print("\n  Credenciais:")
+    credentials = settings.credentials_for(settings.exchange)
+    status = "configurada" if credentials.configured else "ausente"
+    print(f"    {settings.exchange:<10} {status}")
+    if not settings.sends_real_orders:
+        print("    (dados de mercado sao publicos; credenciais so sao exigidas fora do dry_run)")
+
+    print("\n  Limites de risco:")
+    risk = settings.risk
+    print(f"    ordem maxima      : {risk.max_order_notional} {settings.trading.quote_currency} "
+          f"ou {risk.max_order_pct_portfolio:.1%} do portfolio (o menor)")
+    print(f"    ordem minima      : {risk.min_order_notional} {settings.trading.quote_currency}")
+    print(f"    exposicao maxima  : {risk.max_asset_exposure_pct:.0%} por ativo")
+    print(f"    stop / alvo       : -{risk.stop_loss_pct:.1%} / +{risk.take_profit_pct:.1%}")
+    print(f"    circuit breaker   : -{risk.daily_loss_limit_pct:.1%} ao dia, "
+          f"-{risk.weekly_loss_limit_pct:.1%} na semana")
+    print(f"    cooldown          : {risk.cooldown_seconds}s por par")
+    if settings.trading.discovery_enabled:
+        # A whitelist configurada nao vale neste modo: quem a define e a
+        # varredura de mercado logo abaixo. Mostrar a lista salva aqui enganaria.
+        print("    whitelist         : definida pela descoberta (ver pares abaixo)")
+        print(f"    max posicoes      : {risk.max_open_positions} "
+              f"— principal defesa no modo automatico")
+    else:
+        print(f"    whitelist         : {', '.join(risk.symbol_whitelist)}")
+
     await _check_regime_filter(settings)
 
     print("\n  Conectividade com a exchange (endpoints publicos):")
@@ -148,20 +153,20 @@ async def _check(settings) -> int:
             # chamada e ainda poderia devolver precos diferentes entre elas.
             markets, tickers = await source.fetch_markets_and_tickers()
 
-            if settings.discovery_enabled:
+            if settings.trading.discovery_enabled:
                 from .discovery import DEFAULT_EXCLUDED_ASSETS, DiscoveryCriteria, select_markets
 
                 criteria = DiscoveryCriteria(
-                    quote_currency=settings.quote_currency,
-                    min_quote_volume_24h=settings.discovery_min_quote_volume_24h,
-                    max_symbols=settings.discovery_max_symbols,
+                    quote_currency=settings.trading.quote_currency,
+                    min_quote_volume_24h=settings.trading.discovery_min_quote_volume_24h,
+                    max_symbols=settings.trading.discovery_max_symbols,
                     exclude_assets=DEFAULT_EXCLUDED_ASSETS
-                    | {a.upper() for a in settings.discovery_exclude_assets},
+                    | {a.upper() for a in settings.trading.discovery_exclude_assets},
                 )
                 result = select_markets(markets, tickers, criteria)
                 if not result.symbols:
                     print("    NENHUM par atingiu o piso de liquidez.")
-                    print("    Reduza DISCOVERY_MIN_QUOTE_VOLUME_24H ou defina SYMBOLS.")
+                    print("    Em Configuracoes: reduza o piso de liquidez, ou informe os pares.")
                     return 1
                 print(f"    {result.considered} pares avaliados, "
                       f"{result.rejected_low_volume} abaixo do piso de volume")
@@ -170,7 +175,7 @@ async def _check(settings) -> int:
                     print(f"      {market.symbol:<14} volume 24h {volume:>8,.0f}M")
                 active_symbols = result.symbols
             else:
-                active_symbols = list(settings.symbols)
+                active_symbols = list(settings.trading.symbols)
                 for symbol in active_symbols:
                     price = (tickers.get(symbol) or {}).get("last")
                     print(f"    {symbol}: {price if price else 'sem cotacao'}  OK")
@@ -200,45 +205,30 @@ async def _check(settings) -> int:
     return 0
 
 
-async def _check_stored_limits(settings) -> None:
-    """Avisa quando o banco tem limites diferentes do `.env`.
+async def _load_business_config(settings) -> None:
+    """Carrega a configuracao de negocio do banco para dentro de `settings`.
 
-    A partir da primeira subida o banco passa a ser a fonte da verdade, e o
-    `.env` deixa de ter efeito sobre os limites. Sem este aviso, o diagnostico
-    imprimiria os numeros do arquivo enquanto o sistema opera por outros -- o
-    tipo de divergencia silenciosa que so aparece depois de uma ordem estranha.
+    Sem isto o diagnostico imprimiria os padroes de codigo -- e o `check` existe
+    justamente para responder "o que ESTA instalacao vai fazer".
     """
-    from .db.repositories import RiskConfigRepository
+    from .business_config import load_business_config
+    from .db.repositories import TradingConfigRepository
 
     try:
         async with session_scope(settings) as session:
-            gravado = dict((await RiskConfigRepository(session).get_or_create({})).values or {})
+            existia = await TradingConfigRepository(session).get() is not None
+        trading, risk = await load_business_config(settings)
+        settings.with_business_config(trading, risk)
     except Exception as exc:
-        print(f"\n  Limites gravados : nao foi possivel ler — {exc}")
+        print(f"\n  Configuracao de negocio : FALHOU ao ler do banco — {exc}")
+        print("    Seguindo com os padroes conservadores do codigo.")
         return
 
-    if not gravado:
-        print("\n  Limites gravados : nenhum; o `.env` vale na proxima subida.")
-        return
-
-    do_env = settings.risk.model_dump(mode="json")
-    ignorar = {"symbol_whitelist", "asset_whitelist"}
-    divergentes = [
-        (campo, gravado[campo], do_env[campo])
-        for campo in do_env
-        if campo in gravado and campo not in ignorar and str(gravado[campo]) != str(do_env[campo])
-    ]
-
-    if not divergentes:
-        print("\n  Limites gravados : iguais ao `.env`.")
-        return
-
-    print("\n  Limites gravados no banco DIVERGEM do `.env`:")
-    print(f"    {'campo':<28}{'vale (banco)':>16}{'ignorado (.env)':>18}")
-    for campo, banco, arquivo in divergentes:
-        print(f"    {campo:<28}{banco!s:>16}{arquivo!s:>18}")
-    print("    Editar o `.env` NAO muda estes valores: use a tela de risco na")
-    print("    interface, que grava no banco e registra no audit_log.")
+    origem = "banco" if existia else "padroes de fabrica (linha criada agora)"
+    print(f"    negocio   : {origem}")
+    if not existia:
+        print("    Primeira subida: os valores de negocio foram gravados com os")
+        print("    padroes. Ajuste-os em Configuracoes, na interface web.")
 
 
 async def _check_regime_filter(settings) -> None:
@@ -303,7 +293,7 @@ def _check_sizing(settings, quote_balance: Decimal | None = None) -> SizingFeasi
     """
     from .risk.rules import assess_sizing_feasibility
 
-    quote = settings.quote_currency
+    quote = settings.trading.quote_currency
     print("\n  Dimensionamento de ordens:")
 
     if settings.sends_real_orders:
@@ -316,13 +306,13 @@ def _check_sizing(settings, quote_balance: Decimal | None = None) -> SizingFeasi
             print(f"    SEM SALDO em {quote} na conta da exchange.")
             print(f"    O sistema negocia pares cotados em {quote} e precisa dessa")
             print("    moeda para comprar. Converta o saldo que voce tem, ou aponte")
-            print("    QUOTE_CURRENCY para a moeda que voce de fato possui.")
+            print("    a moeda de cotacao, em Configuracoes, para a que voce possui.")
             print("    " + "!" * 62)
             return None
         balance = quote_balance
         origin = f"saldo real em {quote} na exchange"
     else:
-        balance = settings.paper_initial_balance
+        balance = settings.trading.paper_initial_balance
         origin = f"saldo simulado ({quote})"
 
     result = assess_sizing_feasibility(settings.risk, balance)
@@ -335,8 +325,8 @@ def _check_sizing(settings, quote_balance: Decimal | None = None) -> SizingFeasi
     print("    " + "!" * 62)
     for line in _wrap(result.explain(quote), 60):
         print(f"    {line}")
-    print("    Aumente o patrimonio, ou reduza RISK_MIN_ORDER_NOTIONAL e suba")
-    print("    RISK_MAX_ORDER_PCT_PORTFOLIO / RISK_MAX_ASSET_EXPOSURE_PCT.")
+    print("    Aumente o patrimonio, ou, na tela de risco: reduza a ordem")
+    print("    minima e suba o percentual por ordem / exposicao por ativo.")
     print("    " + "!" * 62)
     return None
 
@@ -364,7 +354,7 @@ def _check_market_filters(
     if not symbols or not markets:
         return True
 
-    quote = settings.quote_currency
+    quote = settings.trading.quote_currency
     notional = sizing.max_possible_order
     results = check_all(markets, tickers, symbols, notional)
     if not results:
@@ -388,7 +378,7 @@ def _check_market_filters(
     print("    " + "!" * 62)
     print(f"    {len(blocked)} par(es) rejeitariam a ordem por causa do arredondamento")
     print("    de lote. Ajustes possiveis:")
-    print(f"      - subir RISK_MIN_ORDER_NOTIONAL para {needed:.2f} (e o teto por")
+    print(f"      - subir a ordem minima para {needed:.2f} (e o teto por")
     print("        ordem junto, para caber), ou")
     print(f"      - remover da whitelist: {', '.join(r.symbol for r in blocked)}")
     print("    " + "!" * 62)
@@ -411,7 +401,7 @@ async def _check_credentials(settings) -> tuple[bool, Decimal | None]:
 
     Devolve `(ok, saldo_em_moeda_de_cotacao)`. O saldo alimenta a checagem de
     dimensionamento: em testnet/live o que vale e o dinheiro que existe na
-    conta, nao o saldo simulado do `.env`.
+    conta, nao o saldo simulado da configuracao de negocio.
     """
     from .exchanges import CcxtExchange
     from .exchanges.base import ApiAccessDenied
@@ -451,7 +441,7 @@ async def _check_credentials(settings) -> tuple[bool, Decimal | None]:
     assets = ", ".join(sorted(balances)) if balances else "nenhum saldo positivo"
     print(f"    leitura de saldo OK — ativos: {assets}")
     print("    (envio de ordem nao e testado aqui: isso exigiria uma ordem real)")
-    return True, balances.get(settings.quote_currency)
+    return True, balances.get(settings.trading.quote_currency)
 
 
 async def _print_public_ip() -> None:
@@ -479,16 +469,16 @@ async def _backtest(settings, args) -> int:
     from .exchanges import build_market_data_source
     from .strategies import available_strategies, get_strategy
 
-    if not args.symbol and not settings.symbols:
+    if not args.symbol and not settings.trading.symbols:
         print(
-            "SYMBOLS esta em branco (modo de descoberta automatica), entao o backtest "
+            "A lista de pares esta vazia (descoberta automatica), entao o backtest "
             "precisa de um par explicito.\n"
             "Exemplo: crypto-traders backtest --symbol BTC/USDT"
         )
         return 1
-    symbol = args.symbol or settings.symbols[0]
-    timeframe = args.timeframe or settings.timeframe
-    balance = args.balance or settings.paper_initial_balance
+    symbol = args.symbol or settings.trading.symbols[0]
+    timeframe = args.timeframe or settings.trading.timeframe
+    balance = args.balance or settings.trading.paper_initial_balance
 
     minutes = TIMEFRAME_MINUTES.get(timeframe)
     if minutes is None:
@@ -516,7 +506,7 @@ async def _backtest(settings, args) -> int:
     )
 
     names = list(available_strategies()) if args.all_strategies else [
-        args.strategy or settings.strategies[0]
+        args.strategy or settings.trading.strategies[0]
     ]
 
     results = []
@@ -524,11 +514,11 @@ async def _backtest(settings, args) -> int:
         engine = BacktestEngine(
             get_strategy(name),
             settings.risk,
-            quote_currency=settings.quote_currency,
+            quote_currency=settings.trading.quote_currency,
             initial_balance=balance,
-            fee_pct=settings.paper_fee_pct,
-            slippage_pct=settings.paper_slippage_pct,
-            lookback=settings.candle_history_limit,
+            fee_pct=settings.trading.paper_fee_pct,
+            slippage_pct=settings.trading.paper_slippage_pct,
+            lookback=settings.trading.candle_history_limit,
         )
         try:
             results.append(await engine.run(closed))
@@ -538,7 +528,7 @@ async def _backtest(settings, args) -> int:
     if not results:
         return 1
 
-    _print_backtest_table(results, balance, settings.quote_currency)
+    _print_backtest_table(results, balance, settings.trading.quote_currency)
     return 0
 
 

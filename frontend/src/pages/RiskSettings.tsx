@@ -90,6 +90,15 @@ const FIELDS: {
     help: 'Intervalo mínimo entre ordens do mesmo par. Não bloqueia fechamento de posição.',
     kind: 'int',
   },
+  {
+    key: 'mvrv_max_percentile',
+    label: 'Filtro de regime MVRV',
+    help:
+      '1 desliga. 0,40 = não abrir posição quando o mercado estiver mais caro que 40% ' +
+      'dos dias já observados. Medido: reduz a queda máxima e custa retorno, porque ' +
+      'bloqueia entrada durante as altas. Nunca bloqueia fechamento.',
+    kind: 'percent',
+  },
 ]
 
 export default function RiskSettings() {

@@ -271,3 +271,130 @@ class TestRiskControl:
         await http.put("/api/risk/config", json={"cooldown_seconds": 300, "confirm": True})
         entries = (await http.get("/api/audit")).json()
         assert any(entry["action"] == "risk_limits_updated" for entry in entries)
+
+
+class TestTradingConfigRoutes:
+    """A tela de Configuracoes e o unico lugar de editar negocio.
+
+    Se o `.env` deixou de aceitar essas variaveis, esta rota precisa funcionar --
+    caso contrario a separacao teria apenas tirado o controle do usuario.
+    """
+
+    @pytest.fixture
+    async def controlled(self, settings):
+        from crypto_traders.agents.market_data import MarketDataAgent
+        from crypto_traders.agents.orchestrator import Orchestrator
+        from crypto_traders.agents.risk_manager import RiskManagerAgent
+        from crypto_traders.agents.strategy import StrategyAgent
+        from crypto_traders.bus import InMemoryEventBus
+        from crypto_traders.strategies import build_strategies
+
+        orchestrator = Orchestrator(settings)
+        orchestrator.bus = InMemoryEventBus()
+        await orchestrator.bus.start()
+        orchestrator.risk_manager = RiskManagerAgent(orchestrator.bus, settings)
+        orchestrator.strategy = StrategyAgent(
+            orchestrator.bus, build_strategies(settings.trading.strategies), settings
+        )
+        orchestrator.market_data = MarketDataAgent(orchestrator.bus, None, settings)
+
+        app = create_app()
+        app.state.settings = settings
+        app.state.orchestrator = orchestrator
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as http:
+            yield http, orchestrator
+
+    async def test_reads_the_current_configuration(self, controlled):
+        http, _ = controlled
+        body = (await http.get("/api/trading/config")).json()
+        assert body["symbols"] == ["BTC/USDT"]
+        assert body["discovery_enabled"] is False
+        assert "ma_crossover" in body["available_strategies"]
+
+    async def test_update_requires_explicit_confirmation(self, controlled):
+        """Trocar pares muda o que o sistema negocia com dinheiro real."""
+        http, _ = controlled
+        response = await http.put("/api/trading/config", json={"timeframe": "4h"})
+        assert response.status_code == 400
+        assert "confirm=true" in response.json()["detail"]
+
+    async def test_update_applies_to_the_running_process(self, controlled):
+        http, orchestrator = controlled
+        response = await http.put(
+            "/api/trading/config", json={"timeframe": "4h", "confirm": True}
+        )
+        assert response.status_code == 200
+        assert orchestrator.settings.trading.timeframe == "4h"
+
+    async def test_changing_strategies_swaps_them_without_restart(self, controlled):
+        http, orchestrator = controlled
+        response = await http.put(
+            "/api/trading/config",
+            json={"strategies": ["macd_trend", "rsi_reversion"], "confirm": True},
+        )
+        assert response.status_code == 200
+        assert orchestrator.strategy.strategy_names == ["macd_trend", "rsi_reversion"]
+
+    async def test_unknown_strategy_is_refused(self, controlled):
+        http, _ = controlled
+        response = await http.put(
+            "/api/trading/config", json={"strategies": ["nao_existe"], "confirm": True}
+        )
+        assert response.status_code == 422
+        assert "inexistente" in response.json()["detail"]
+
+    async def test_empty_symbols_turns_on_discovery(self, controlled):
+        """Lista vazia e um valor com significado, nao ausencia de valor."""
+        http, orchestrator = controlled
+        response = await http.put(
+            "/api/trading/config", json={"symbols": [], "confirm": True}
+        )
+        assert response.status_code == 200
+        assert response.json()["discovery_enabled"] is True
+        assert orchestrator.settings.trading.discovery_enabled is True
+
+    async def test_unknown_field_is_refused(self, controlled):
+        http, _ = controlled
+        response = await http.put(
+            "/api/trading/config", json={"campo_inexistente": 1, "confirm": True}
+        )
+        assert response.status_code == 422
+
+    async def test_empty_payload_is_refused(self, controlled):
+        http, _ = controlled
+        response = await http.put("/api/trading/config", json={"confirm": True})
+        assert response.status_code == 400
+
+
+class TestMvrvIsEditable:
+    """O filtro de regime nao era editavel pela interface -- so pelo `.env`.
+
+    Com negocio morando no banco, um limite sem tela seria um limite sem dono.
+    """
+
+    async def test_risk_config_exposes_the_filter(self, settings):
+        from crypto_traders.agents.orchestrator import Orchestrator
+        from crypto_traders.agents.risk_manager import RiskManagerAgent
+        from crypto_traders.bus import InMemoryEventBus
+
+        orchestrator = Orchestrator(settings)
+        orchestrator.bus = InMemoryEventBus()
+        await orchestrator.bus.start()
+        orchestrator.risk_manager = RiskManagerAgent(orchestrator.bus, settings)
+
+        app = create_app()
+        app.state.settings = settings
+        app.state.orchestrator = orchestrator
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as http:
+            assert (await http.get("/api/risk/config")).json()["mvrv_max_percentile"] == 1.0
+
+            response = await http.put(
+                "/api/risk/config", json={"mvrv_max_percentile": 0.4, "confirm": True}
+            )
+            assert response.status_code == 200
+            assert response.json()["mvrv_max_percentile"] == 0.4
+            assert orchestrator.risk_manager.limits.mvrv_max_percentile == 0.4
+            # `settings.risk` alimenta o check e o backtest: precisa acompanhar.
+            assert settings.risk.mvrv_max_percentile == 0.4

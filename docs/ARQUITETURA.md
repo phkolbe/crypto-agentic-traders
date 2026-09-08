@@ -100,11 +100,48 @@ o dashboard congela justamente quando há atividade.
 | `portfolio_snapshots` | Série temporal do patrimônio (gráfico do dashboard) |
 | `agent_runs` | Heartbeats |
 | `audit_log` | Append-only: mudanças de config e ações administrativas |
+| `onchain_metrics` | Série diária do MVRV Z-Score, cacheada (provedor externo) |
+| `trading_config` | O que negociar e com que cadência (negócio, nunca do `.env`) |
 | `risk_config` | Limites vigentes + estado do circuit breaker |
 | `notification_config` | Canais de alerta: liga/desliga e destinatários (nunca segredos) |
 
 `trades` é uma tabela só para agentes e lançamentos manuais, distinguidos por
 `origin`. Isso mantém filtros, dashboard e exportação fiscal simples — sem UNION.
+
+## Configuração: duas naturezas, dois lugares
+
+```
+.env  (ambiente)                      banco  (negócio)
+├── credenciais                       ├── trading_config
+├── TRADING_MODE, LIVE_CONFIRMED      │   pares, moeda, timeframe,
+├── EXCHANGE                          │   estratégias, cadência,
+├── DATABASE_URL, EVENT_BUS           │   descoberta, simulação
+├── API_HOST/PORT, CORS               └── risk_config
+└── SMTP_*, WHATSAPP_*                    todos os limites + MVRV
+        │                                        │
+        ▼                                        ▼
+   Settings (BaseSettings)          TradingSettings / RiskSettings
+   lê ambiente                      BaseModel puros: NÃO leem ambiente
+        └──────────── install_business_config() ──────┘
+                    (no start, antes dos agentes)
+```
+
+`Settings.trading` e `Settings.risk` existem por conveniência de leitura —
+`settings.trading.timeframe` — mas quem os preenche é o banco, na subida. A troca
+é do objeto inteiro (`with_business_config`), não campo a campo: a leitura fica
+atômica e nenhum agente vê metade da configuração nova. Como todos leem
+`settings.trading.X` no momento do uso, a troca se propaga sozinha, sem cópias
+envelhecendo em cada agente.
+
+Três coisas não se propagam sozinhas, porque são lidas na **construção** do
+agente, e `Orchestrator.update_trading` reage a elas: a lista de estratégias
+(instanciada uma vez), os critérios de descoberta (que só revarrem a cada 24h) e
+a mudança de universo. Sem isso a tela mostraria uma configuração que o sistema
+não está usando.
+
+Escrever uma variável de negócio no `.env` faz `Settings` recusar subir. Ver
+seção 11 de [`SEGURANCA.md`](SEGURANCA.md) para o episódio que tornou isso uma
+regra.
 
 ## Decisões que divergem do plano original
 
@@ -115,5 +152,6 @@ o dashboard congela justamente quando há atividade.
 | `vectorbt`/`backtrader` para backtest | Backtester próprio orientado a eventos | Reutiliza o **mesmo** Strategy Agent, Risk Manager e PaperBroker da produção — testa o código real, não uma reimplementação |
 | Celery/APScheduler | Loops `asyncio` no orquestrador | Um processo só; agendamento externo adicionaria infraestrutura sem ganho |
 | Coinbase no MVP | Somente Binance | Coinbase movida para a fase 5; o adapter `ccxt` já é genérico |
-| Whitelist de pares sempre fixa | `SYMBOLS` em branco ativa descoberta automática | Universo escolhido por liquidez, com a lista descoberta virando a whitelist efetiva e indo para o `audit_log` |
+| Whitelist de pares sempre fixa | Lista de pares vazia ativa descoberta automática | Universo escolhido por liquidez, com a lista descoberta virando a whitelist efetiva e indo para o `audit_log` |
 | Alertas por Telegram | E-mail (SMTP) e WhatsApp (Meta Cloud API) | Canais que o operador de fato usa, cada um com liga/desliga na interface |
+| Configuração toda no `.env` | `.env` só ambiente; negócio no banco, editável na web | Enquanto os limites viviam nos dois lugares, o banco vencia em silêncio — o `.env` pedia ordem máxima de 7 USDT e o sistema operava com 50 |

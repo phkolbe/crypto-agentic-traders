@@ -32,10 +32,10 @@ def build_broker(settings: Settings) -> Broker:
     """
     if settings.trading_mode is TradingMode.DRY_RUN:
         return PaperBroker(
-            quote_currency=settings.quote_currency,
-            initial_balance=settings.paper_initial_balance,
-            fee_pct=settings.paper_fee_pct,
-            slippage_pct=settings.paper_slippage_pct,
+            quote_currency=settings.trading.quote_currency,
+            initial_balance=settings.trading.paper_initial_balance,
+            fee_pct=settings.trading.paper_fee_pct,
+            slippage_pct=settings.trading.paper_slippage_pct,
         )
 
     credentials = settings.credentials_for(settings.exchange)

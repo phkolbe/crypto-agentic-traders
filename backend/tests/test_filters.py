@@ -191,7 +191,7 @@ class TestCheckCommand:
         assert ok is False
         output = capsys.readouterr().out
         assert "arredondamento" in output
-        assert "RISK_MIN_ORDER_NOTIONAL" in output
+        assert "subir a ordem minima" in output
 
     def test_passes_with_a_viable_order(self, settings, capsys):
         from crypto_traders.cli import _check_market_filters

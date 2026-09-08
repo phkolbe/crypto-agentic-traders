@@ -19,10 +19,12 @@ export function useHealth() {
 
 export function Card({
   title,
+  subtitle,
   children,
   action,
 }: {
   title?: string
+  subtitle?: string
   children: ReactNode
   action?: ReactNode
 }) {
@@ -30,7 +32,14 @@ export function Card({
     <div className="card">
       {(title || action) && (
         <div className="row-tight" style={{ justifyContent: 'space-between', marginBottom: 10 }}>
-          {title && <div className="card-title" style={{ marginBottom: 0 }}>{title}</div>}
+          <div>
+            {title && <div className="card-title" style={{ marginBottom: 0 }}>{title}</div>}
+            {subtitle && (
+              <div className="hint" style={{ marginTop: 3 }}>
+                {subtitle}
+              </div>
+            )}
+          </div>
           {action}
         </div>
       )}

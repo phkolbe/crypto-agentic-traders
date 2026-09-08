@@ -18,7 +18,16 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from ..config import get_settings
 from ..logging_setup import get_logger
-from .routes import agents, backtest, notifications, portfolio, risk, trades, ws
+from .routes import (
+    agents,
+    backtest,
+    notifications,
+    portfolio,
+    risk,
+    trades,
+    trading_config,
+    ws,
+)
 
 if TYPE_CHECKING:
     from ..agents.orchestrator import Orchestrator
@@ -68,6 +77,7 @@ def create_app(orchestrator: Orchestrator | None = None) -> FastAPI:
     app.include_router(agents.router, prefix="/api", tags=["agentes"])
     app.include_router(backtest.router, prefix="/api", tags=["backtest"])
     app.include_router(notifications.router, prefix="/api", tags=["notificacoes"])
+    app.include_router(trading_config.router, prefix="/api", tags=["configuracao"])
     app.include_router(ws.router, tags=["tempo real"])
 
     return app
