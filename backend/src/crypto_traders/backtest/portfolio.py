@@ -56,6 +56,14 @@ class PortfolioTrade:
 
     realized_pnl: Decimal | None = None
 
+    exit_reason: str | None = None
+    """Por que a posicao fechou: `stop`, `alvo` ou `estrategia`.
+
+    Sem isso nao da para responder a pergunta que decide o valor do stop: das
+    saidas, quantas foram protecao disparando e quantas foram a estrategia
+    mandando sair?
+    """
+
 
 @dataclass
 class PortfolioBacktestResult:
@@ -71,6 +79,8 @@ class PortfolioBacktestResult:
     signals_rejected: int = 0
     rejection_reasons: Counter = field(default_factory=Counter)
     trades_per_symbol: Counter = field(default_factory=Counter)
+    exits: Counter = field(default_factory=Counter)
+    """Contagem de saidas por motivo: `stop`, `alvo`, `estrategia`."""
 
     #: Preco no inicio e no fim da janela, por par. Base do comprar-e-segurar.
     first_prices: dict[str, Decimal] = field(default_factory=dict)
@@ -238,6 +248,7 @@ class PortfolioBacktestEngine:
         prices: dict[str, Decimal] = {}
         cost_basis: dict[str, Decimal] = {}
         last_order_at: dict[str, datetime] = {}
+        protection: dict[str, tuple[Decimal, Decimal]] = {}
         order_seq = 0
 
         for step, now in enumerate(timeline):
@@ -250,7 +261,15 @@ class PortfolioBacktestEngine:
                 prices[base] = price
                 broker.set_price(base, price)
 
-            # 2) Coleta TODOS os sinais deste instante antes de decidir.
+            # 2) Protecao ANTES de qualquer decisao nova.
+            #    Um stop que disparou libera caixa e encerra a exposicao; avaliar
+            #    sinais antes dele daria ao sistema um dinheiro que ele nao tinha
+            #    e uma posicao que ja devia estar fechada.
+            order_seq = await self._apply_protective_exits(
+                frames, now, broker, cost_basis, protection, last_order_at, result, order_seq
+            )
+
+            # 3) Coleta TODOS os sinais deste instante antes de decidir.
             #    Avaliar par a par atenderia quem aparece primeiro na iteracao
             #    dos dicionarios -- ordem arbitraria, nao qualidade.
             batch = []
@@ -273,7 +292,7 @@ class PortfolioBacktestEngine:
                     if signal is not None:
                         batch.append(signal)
 
-            # 3) Decide o lote inteiro por confianca, e executa os aprovados.
+            # 4) Decide o lote inteiro por confianca, e executa os aprovados.
             if batch:
                 result.signals_generated += len(batch)
                 for signal, assessment in await self._decide_batch(
@@ -282,10 +301,10 @@ class PortfolioBacktestEngine:
                     order_seq += 1
                     await self._execute(
                         signal, assessment, broker, prices, cost_basis,
-                        last_order_at, result, now, order_seq,
+                        protection, last_order_at, result, now, order_seq,
                     )
 
-            # 4) Patrimonio ao fim do instante. Amostrado, nao a cada passo:
+            # 5) Patrimonio ao fim do instante. Amostrado, nao a cada passo:
             #    16 pares x milhares de candles produziriam uma curva gigante
             #    sem ganho de informacao.
             if step % 4 == 0 or now == timeline[-1]:
@@ -300,6 +319,102 @@ class PortfolioBacktestEngine:
             return_pct=round(result.total_return_pct, 4),
         )
         return result
+
+    async def _apply_protective_exits(
+        self, frames, now, broker, cost_basis, protection, last_order_at, result, order_seq
+    ) -> int:
+        """Executa stop-loss e take-profit contra o candle que acabou de fechar.
+
+        Este passo **nao existia**, e a ausencia dele nao aparecia como erro: os
+        niveis eram calculados pelo Risk Manager, gravados na ordem e nunca
+        comparados com preco nenhum. Toda posicao andava ate a estrategia mandar
+        sair, e por isso as quedas maximas medidas (37%, 46%) eram o retrato de
+        um sistema **sem** stop -- justamente o numero que o stop existe para
+        limitar.
+
+        Tres convencoes, todas escolhidas para o lado pessimista, porque um
+        backtest de risco que erra para o otimista nao serve para nada:
+
+        1. **Stop e alvo no mesmo candle: o stop vence.** O OHLC nao diz qual
+           preco veio primeiro. Supor o alvo seria escolher o desfecho bom com
+           base em informacao que nao existe.
+        2. **Gap conta contra.** Se o candle abriu abaixo do stop, a execucao sai
+           na abertura, nao no nivel do stop -- e exatamente assim que stops
+           machucam na vida real. O alvo, ao contrario, executa no nivel, sem
+           credito pelo gap favoravel.
+        3. **Deslizamento se aplica.** A ordem sai como LIMIT no preco calculado
+           e o `PaperBroker` aplica o deslizamento contra o operador.
+        """
+        balances = await broker.fetch_balances()
+        for symbol, frame in frames.items():
+            if now not in frame.index:
+                continue
+            base = symbol.partition("/")[0]
+            niveis = protection.get(base)
+            held = balances.get(base, Decimal(0))
+            if niveis is None or held <= 0:
+                continue
+
+            stop, alvo = niveis
+            baixa = Decimal(str(frame.at[now, "low"]))
+            alta = Decimal(str(frame.at[now, "high"]))
+            abertura = Decimal(str(frame.at[now, "open"]))
+
+            if baixa <= stop:
+                motivo, fill = "stop", min(abertura, stop)
+            elif alta >= alvo:
+                motivo, fill = "alvo", alvo
+            else:
+                continue
+
+            order_seq += 1
+            order = await broker.place_order(
+                OrderRequest(
+                    client_order_id=f"pbt-{motivo}-{order_seq}",
+                    signal_id=None,
+                    risk_event_id=f"protecao-{order_seq}",
+                    exchange=ExchangeName.PAPER,
+                    symbol=symbol,
+                    side=Side.SELL,
+                    order_type=OrderType.LIMIT,
+                    price=fill,
+                    quantity=held,
+                    notional=held * fill,
+                    strategy="protecao",
+                )
+            )
+            if order.status is not OrderStatus.FILLED:
+                continue
+
+            preco = order.average_price or fill
+            medio = cost_basis.get(base, Decimal(0)) / held if held > 0 else Decimal(0)
+            realizado = held * preco - order.fee - held * medio
+
+            # A posicao foi zerada: sem base de custo e sem protecao pendente.
+            cost_basis[base] = Decimal(0)
+            protection.pop(base, None)
+            # O cooldown vale para a reentrada: um stop que dispara e o momento
+            # em que menos se quer recomprar no candle seguinte.
+            last_order_at[symbol] = now
+            balances[base] = Decimal(0)
+
+            result.trades.append(
+                PortfolioTrade(
+                    timestamp=now,
+                    symbol=symbol,
+                    strategy="protecao",
+                    side=str(Side.SELL),
+                    quantity=held,
+                    price=preco,
+                    notional=held * preco,
+                    fee=order.fee,
+                    realized_pnl=realizado,
+                    exit_reason=motivo,
+                )
+            )
+            result.trades_per_symbol[symbol] += 1
+            result.exits[motivo] += 1
+        return order_seq
 
     async def _decide_batch(
         self, batch, broker, prices, last_order_at, result, now
@@ -337,8 +452,8 @@ class PortfolioBacktestEngine:
         return aprovados
 
     async def _execute(
-        self, signal, assessment, broker, prices, cost_basis, last_order_at,
-        result, now, order_seq,
+        self, signal, assessment, broker, prices, cost_basis, protection,
+        last_order_at, result, now, order_seq,
     ) -> None:
         base = signal.symbol.partition("/")[0]
         side = Side.BUY if signal.direction is SignalDirection.LONG else Side.SELL
@@ -368,11 +483,24 @@ class PortfolioBacktestEngine:
         held = (await broker.fetch_balances()).get(base, Decimal(0))
         if side is Side.BUY:
             cost_basis[base] = cost_basis.get(base, Decimal(0)) + quantity * fill + order.fee
+            # Os niveis protegem a POSICAO, nao o lote: ao reforcar uma posicao
+            # existente eles sao recalculados sobre o preco medio. Manter o stop
+            # do primeiro lote deixaria a parte nova sem protecao, e criar um
+            # segundo par de niveis exigiria fatiar a posicao na venda -- o que a
+            # exchange nao faz num mercado spot.
+            medio = cost_basis[base] / held if held > 0 else fill
+            protection[base] = (
+                medio * (Decimal(1) - Decimal(str(self.limits.stop_loss_pct))),
+                medio * (Decimal(1) + Decimal(str(self.limits.take_profit_pct))),
+            )
         else:
             previous = held + quantity
             average = (cost_basis.get(base, Decimal(0)) / previous) if previous > 0 else Decimal(0)
             realized = quantity * fill - order.fee - quantity * average
             cost_basis[base] = cost_basis.get(base, Decimal(0)) - quantity * average
+            if held <= 0:
+                protection.pop(base, None)
+            result.exits["estrategia"] += 1
 
         result.trades.append(
             PortfolioTrade(
@@ -386,6 +514,7 @@ class PortfolioBacktestEngine:
                 fee=order.fee,
                 confidence=signal.confidence,
                 realized_pnl=realized,
+                exit_reason="estrategia" if side is Side.SELL else None,
             )
         )
         result.trades_per_symbol[signal.symbol] += 1

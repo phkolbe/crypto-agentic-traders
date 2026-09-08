@@ -52,6 +52,8 @@ class BacktestTrade:
     fee: Decimal
     reason: str
     realized_pnl: Decimal | None = None
+    exit_reason: str | None = None
+    """`stop`, `alvo` ou `estrategia`."""
 
 
 @dataclass
@@ -68,6 +70,8 @@ class BacktestResult:
     signals_generated: int = 0
     signals_rejected: int = 0
     rejection_reasons: Counter = field(default_factory=Counter)
+    exits: Counter = field(default_factory=Counter)
+    """Contagem de saidas por motivo: `stop`, `alvo`, `estrategia`."""
 
     #: Preco no inicio e no fim da janela, base da comparacao buy-and-hold.
     first_price: Decimal | None = None
@@ -202,12 +206,66 @@ class BacktestEngine:
         cost_basis = Decimal(0)
         held = Decimal(0)
         last_order_at: dict[str, datetime] = {}
+        protection: tuple[Decimal, Decimal] | None = None
 
         for index in range(self.strategy.min_candles, len(closed)):
             window = closed[max(0, index + 1 - self.lookback) : index + 1]
             current = window[-1]
             price = current.close
             broker.set_price(base, price)
+
+            # Protecao antes da decisao. As mesmas tres convencoes pessimistas do
+            # motor de carteira: stop vence empate no mesmo candle, gap conta
+            # contra no stop e nao credita no alvo. Ver `portfolio.py`.
+            if protection is not None:
+                held_now = (await broker.fetch_balances()).get(base, Decimal(0))
+                if held_now > 0:
+                    stop, alvo = protection
+                    if current.low <= stop:
+                        motivo, saida = "stop", min(current.open, stop)
+                    elif current.high >= alvo:
+                        motivo, saida = "alvo", alvo
+                    else:
+                        motivo, saida = None, None
+                    if motivo is not None:
+                        exit_order = await broker.place_order(
+                            OrderRequest(
+                                client_order_id=f"bt-{motivo}-{index}",
+                                signal_id=None,
+                                risk_event_id=f"protecao-{index}",
+                                exchange=ExchangeName.PAPER,
+                                symbol=result.symbol,
+                                side=Side.SELL,
+                                order_type=OrderType.LIMIT,
+                                price=saida,
+                                quantity=held_now,
+                                notional=held_now * saida,
+                                strategy=self.strategy.name,
+                            )
+                        )
+                        if exit_order.status is OrderStatus.FILLED:
+                            preco = exit_order.average_price or saida
+                            medio = cost_basis / held_now if held_now > 0 else Decimal(0)
+                            result.trades.append(
+                                BacktestTrade(
+                                    timestamp=current.open_time,
+                                    side=str(Side.SELL),
+                                    quantity=held_now,
+                                    price=preco,
+                                    notional=held_now * preco,
+                                    fee=exit_order.fee,
+                                    reason=f"protecao: {motivo}",
+                                    realized_pnl=(
+                                        held_now * preco - exit_order.fee - held_now * medio
+                                    ),
+                                    exit_reason=motivo,
+                                )
+                            )
+                            result.exits[motivo] += 1
+                            cost_basis = Decimal(0)
+                            held = Decimal(0)
+                            protection = None
+                            last_order_at[result.symbol] = current.open_time
 
             market = MarketFrame.from_candles(window)
             signal = self.strategy.evaluate(market)
@@ -260,6 +318,15 @@ class BacktestEngine:
                         if side is Side.BUY:
                             cost_basis += quantity * fill_price + order_result.fee
                             held += quantity
+                            # Niveis sobre o preco medio: protegem a posicao,
+                            # nao o lote. Ver `portfolio.py`.
+                            medio_compra = cost_basis / held if held > 0 else fill_price
+                            pct_stop = Decimal(str(self.risk.limits.stop_loss_pct))
+                            pct_alvo = Decimal(str(self.risk.limits.take_profit_pct))
+                            protection = (
+                                medio_compra * (Decimal(1) - pct_stop),
+                                medio_compra * (Decimal(1) + pct_alvo),
+                            )
                         else:
                             average_cost = (cost_basis / held) if held > 0 else Decimal(0)
                             realized = (
@@ -267,6 +334,9 @@ class BacktestEngine:
                             )
                             cost_basis -= quantity * average_cost
                             held -= quantity
+                            result.exits["estrategia"] += 1
+                            if held <= 0:
+                                protection = None
 
                         result.trades.append(
                             BacktestTrade(
@@ -278,6 +348,7 @@ class BacktestEngine:
                                 fee=order_result.fee,
                                 reason=signal.reason,
                                 realized_pnl=realized,
+                                exit_reason="estrategia" if side is Side.SELL else None,
                             )
                         )
 
