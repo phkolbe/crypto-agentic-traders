@@ -527,6 +527,49 @@ sobreviveu.
 inteiramente do lado do sistema. Não há trava impedindo o LIVE: a decisão de
 subir com essa limitação é do operador, e este é o registro dela.
 
+### Por que o stop vai para caixa, e não para outro ativo
+
+Pergunta que aparece naturalmente: em vez de vender para BRL, o stop não deveria
+trocar a posição por USDC ou BTC? Medido, e as duas ideias têm respostas
+diferentes.
+
+**Para BTC: não.** O que o BTC/BRL fez depois de cada um dos 160 stops de uma
+janela, comparado com um dia qualquer da mesma série:
+
+| Depois de | BTC após um stop | BTC em dia qualquer |
+|---|---|---|
+| 1 dia | **−0,42%** (negativo em 58%) | +0,06% (49%) |
+| 5 dias | **−0,62%** (57%) | +0,11% (49%) |
+| 10 dias | **−1,42%** (54%) | +0,58% (47%) |
+| 20 dias | +0,24% (49%) | +0,40% (48%) |
+
+Stops disparam quando o mercado cai, e o BTC continua caindo por cerca de dez
+dias com mais frequência do que num dia normal. Trocar para BTC converteria uma
+perda **encerrada** em uma perda que **continua** — mediana de −1,42% adicionais,
+em cima dos 3% do stop.
+
+A razão é estrutural: os 16 pares são todos cripto e caem junto com o BTC. Parar
+a perda em SOL e entrar em BTC encerra a parte específica do SOL e mantém a parte
+de mercado, que é a maior. **Um stop que mantém a exposição que o disparou não é
+um stop.**
+
+**Para USDC: é aposta de câmbio, não medida de risco.** O USDC/BRL é
+descorrelacionado do evento (mediana +0,03% em 5 dias após um stop). Ele não
+ajuda nem prejudica a saída — apenas troca exposição em real por exposição em
+dólar. Na janela com histórico disponível isso teria custado **−4,47%**, porque o
+real se fortaleceu.
+
+**E o mecanismo cobraria caro:** duas operações por saída em vez de uma (~0,6% em
+vez de ~0,3%), quatro pernas por ciclo de saída e reentrada, três dos dezesseis
+ativos sem par direto líquido em USDC — e uma colisão concreta de contabilidade,
+porque USDC guardado seria visto pelo Risk Manager como posição, com preço médio
+e, portanto, com stop próprio: uma oscilação de 3% no câmbio "stoparia" o caixa.
+
+Se em algum momento o objetivo for não ficar em real, o caminho limpo não é o
+swap: é **trocar a moeda de cotação para USDC** e negociar pares em USDC. Aí o
+caixa já é dólar por natureza, sem perna extra, sem taxa a mais e sem colisão. A
+Binance tem 45 pares USDC líquidos, contra 43 em BRL.
+
 ### As três convenções do backtest, todas pessimistas
 
 1. **Stop e alvo no mesmo candle: o stop vence.** O OHLC não diz qual preço veio
