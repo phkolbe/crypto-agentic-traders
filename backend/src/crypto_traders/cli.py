@@ -149,8 +149,15 @@ async def _check(settings) -> int:
         # A whitelist configurada nao vale neste modo: quem a define e a
         # varredura de mercado logo abaixo. Mostrar a lista salva aqui enganaria.
         print("    whitelist         : definida pela descoberta (ver pares abaixo)")
-        print(f"    max posicoes      : {risk.max_open_positions} "
-              f"— principal defesa no modo automatico")
+        if risk.max_open_positions is not None:
+            print(f"    (com a whitelist definida por criterio, o limite de "
+                  f"{risk.max_open_positions} posicoes e a defesa principal)")
+        else:
+            # Sem whitelist aprovada a mao E sem teto de posicoes, as duas defesas
+            # que sobram sao a exposicao por ativo e o stop. Dizer isso e melhor
+            # que imprimir "None" onde antes havia um numero tranquilizador.
+            print("    (sem whitelist aprovada a mao e sem teto de posicoes, as")
+            print("     defesas que restam sao a exposicao por ativo e o stop)")
     else:
         print(f"    whitelist         : {', '.join(risk.symbol_whitelist)}")
 
