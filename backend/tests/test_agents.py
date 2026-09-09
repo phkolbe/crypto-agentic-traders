@@ -55,6 +55,8 @@ def make_snapshot(
     cash: str = "1000",
     btc: str = "0",
     timestamp: datetime | None = None,
+    realized: str = "0",
+    unrealized: str = "0",
 ) -> PortfolioSnapshot:
     positions = [
         Position(exchange=ExchangeName.PAPER, asset="USDT", quantity=Decimal(cash),
@@ -70,6 +72,8 @@ def make_snapshot(
         total_value=Decimal(total),
         cash_value=Decimal(cash),
         positions_value=Decimal(total) - Decimal(cash),
+        realized_pnl=Decimal(realized),
+        unrealized_pnl=Decimal(unrealized),
         positions=positions,
     )
 
@@ -178,10 +182,21 @@ class TestRiskManagerAgent:
 
 
 class TestCircuitBreaker:
-    async def _seed(self, settings, reference: str, when: datetime) -> None:
+    async def _seed(
+        self, settings, reference: str, when: datetime, resultado: str = "0"
+    ) -> None:
+        """Grava o retrato de referencia do periodo.
+
+        `resultado` e o lucro acumulado de negociacao naquele momento -- e ele,
+        nao o patrimonio, que a trava compara. Ver
+        `RiskManagerAgent.check_circuit_breaker`.
+        """
         async with session_scope(settings) as session:
             await PortfolioSnapshotRepository(session).save(
-                make_snapshot(total=reference, cash=reference, timestamp=when), "dry_run"
+                make_snapshot(
+                    total=reference, cash=reference, timestamp=when, realized=resultado
+                ),
+                "dry_run",
             )
 
     async def test_trips_on_daily_loss_beyond_the_limit(self, settings):
@@ -192,8 +207,10 @@ class TestCircuitBreaker:
         now = datetime.now(UTC).replace(hour=12, minute=0, second=0, microsecond=0)
         await self._seed(settings, "1000", now.replace(hour=0, minute=1))
 
-        # Queda de 6%, acima do limite diario de 5%.
-        reason = await agent.check_circuit_breaker(make_snapshot(total="940", timestamp=now))
+        # Prejuizo de 60 sobre capital de 1000 = 6%, acima do limite diario de 5%.
+        reason = await agent.check_circuit_breaker(
+            make_snapshot(total="940", timestamp=now, realized="-60")
+        )
 
         assert reason is not None and "perda diaria" in reason
         assert agent.circuit_breaker_active
@@ -206,7 +223,9 @@ class TestCircuitBreaker:
         now = datetime.now(UTC).replace(hour=12, minute=0, second=0, microsecond=0)
         await self._seed(settings, "1000", now.replace(hour=0, minute=1))
 
-        reason = await agent.check_circuit_breaker(make_snapshot(total="970", timestamp=now))
+        reason = await agent.check_circuit_breaker(
+            make_snapshot(total="970", timestamp=now, realized="-30")
+        )
 
         assert reason is None
         assert not agent.circuit_breaker_active
@@ -219,7 +238,9 @@ class TestCircuitBreaker:
 
         now = datetime.now(UTC).replace(hour=12, minute=0, second=0, microsecond=0)
         await self._seed(settings, "1000", now.replace(hour=0, minute=1))
-        await agent.check_circuit_breaker(make_snapshot(total="900", timestamp=now))
+        await agent.check_circuit_breaker(
+            make_snapshot(total="900", timestamp=now, realized="-100")
+        )
 
         await agent._on_signal(make_signal())
 
@@ -237,7 +258,9 @@ class TestCircuitBreaker:
 
         now = datetime.now(UTC).replace(hour=12, minute=0, second=0, microsecond=0)
         await self._seed(settings, "2000", now.replace(hour=0, minute=1))
-        await agent.check_circuit_breaker(make_snapshot(total="1500", timestamp=now))
+        await agent.check_circuit_breaker(
+            make_snapshot(total="1500", timestamp=now, realized="-500")
+        )
         assert agent.circuit_breaker_active
 
         await agent._on_signal(make_signal(direction=SignalDirection.FLAT))
@@ -255,8 +278,15 @@ class TestCircuitBreaker:
         now = datetime.now(UTC).replace(hour=12, minute=0, second=0, microsecond=0)
         await self._seed(settings, "1000", now.replace(hour=0, minute=1))
 
-        assert await agent.check_circuit_breaker(make_snapshot(total="900", timestamp=now))
-        assert await agent.check_circuit_breaker(make_snapshot(total="800", timestamp=now)) is None
+        assert await agent.check_circuit_breaker(
+            make_snapshot(total="900", timestamp=now, realized="-100")
+        )
+        assert (
+            await agent.check_circuit_breaker(
+                make_snapshot(total="800", timestamp=now, realized="-200")
+            )
+            is None
+        )
 
     async def test_reset_is_manual_and_audited(self, settings):
         bus = InMemoryEventBus()
@@ -265,7 +295,9 @@ class TestCircuitBreaker:
 
         now = datetime.now(UTC).replace(hour=12, minute=0, second=0, microsecond=0)
         await self._seed(settings, "1000", now.replace(hour=0, minute=1))
-        await agent.check_circuit_breaker(make_snapshot(total="900", timestamp=now))
+        await agent.check_circuit_breaker(
+            make_snapshot(total="900", timestamp=now, realized="-100")
+        )
 
         await agent.reset_circuit_breaker(actor="paulinho")
 
@@ -282,7 +314,9 @@ class TestCircuitBreaker:
 
         now = datetime.now(UTC).replace(hour=12, minute=0, second=0, microsecond=0)
         await self._seed(settings, "1000", now.replace(hour=0, minute=1))
-        await agent.check_circuit_breaker(make_snapshot(total="900", timestamp=now))
+        await agent.check_circuit_breaker(
+            make_snapshot(total="900", timestamp=now, realized="-100")
+        )
 
         revived = RiskManagerAgent(InMemoryEventBus(), settings)
         await revived._load_state()
@@ -421,3 +455,109 @@ class TestFullPipeline:
         # A rastreabilidade completa e o ponto: do trade ate o sinal que o causou.
         assert trade.signal_id is not None
         assert trade.strategy == "ma_crossover"
+
+
+class TestCircuitBreakerIgnoresExternalFlows:
+    """Saque e deposito nao sao prejuizo.
+
+    O primeiro ensaio em dry_run disparou a trava em tres minutos com "perda
+    diaria de 85%", porque o saldo simulado passou de 1000 para 150. Nao houve
+    perda -- mudou a referencia. Comparando patrimonio bruto, um SAQUE e
+    indistinguivel de uma catastrofe: tirar R$100 de uma conta de R$150 dispara
+    "perda de 67%" e pausa tudo, culpando um prejuizo que nao existiu.
+    """
+
+    async def _seed(self, settings, total: str, when: datetime, resultado: str = "0") -> None:
+        async with session_scope(settings) as session:
+            await PortfolioSnapshotRepository(session).save(
+                make_snapshot(total=total, cash=total, timestamp=when, realized=resultado),
+                "dry_run",
+            )
+
+    async def _agente(self, settings, autorizado=None):
+        bus = InMemoryEventBus()
+        await bus.start()
+        if autorizado is not None:
+            settings = settings.model_copy(
+                update={
+                    "risk": settings.risk.model_copy(
+                        update={"authorized_capital": Decimal(autorizado)}
+                    )
+                }
+            )
+        return RiskManagerAgent(bus, settings)
+
+    async def test_a_withdrawal_does_not_trip_the_breaker(self, settings):
+        """R$150 viram R$50 por saque, com resultado de negociacao zerado."""
+        agent = await self._agente(settings)
+        now = datetime.now(UTC).replace(hour=12, minute=0, second=0, microsecond=0)
+        await self._seed(settings, "150", now.replace(hour=0, minute=1))
+
+        reason = await agent.check_circuit_breaker(
+            make_snapshot(total="50", cash="50", timestamp=now, realized="0")
+        )
+
+        assert reason is None
+        assert not agent.circuit_breaker_active
+
+    async def test_a_deposit_does_not_trip_the_breaker(self, settings):
+        agent = await self._agente(settings)
+        now = datetime.now(UTC).replace(hour=12, minute=0, second=0, microsecond=0)
+        await self._seed(settings, "150", now.replace(hour=0, minute=1))
+
+        reason = await agent.check_circuit_breaker(
+            make_snapshot(total="650", cash="650", timestamp=now, realized="0")
+        )
+        assert reason is None
+
+    async def test_a_real_loss_still_trips(self, settings):
+        """A correcao nao pode ter desligado a trava."""
+        agent = await self._agente(settings)
+        now = datetime.now(UTC).replace(hour=12, minute=0, second=0, microsecond=0)
+        await self._seed(settings, "1000", now.replace(hour=0, minute=1))
+
+        reason = await agent.check_circuit_breaker(
+            make_snapshot(total="940", timestamp=now, realized="-60")
+        )
+        assert reason is not None
+        assert agent.circuit_breaker_active
+
+    async def test_an_unrealized_loss_also_trips(self, settings):
+        """Posicao aberta afundando conta, mesmo antes de virar prejuizo realizado.
+
+        Esperar a realizacao deixaria a trava cega justamente no cenario que ela
+        existe para pegar: a posicao caindo agora.
+        """
+        agent = await self._agente(settings)
+        now = datetime.now(UTC).replace(hour=12, minute=0, second=0, microsecond=0)
+        await self._seed(settings, "1000", now.replace(hour=0, minute=1))
+
+        reason = await agent.check_circuit_breaker(
+            make_snapshot(total="940", timestamp=now, realized="0", unrealized="-60")
+        )
+        assert reason is not None
+
+    async def test_the_base_is_the_authorized_capital(self, settings):
+        """Com portao em 150 sobre conta de 650, medir contra 650 afrouxaria 4x.
+
+        Prejuizo de R$10 e 6,7% de 150 (dispara) e 1,5% de 650 (nao dispararia).
+        """
+        agent = await self._agente(settings, autorizado="150")
+        now = datetime.now(UTC).replace(hour=12, minute=0, second=0, microsecond=0)
+        await self._seed(settings, "650", now.replace(hour=0, minute=1))
+
+        reason = await agent.check_circuit_breaker(
+            make_snapshot(total="640", cash="640", timestamp=now, realized="-10")
+        )
+        assert reason is not None
+        assert "sobre 150.00" in reason
+
+    async def test_a_gain_never_trips(self, settings):
+        agent = await self._agente(settings)
+        now = datetime.now(UTC).replace(hour=12, minute=0, second=0, microsecond=0)
+        await self._seed(settings, "1000", now.replace(hour=0, minute=1), resultado="-50")
+
+        reason = await agent.check_circuit_breaker(
+            make_snapshot(total="1100", timestamp=now, realized="50")
+        )
+        assert reason is None

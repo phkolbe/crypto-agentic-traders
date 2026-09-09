@@ -430,6 +430,32 @@ class PortfolioSnapshotRepository:
         value = (await self._session.execute(stmt)).scalar_one_or_none()
         return _as_optional_decimal(value)
 
+    async def first_result_since(self, moment: datetime) -> Decimal | None:
+        """Resultado acumulado de NEGOCIACAO no primeiro retrato do periodo.
+
+        `realized_pnl` (acumulado desde sempre) mais `unrealized_pnl` (marcacao a
+        mercado das posicoes abertas). A soma e imune a deposito e saque: dinheiro
+        que entra ou sai da conta nao muda lucro realizado nem nao realizado.
+
+        E por isso que ela substitui o patrimonio bruto no circuit breaker. Ver
+        `RiskManagerAgent.check_circuit_breaker`.
+        """
+        stmt = (
+            select(
+                orm.PortfolioSnapshot.realized_pnl,
+                orm.PortfolioSnapshot.unrealized_pnl,
+            )
+            .where(orm.PortfolioSnapshot.timestamp >= moment)
+            .order_by(orm.PortfolioSnapshot.timestamp.asc())
+            .limit(1)
+        )
+        row = (await self._session.execute(stmt)).first()
+        if row is None:
+            return None
+        realizado = _as_optional_decimal(row[0]) or Decimal(0)
+        nao_realizado = _as_optional_decimal(row[1]) or Decimal(0)
+        return realizado + nao_realizado
+
 
 class AgentRunRepository:
     def __init__(self, session: AsyncSession) -> None:

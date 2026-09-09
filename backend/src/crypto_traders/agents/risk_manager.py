@@ -528,12 +528,25 @@ class RiskManagerAgent(BaseAgent):
     # Circuit breaker
     # ------------------------------------------------------------------
     async def check_circuit_breaker(self, snapshot: PortfolioSnapshot) -> str | None:
-        """Compara o patrimonio atual com o do inicio do dia e da semana.
+        """Dispara a trava quando a NEGOCIACAO perdeu demais no dia ou na semana.
 
         Retorna o motivo se a trava disparou agora, `None` caso contrario.
         Uma vez disparada, permanece ativa ate rearme **manual**: se o sistema
         perdeu dinheiro rapido o bastante para chegar aqui, a causa precisa ser
         entendida por uma pessoa antes de voltar a operar.
+
+        **Mede resultado de negociacao, nao patrimonio bruto**, e a diferenca nao
+        e teorica. Comparando patrimonio, um SAQUE da conta e indistinguivel de
+        uma perda catastrofica: tirar R$100 de uma conta de R$150 dispara "perda
+        diaria de 67%" e pausa tudo, culpando um prejuizo que nao existiu. Foi o
+        que aconteceu no primeiro ensaio em dry_run, quando mudar o saldo
+        simulado de 1000 para 150 disparou "perda de 85%" em tres minutos.
+
+        `realized_pnl` (acumulado) + `unrealized_pnl` nao se mexem com deposito
+        nem com saque -- apenas com o resultado das operacoes. E a base do
+        percentual e o **capital autorizado**, nao o saldo total: com o portao em
+        R$150 sobre uma conta de R$650, medir contra 650 tornaria a trava quatro
+        vezes mais frouxa do que o configurado.
         """
         if self._circuit_breaker_active:
             return None
@@ -544,24 +557,40 @@ class RiskManagerAgent(BaseAgent):
 
         async with session_scope(self._settings) as session:
             repository = PortfolioSnapshotRepository(session)
-            day_reference = await repository.first_value_since(day_start)
-            week_reference = await repository.first_value_since(week_start)
+            day_reference = await repository.first_result_since(day_start)
+            week_reference = await repository.first_result_since(week_start)
+
+        atual = snapshot.realized_pnl + snapshot.unrealized_pnl
+        base = self._capital_em_risco(snapshot)
+        if base <= 0:
+            return None
 
         for label, reference, limit in (
             ("diaria", day_reference, self._limits.daily_loss_limit_pct),
             ("semanal", week_reference, self._limits.weekly_loss_limit_pct),
         ):
-            if reference is None or reference <= 0:
+            if reference is None:
                 continue
-            drop = (reference - snapshot.total_value) / reference
-            if drop >= Decimal(str(limit)):
+            perda = reference - atual
+            if perda <= 0:
+                continue
+            fracao = perda / base
+            if fracao >= Decimal(str(limit)):
                 reason = (
-                    f"perda {label} de {drop:.2%} (limite {limit:.2%}); "
-                    f"referencia {reference:.2f} -> atual {snapshot.total_value:.2f}"
+                    f"perda {label} de {fracao:.2%} do capital (limite {limit:.2%}); "
+                    f"resultado de negociacao {reference:.2f} -> {atual:.2f} "
+                    f"sobre {base:.2f} {self._settings.trading.quote_currency}"
                 )
                 await self._trip(reason)
                 return reason
         return None
+
+    def _capital_em_risco(self, snapshot: PortfolioSnapshot) -> Decimal:
+        """Base do percentual da trava: o que o sistema pode comprometer."""
+        autorizado = self._limits.authorized_capital
+        if autorizado is None:
+            return snapshot.total_value
+        return min(snapshot.total_value, autorizado)
 
     async def _trip(self, reason: str) -> None:
         self._circuit_breaker_active = True

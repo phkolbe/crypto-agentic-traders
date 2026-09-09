@@ -127,6 +127,18 @@ rejeitar:
 | Cooldown por par | *Overtrading* — o mesmo sinal disparando repetidamente |
 | Circuit breaker diário/semanal | Um dia ruim virar um mês ruim |
 
+O circuit breaker mede **resultado de negociação** (`realized_pnl` +
+`unrealized_pnl`), não patrimônio bruto, e a diferença não é teórica: comparando
+patrimônio, um **saque** da conta é indistinguível de uma perda catastrófica —
+tirar R$100 de uma conta de R$150 dispararia "perda diária de 67%" e pausaria
+tudo, culpando um prejuízo que não existiu. O ensaio em `dry_run` encontrou isso
+em três minutos, quando mudar o saldo simulado de 1000 para 150 disparou "perda
+de 85%".
+
+A base do percentual é o **capital autorizado**, não o saldo total: com o portão
+em R$150 sobre uma conta de R$650, medir contra 650 tornaria a trava quatro vezes
+mais frouxa do que o configurado.
+
 **Stop-loss e take-profit são calculados pelo Risk Manager**, não pela
 estratégia. Uma estratégia nova, escrita meses depois, não tem como esquecer de
 definir stop: ela nem participa dessa etapa.
