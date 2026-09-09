@@ -203,6 +203,28 @@ Hoje a execução da proteção existe nos dois motores de backtest
 documentadas na seção 11 de [`SEGURANCA.md`](SEGURANCA.md). Em produção **ainda
 não existe**: `ccxt_adapter.place_order` não envia `stopPrice` nem OCO.
 
+## Quem ganha o caixa quando os sinais competem
+
+`RiskEngine.evaluate_batch` ordena fechamentos primeiro e depois aberturas por
+confiança decrescente. Mas isso **só vale quando existe lote**, e a janela de
+agrupamento (`signal_batch_window_seconds`) está em zero por padrão — medição em
+`SEGURANCA.md` seção 9 não sustentou ligá-la.
+
+Consequência: em produção cada sinal é avaliado sozinho, e com o caixa cabendo em
+~7 posições quem ganha é quem chegou primeiro — a ordem da lista de pares. O
+backtest, que agrupa naturalmente os sinais de um mesmo fechamento de candle,
+ordena por confiança. **Os dois usam critérios diferentes.**
+
+Medido, e imaterial na configuração vigente: cinco critérios de disputa
+(confiança, ordem da lista, ordem inversa, força relativa crescente e
+decrescente) produzem **queda máxima, operações/mês e taxa de acerto idênticas**.
+O conjunto de operações é praticamente o mesmo, porque com 16 operações por mês a
+disputa por caixa quase não acontece.
+
+A ressalva é condicional e importa se a configuração mudar: com timeframe mais
+rápido ou mais estratégias (as três juntas dão 33 operações/mês), a disputa passa
+a ser frequente e alinhar os dois critérios deixa de ser cosmético.
+
 ## Decisões que divergem do plano original
 
 | Plano | Implementado | Motivo |
