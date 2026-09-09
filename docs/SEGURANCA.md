@@ -481,6 +481,59 @@ retorno**, e os `+40%` nunca foram alcançáveis por quem usa stop.
 Só o `ma_crossover` melhorou, e é hoje o único resultado consistente do projeto:
 +4,39%, +2,03% e +4,80% nas três janelas, com quedas de 3,5%, 3,8% e 4,4%.
 
+### Abrir a carteira: o que custa aplicar 100% em vez de 45%
+
+A configuração medida acima usava 3 posições de 15% — no máximo 45% do capital
+aplicado, com 55% sempre em caixa. Com o limite de posições removido (D19), o
+caixa passa a ser o único freio e a carteira enche em 7 posições.
+
+Medido, `ma_crossover` em 1d sobre a janela inteira:
+
+| Posições | Retorno | Queda máxima | Oper/mês | Taxa/mês |
+|---|---|---|---|---|
+| 3 | +6,91% | **7,7%** | 12 | 0,18% |
+| 5 | **+10,80%** | 8,0% | 15 | 0,23% |
+| 7 | +9,84% | 8,9% | 16 | 0,24% |
+| sem limite | +9,84% | 8,9% | 16 | 0,24% |
+
+Duas confirmações mecânicas: "sem limite" dá exatamente o mesmo que 7 posições,
+porque é onde o caixa acaba; e 3 posições com teto de R$25 dá exatamente o mesmo
+que 3 posições sem teto, porque em R$150 os 15% valem R$22,50 e o teto nunca
+chegava a limitar.
+
+**O que as três janelas mostram, e a janela inteira esconde:**
+
+| Janela | 3 posições | Sem limite | Comprar e segurar |
+|---|---|---|---|
+| 1 (2023-12→2024-11) | +4,39% (queda 3,5%) | +3,72% (**6,2%**) | +24,2% |
+| 2 (2024-11→2025-10) | +2,03% (3,8%) | +1,34% (**5,6%**) | −1,8% |
+| 3 (2025-10→2026-09) | +4,80% (4,4%) | **+9,30%** (6,0%) | −20,8% |
+
+Abrir a carteira **aumenta a queda máxima nas três janelas** — de 3,5–4,4% para
+5,6–6,2%, cerca de 50% mais. O retorno melhora em **uma** das três, e o ganho de
++2,9 pp na janela inteira vem inteiro dessa janela.
+
+Ambas as configurações seguem positivas nas três janelas, o que é o resultado
+robusto e vale para as duas. A escolha entre elas é sobre quanto capital ocioso
+se aceita: mais aplicado rendeu mais no agregado, e oscilou mais sempre.
+
+Nota de disciplina: **5 posições foi o melhor número da janela inteira**, com
+retorno maior e queda menor que "sem limite". Não é motivo para configurar 5 — é
+uma janela, e este projeto já registrou duas vezes o custo de escolher parâmetro
+pelo melhor resultado de uma janela (seções 9 e 10). O único efeito consistente
+nas três é que mais posições aumentam a queda.
+
+### As outras estratégias, na configuração vigente
+
+| Estratégia | Retorno | Queda | Acerto |
+|---|---|---|---|
+| ma_crossover | **+9,84%** | 8,9% | 38% |
+| macd_trend | −4,21% | 12,4% | 33% |
+| rsi_reversion | −20,16% | 24,9% | 26% |
+| as três juntas | −15,90% | 24,5% | 33% |
+
+`ma_crossover` isolado continua sendo a única escolha que a medição sustenta.
+
 ### Stop mais apertado foi melhor, não pior
 
 Contraintuitivo e consistente nas três estratégias medidas:
