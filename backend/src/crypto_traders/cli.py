@@ -292,7 +292,7 @@ def _check_protection_scope(settings) -> None:
     print("                 que rompe o stop e volta antes da proxima leitura")
     print("                 passa batida. O backtest, que le a minima do candle,")
     print("                 e nesse ponto MAIS severo que a producao.")
-    print("    ver        : docs/SEGURANCA.md, secao 11")
+    print("    ver        : docs/SEGURANCA.md, secao 12")
 
 
 async def _check_regime_filter(settings) -> None:

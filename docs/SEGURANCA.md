@@ -132,7 +132,7 @@ estratégia. Uma estratégia nova, escrita meses depois, não tem como esquecer 
 definir stop: ela nem participa dessa etapa.
 
 > ⚠️ **Executados pelo sistema, não pela exchange.** O Risk Manager compara os
-> níveis a cada snapshot e fecha a posição — ver seção 11 para o que essa escolha
+> níveis a cada snapshot e fecha a posição — ver seção 12 para o que essa escolha
 > não cobre. Até a descoberta do defeito, este documento afirmava que os níveis
 > eram "anexados a toda posição": eram calculados e nunca comparados com preço
 > nenhum. É o tipo de erro que um leitor não teria como pegar, porque o número
@@ -290,7 +290,7 @@ na fronteira é rejeitada por qualquer variação contrária.
 
 ### Configuração validada para ~R$100 (19 USDT)
 
-Na tela **Risco** (não no `.env` — ver seção 11):
+Na tela **Risco** (não no `.env` — ver seção 12):
 
 | Limite | Valor |
 |---|---|
@@ -367,7 +367,7 @@ de qualidade validada contra resultado — não antes.
 ## 10. Filtro de regime por MVRV Z-Score
 
 > **Todos os números desta seção foram refeitos** depois da descoberta de que o
-> backtest não executava stop-loss. Ver seção 11.
+> backtest não executava stop-loss. Ver seção 12.
 
 **MVRV** = Market Value to Realized Value. O Z-Score normaliza a diferença entre
 a capitalização e o preço médio que o mercado pagou, pelo desvio da
@@ -442,7 +442,80 @@ pior que dado nenhum: o `None` ao menos desliga o filtro de forma visível no lo
 
 ---
 
-## 11. O stop-loss que não existia
+## 11. Três filtros de regime medidos, três desligados
+
+O projeto testou três formas de "não operar quando o mercado está errado". Nenhuma
+sobreviveu ao teste fora da janela. O padrão vale mais que os três resultados
+somados, e está aqui para não ser refeito.
+
+| Filtro | O que prometia | O que a medição deu |
+|---|---|---|
+| Seleção por confiança | escolher o melhor sinal da rajada | pior em 8 de 10 janelas |
+| MVRV Z-Score | não comprar mercado caro | bloqueou **tudo** em 2 de 3 janelas |
+| Fear & Greed | não comprar em euforia (ou em pânico) | ver abaixo |
+
+### Fear & Greed: por que não entrou
+
+O índice (alternative.me, o mesmo que a Binance exibe) tem 3.139 dias de
+histórico, faixa completa de 5 a 95, e move 4,2 pontos por dia — 3,4× mais rápido
+que o MVRV em fração da faixa. Isso o tornava promissor: ao contrário do MVRV, ele
+não ficaria inerte por anos, e a escala 0–100 é absoluta e interpretável.
+
+Testado nas **duas** direções sobre `ma_crossover`, 1d, 998 dias (base sem filtro:
++9,84%):
+
+| Limiar | Não compre na ganância | Não compre no medo |
+|---|---|---|
+| percentil 90 | +9,89% | +6,80% |
+| **percentil 80** | **+13,40%** | **+15,45%** |
+| percentil 70 | +2,69% | +11,81% |
+| percentil 60 | +8,91% | +5,03% |
+| percentil 50 | +1,64% | +7,61% |
+| percentil 40 | +3,99% | +0,32% |
+| percentil 30 | −1,74% | +6,53% |
+
+**Duas coisas condenam o resultado, e nenhuma delas é o valor de um número.**
+
+**Primeiro: as duas regras opostas "funcionam" no mesmo limiar.** "Não compre
+quando há ganância" dá +13,40% e "não compre quando há medo" dá +15,45%, ambas no
+percentil 80. Regras contraditórias não podem estar capturando o mesmo efeito
+real. O que variou foi *quais* operações específicas saíram — por sorte, não por
+regime.
+
+**Segundo: a resposta não é monótona.** Apertando o filtro: +9,89%, +13,40%,
++2,69%, +8,91%, +1,64%, +3,99%, −1,74%. Um efeito de regime seria aproximadamente
+monótono — protegeria progressivamente mais, custando progressivamente mais
+retorno. Este pula 12 pontos percentuais sem padrão.
+
+E o teste fora da janela fecha:
+
+| Configuração | Janela 1 | Janela 2 | Janela 3 | Soma |
+|---|---|---|---|---|
+| Sem filtro | +3,72% | +1,34% | +9,30% | 14,36% |
+| Não compre na ganância (>73) | +1,43% | +1,83% | +10,34% | 13,60% |
+| Não compre no medo (<30) | **+3,72%** | **+1,34%** | +12,65% | 17,70% |
+
+"Não compre no medo" é **idêntico à base nas janelas 1 e 2** — o filtro nunca
+disparou. Todo o ganho aparente vem da janela 3. É o mesmo desenho do MVRV: parece
+melhorar no agregado porque agiu uma vez, e não agiu nas outras duas.
+
+Uma ressalva honesta: na janela 3 (mercado caindo 20,8%) esse filtro cortou a
+queda de 6,0% para 3,0% e metade das operações. Pode ser proteção real em mercado
+de baixa — mas com uma única janela de baixa não há como distinguir isso de ter
+bloqueado as operações certas por acaso. Testar essa hipótese exigiria mais
+períodos de baixa do que a série disponível oferece.
+
+### O que o padrão sugere
+
+Três indicadores, três direções, sempre o mesmo desfecho: o filtro melhora a
+janela onde foi escolhido e não replica. O que **de fato** reduziu queda de forma
+consistente nas três janelas foi o stop-loss — que não é filtro de regime, é
+limite por operação. Vale registrar para a próxima vez que um índice novo
+parecer promissor.
+
+---
+
+## 12. O stop-loss que não existia
 
 Durante todo o desenvolvimento, `stop_loss` e `take_profit` foram calculados pelo
 Risk Manager, gravados na ordem, persistidos no banco e expostos na API — e
@@ -520,7 +593,7 @@ se aceita: mais aplicado rendeu mais no agregado, e oscilou mais sempre.
 Nota de disciplina: **5 posições foi o melhor número da janela inteira**, com
 retorno maior e queda menor que "sem limite". Não é motivo para configurar 5 — é
 uma janela, e este projeto já registrou duas vezes o custo de escolher parâmetro
-pelo melhor resultado de uma janela (seções 9 e 10). O único efeito consistente
+pelo melhor resultado de uma janela (seção 11). O único efeito consistente
 nas três é que mais posições aumentam a queda.
 
 ### As outras estratégias, na configuração vigente
@@ -640,7 +713,7 @@ que a exchange não faz em spot.
 
 ---
 
-## 12. O portão de capital: auto-ajuste com aval humano
+## 13. O portão de capital: auto-ajuste com aval humano
 
 O sistema acompanha o saldo sozinho, e não usa saldo que ninguém autorizou. As
 duas coisas ao mesmo tempo, porque resolvem problemas opostos.
@@ -715,7 +788,7 @@ com o valor parado e um botão para liberar.
 
 ---
 
-## 13. Ambiente e negócio: a fronteira, e por que ela é rígida
+## 14. Ambiente e negócio: a fronteira, e por que ela é rígida
 
 O `.env` descreve **a instalação**. O banco guarda **o que negociar e com quanto
 risco**. Nenhuma variável mora nos dois lugares, e escrever uma variável de
@@ -784,7 +857,7 @@ acabou de criá-la com os padrões de fábrica.
 
 ---
 
-## 14. Antes de ligar o LIVE
+## 15. Antes de ligar o LIVE
 
 > ⚠️ **Leia a seção 11 antes.** O stop-loss existe em software, no Risk Manager,
 > e **não** na exchange. Ele não age se o processo morrer, se a máquina
