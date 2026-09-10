@@ -2,7 +2,8 @@ import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useState } from 'react'
 
 import { ApiError, api } from '../api/client'
-import { Card } from '../components/Shared'
+import { money, multiplyDecimal, quoteOf } from '../api/format'
+import { Card, useQuoteCurrency } from '../components/Shared'
 
 /** `datetime-local` espera o horario LOCAL sem timezone; ISO com Z apareceria deslocado. */
 function nowForInput(): string {
@@ -11,6 +12,14 @@ function nowForInput(): string {
   return now.toISOString().slice(0, 16)
 }
 
+/**
+ * Formulario vazio.
+ *
+ * `fee_currency` NAO tem valor de fabrica: era `'USDT'`, e depois da migracao
+ * para USDC todo lancamento manual salvo sem tocar no campo gravava a moeda
+ * errada no historico. O padrao passa a ser a moeda de cotacao vigente,
+ * resolvida em tempo de renderizacao.
+ */
 const EMPTY = {
   executed_at: nowForInput(),
   exchange: 'binance',
@@ -19,12 +28,13 @@ const EMPTY = {
   quantity: '',
   price: '',
   fee: '',
-  fee_currency: 'USDT',
+  fee_currency: '',
   notes: '',
 }
 
 export default function ManualTrade() {
   const queryClient = useQueryClient()
+  const moeda = useQuoteCurrency()
   const [form, setForm] = useState(EMPTY)
   const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null)
 
@@ -58,13 +68,26 @@ export default function ManualTrade() {
       quantity: form.quantity,
       price: form.price,
       fee: form.fee || '0',
-      fee_currency: form.fee_currency || null,
+      fee_currency: form.fee_currency || moedaDoPar || null,
       notes: form.notes || null,
     })
   }
 
+  /**
+   * Total da operacao, calculado sem float (D7).
+   *
+   * Era `Number(quantity) * Number(price)`. Com 0,07 x 1,1 o float devolve
+   * 0.07700000000000001, e este total e conferido pelo operador contra o que
+   * ele viu na exchange: um residuo aqui e uma divergencia que ninguem
+   * consegue explicar. `multiplyDecimal` multiplica os digitos em `BigInt`, e
+   * devolve `null` quando o campo ainda nao e um decimal valido.
+   */
   const total =
-    form.quantity && form.price ? Number(form.quantity) * Number(form.price) : null
+    form.quantity && form.price ? multiplyDecimal(form.quantity, form.price) : null
+  // Lancamento manual pode ser de um par que o sistema nao negocia mais: a
+  // unidade do total vem do par digitado, com a moeda configurada so como
+  // ultimo recurso.
+  const moedaDoPar = quoteOf(form.symbol) || moeda
 
   return (
     <>
@@ -107,7 +130,7 @@ export default function ManualTrade() {
                 <input
                   value={form.symbol}
                   onChange={(e) => update('symbol')(e.target.value.toUpperCase())}
-                  placeholder="BTC/USDT"
+                  placeholder={moeda ? `BTC/${moeda}` : ''}
                   pattern="[A-Z0-9]{2,12}/[A-Z0-9]{2,12}"
                   required
                 />
@@ -166,8 +189,11 @@ export default function ManualTrade() {
                 <input
                   value={form.fee_currency}
                   onChange={(e) => update('fee_currency')(e.target.value.toUpperCase())}
-                  placeholder="USDT"
+                  placeholder={moedaDoPar}
                 />
+                <span className="hint">
+                  Vazio usa a cotação do par{moedaDoPar ? ` (${moedaDoPar})` : ''}.
+                </span>
               </div>
             </div>
 
@@ -182,12 +208,10 @@ export default function ManualTrade() {
               />
             </div>
 
-            {total !== null && Number.isFinite(total) && (
+            {total !== null && (
               <div className="muted" style={{ fontSize: 13 }}>
                 Valor total da operação:{' '}
-                <strong className="num">
-                  {total.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                </strong>
+                <strong className="num">{money(total, moedaDoPar)}</strong>
               </div>
             )}
 

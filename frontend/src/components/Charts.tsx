@@ -16,6 +16,8 @@
 
 import { useEffect, useRef, useState } from 'react'
 
+import { rotuladorDeSerie } from '../api/format'
+
 /** Ponto de uma série temporal. `time` é ISO-8601; `value` já em unidades reais. */
 export type SeriesPoint = { time: string; value: number }
 
@@ -100,7 +102,7 @@ function monotonePath(xs: number[], ys: number[]): string {
  * baixo dá 20 — nove marcações onde caberiam quatro, e num gráfico de 110 px de
  * altura elas saíam empilhadas ("1160 1150 1140 1130...").
  */
-function niceTicks(min: number, max: number, alvo = 4): number[] {
+export function niceTicks(min: number, max: number, alvo = 4): number[] {
   if (!Number.isFinite(min) || !Number.isFinite(max) || max <= min) return [min]
   const passoBruto = (max - min) / Math.max(1, alvo)
   const magnitude = 10 ** Math.floor(Math.log10(passoBruto))
@@ -116,51 +118,207 @@ function niceTicks(min: number, max: number, alvo = 4): number[] {
   return ticks.length > 0 ? ticks : [min]
 }
 
+/**
+ * Casas decimais necessárias para dois ticks vizinhos não virarem o mesmo texto.
+ *
+ * O padrão anterior era `toFixed(0)`, e ele é correto exatamente enquanto o
+ * patrimônio é grande. Com os 29,29 USDC de hoje e a carteira toda em caixa, a
+ * série é constante, o passo calculado é 0,2 e os três rótulos do eixo saem
+ * "29", "29", "29" — um eixo que não mede nada. O número de casas tem que vir
+ * do PASSO, não de um palpite sobre a ordem de grandeza dos valores.
+ */
+export function casasParaPasso(passo: number): number {
+  if (!Number.isFinite(passo) || passo <= 0) return 2
+  // Uma casa a mais que a primeira significativa do passo cobre 0,2 -> "29,2"
+  // sem inflar 200 -> "200,0".
+  const casas = Math.ceil(-Math.log10(passo))
+  return Math.min(8, Math.max(0, casas))
+}
+
 /** Altura mínima confortável para um rótulo de eixo, em pixels. */
 const ALTURA_POR_ROTULO = 30
 
 /** Largura aproximada de um rótulo de 11px, em pixels. */
 const LARGURA_POR_CARACTERE = 6.1
 
+/** Folga horizontal mínima entre duas caixas de rótulo vizinhas, em pixels. */
+const FOLGA_ENTRE_ROTULOS = 12
+
 /**
- * Índices do eixo X que cabem sem os rótulos se encavalarem.
+ * Espaço que um rótulo pede à sua volta, medido em pixels de tick a tick.
  *
- * O espaçamento mínimo pedido é um piso, não a regra: quem manda é a largura do
- * **rótulo mais largo**. Ignorar isso foi o primeiro erro visível desta
- * substituição — com 500 pontos e datas como "08 de set.", um `minTickGap` de 50
- * px deixava os rótulos a 50 px de distância e 55 px de largura, e o eixo saía
- * como "08 de set.10 de set.".
+ * A conta anterior era `maisLargo + 14`, e ela vale só para rótulo **centrado**:
+ * duas caixas centradas nos ticks deixam `passo − largura` de folga. Mas o
+ * primeiro tick usa `text-anchor="start"` e o último `"end"`, e essas caixas
+ * ficam inteiras de um lado do tick — a folga contra o vizinho centrado cai para
+ * `passo − 1,5 × largura`. Medido com `getBBox` no backtest antes do conserto:
+ * folgas `[8,9  22,9  22,9 …]`, o primeiro par com um terço da folga dos demais;
+ * no dashboard, com "07/09 09/09", a folga real era **6,9 px** e os dois rótulos
+ * liam como um borrão.
  *
- * A largura é estimada por contagem de caracteres em vez de medida no DOM: medir
- * exigiria renderizar para depois decidir o que renderizar, e o erro de uma fonte
- * proporcional é absorvido pela folga.
+ * Reservar `1,5 × largura` cobre os três arranjos possíveis (start→middle,
+ * middle→middle, middle→end) com a mesma folga mínima.
  */
-function tickIndices(rotulos: string[], largura: number, gapMinimo: number): number[] {
+function espacoPorRotulo(maisLargo: number): number {
+  return maisLargo * 1.5 + FOLGA_ENTRE_ROTULOS
+}
+
+const MINUTO_MS = 60 * 1000
+const HORA_MS = 60 * MINUTO_MS
+const DIA_MS = 24 * HORA_MS
+
+/**
+ * Passos de tempo que um humano lê como redondos.
+ *
+ * Um eixo de tempo tem que andar em unidades de tempo, não no que sobrar da
+ * divisão. Sem isto, uma grade perfeitamente uniforme em pixels sai
+ * `03/08 05/08 08/08 11/08 13/08` — passo real constante de 60 horas, que
+ * arredondado para dia alterna 2 e 3 e se lê como escala irregular. Snapando o
+ * passo para 3 dias, os rótulos andam de 3 em 3.
+ */
+const PASSOS_DE_TEMPO = [
+  MINUTO_MS,
+  2 * MINUTO_MS,
+  5 * MINUTO_MS,
+  10 * MINUTO_MS,
+  15 * MINUTO_MS,
+  30 * MINUTO_MS,
+  HORA_MS,
+  2 * HORA_MS,
+  3 * HORA_MS,
+  6 * HORA_MS,
+  12 * HORA_MS,
+  DIA_MS,
+  2 * DIA_MS,
+  3 * DIA_MS,
+  7 * DIA_MS,
+  14 * DIA_MS,
+  30 * DIA_MS,
+  90 * DIA_MS,
+  180 * DIA_MS,
+  365 * DIA_MS,
+]
+
+/**
+ * Amostragem típica da série: a MEDIANA dos intervalos, não a média.
+ *
+ * A média é enganada pelos dois desvios que a série real de patrimônio tem: o
+ * Portfolio Agent grava dois pontos a milissegundos de distância quando o
+ * sistema sobe, e há buracos de horas entre uma execução e a seguinte. Medido na
+ * série de hoje, a média dava ~205 s onde a cadência de verdade é 60 s. A
+ * mediana ignora os dois extremos e acerta a cadência.
+ */
+export function amostragemTipica(instantes: number[]): number {
+  const todas: number[] = []
+  for (let i = 1; i < instantes.length; i += 1) {
+    const d = instantes[i]! - instantes[i - 1]!
+    if (Number.isFinite(d) && d > 0) todas.push(d)
+  }
+  // Intervalo abaixo de um segundo é retrato duplicado (o agente grava um ponto
+  // ao subir e outro no primeiro tique do laço), não cadência. Deixá-los na
+  // conta puxava a mediana para 30 s numa série gravada de minuto em minuto, e
+  // o eixo perdia metade das marcações. Se TUDO for sub-segundo, aí é a
+  // cadência de verdade e vale.
+  const cadencia = todas.filter((d) => d >= 1000)
+  const amostras = cadencia.length > 0 ? cadencia : todas
+  if (amostras.length === 0) return 0
+  amostras.sort((a, b) => a - b)
+  const meio = Math.floor(amostras.length / 2)
+  return amostras.length % 2 === 1
+    ? amostras[meio]!
+    : (amostras[meio - 1]! + amostras[meio]!) / 2
+}
+
+/**
+ * Passos de índice que caem em passos de tempo redondos, do menor aceitável
+ * para cima.
+ *
+ * O eixo é indexado por AMOSTRA, não por instante — é o que mantém o passo em
+ * pixels constante. Converter o passo de tempo pela cadência da série é o que
+ * aproxima os dois: para série regular (um candle por hora no backtest) fica
+ * exato, e para série com buracos fica no melhor possível sem furar a grade.
+ */
+export function passosTemporais(
+  passoMinimo: number,
+  instantes: number[],
+  maximoIndice: number,
+): number[] {
+  const n = instantes.length
+  if (n < 2) return []
+  const porIndice = amostragemTipica(instantes)
+  if (!(porIndice > 0)) return []
+
+  const passos: number[] = []
+  for (const candidato of PASSOS_DE_TEMPO) {
+    const passo = Math.round(candidato / porIndice)
+    if (passo < passoMinimo || passo > maximoIndice) continue
+    if (passos[passos.length - 1] !== passo) passos.push(passo)
+  }
+  return passos
+}
+
+/**
+ * Índices do eixo X: grade de passo CONSTANTE, ancorada no último ponto.
+ *
+ * Duas coisas que a versão anterior errava, as duas medidas no navegador:
+ *
+ * 1. **Colapso.** Ela montava a grade e depois removia os índices cujo rótulo
+ *    repetia o vizinho. Com a série real de hoje (404 pontos dentro de um dia,
+ *    rótulos "dd/mm" todos iguais) a remoção comia o eixo inteiro e sobrava
+ *    **um** rótulo, encostado na borda direita — um gráfico sem eixo de tempo.
+ *    Aqui o desempate é no PASSO: ele cresce até os rótulos da grade serem
+ *    distintos, em vez de furar a grade. (A causa raiz do rótulo repetido é a
+ *    granularidade, resolvida em `rotuladorDeSerie`; isto é a rede de proteção.)
+ *
+ * 2. **Passo irregular.** Remover um índice deixava os sobreviventes nas
+ *    posições originais, e o eixo saía `18/08, 19/08, 21/08` — um salto de 1 dia
+ *    no meio de um ritmo de 2 dias. Eixo de tempo com passo irregular mente
+ *    sobre a escala. Ancorar no fim e caminhar para trás com passo fixo dá uma
+ *    grade uniforme e mantém o último ponto rotulado, que é o que ancora a
+ *    leitura ("até quando vai a série").
+ *
+ * A largura do rótulo é estimada por contagem de caracteres em vez de medida no
+ * DOM: medir exigiria renderizar para depois decidir o que renderizar, e o erro
+ * de uma fonte proporcional é absorvido pela folga.
+ */
+export function tickIndices(
+  rotulos: string[],
+  largura: number,
+  gapMinimo: number,
+  instantes?: number[],
+): number[] {
   const total = rotulos.length
   if (total === 0) return []
   if (total === 1) return [0]
 
   const maisLargo = Math.max(...rotulos.map((r) => r.length)) * LARGURA_POR_CARACTERE
-  const gap = Math.max(gapMinimo, maisLargo + 14)
+  const gap = Math.max(gapMinimo, espacoPorRotulo(maisLargo))
   const maximo = Math.max(1, Math.floor(largura / gap))
-  const passo = Math.max(1, Math.ceil((total - 1) / maximo))
+  const passoInicial = Math.max(1, Math.ceil((total - 1) / maximo))
 
-  const indices: number[] = []
-  for (let i = 0; i < total; i += passo) indices.push(i)
-
-  // O último ponto ancora a leitura ("até quando vai a série"), então entra
-  // sempre. Se o rótulo anterior ficaria colado nele, esse anterior sai.
-  //
-  // O critério é em PIXELS, não em passos: o resto da divisão faz a distância
-  // até o último ponto ser qualquer coisa entre um passo e zero, e medir isso em
-  // "meio passo" ainda deixava "27 de set." grudado em "29 de set.".
-  const ultimo = total - 1
-  if (indices[indices.length - 1] !== ultimo) {
-    const distanciaEmPixels = ((ultimo - indices[indices.length - 1]!) / (total - 1)) * largura
-    if (distanciaEmPixels < gap) indices.pop()
-    indices.push(ultimo)
+  const grade = (passo: number): number[] => {
+    const indices: number[] = []
+    for (let i = total - 1; i >= 0; i -= passo) indices.push(i)
+    return indices.reverse()
   }
-  return indices
+  const rotulosDistintos = (indices: number[]): boolean =>
+    indices.every((indice, i) => i === 0 || rotulos[indice] !== rotulos[indices[i - 1]!])
+
+  // Passos redondos de tempo primeiro; só se nenhum deles separar os textos é
+  // que se aceita um passo qualquer (que ainda é uniforme, só não é redondo).
+  const candidatos = instantes ? passosTemporais(passoInicial, instantes, total - 1) : []
+  for (let passo = passoInicial; passo <= total - 1; passo += 1) candidatos.push(passo)
+
+  for (const passo of candidatos) {
+    const indices = grade(passo)
+    if (indices.length < 2) continue
+    if (rotulosDistintos(indices)) return indices
+  }
+
+  // Nenhum passo separa os textos: a série inteira cai no mesmo rótulo (dois
+  // pontos no mesmo instante, por exemplo). Duas marcações com o mesmo texto
+  // não medem nada, então sobra a que ancora o fim da série.
+  return [total - 1]
 }
 
 /** Largura disponível do container, observada de verdade (sem polling). */
@@ -193,8 +351,7 @@ export function TimeSeriesChart({
   data,
   height = 260,
   fill = false,
-  formatX,
-  formatY = (v) => v.toFixed(0),
+  formatY,
   formatValue,
   valueLabel,
   minTickGap = 40,
@@ -203,7 +360,7 @@ export function TimeSeriesChart({
   height?: number
   /** Preenche a área sob a curva com um gradiente. */
   fill?: boolean
-  formatX: (time: string) => string
+  /** Omitido: as casas decimais saem do passo do eixo (ver `casasParaPasso`). */
   formatY?: (value: number) => string
   formatValue: (value: number) => string
   valueLabel: string
@@ -245,11 +402,26 @@ export function TimeSeriesChart({
   const gradiente = `equity-${fill ? 'area' : 'line'}`
 
   const ticksY = niceTicks(min, max, Math.min(5, Math.max(2, Math.floor(plotH / ALTURA_POR_ROTULO))))
-  const ticksX = tickIndices(
-    data.map((p) => formatX(p.time)),
-    plotW,
-    minTickGap,
-  )
+  // O passo real do eixo, não o intervalo dos dados, é o que decide as casas.
+  const passoY = ticksY.length > 1 ? Math.abs(ticksY[1]! - ticksY[0]!) : Math.abs(max - min)
+  const casasY = casasParaPasso(passoY)
+  const rotularY =
+    formatY ??
+    ((valor: number) =>
+      // Separador decimal em pt-BR, igual ao resto da tela: um eixo com "29.2"
+      // ao lado de um card com "29,29" parece dado de outra origem.
+      valor.toLocaleString('pt-BR', {
+        minimumFractionDigits: casasY,
+        maximumFractionDigits: casasY,
+      }))
+  // A granularidade do eixo X sai do INTERVALO REAL da série, não de uma faixa
+  // escolhida em outro lugar da tela. Não existe mais prop `formatX`: enquanto
+  // ela existia, o dashboard passava "dd/mm" para uma série de seis horas
+  // porque o botão de faixa estava em 30d, e o eixo colapsava para um rótulo.
+  const rotularX = rotuladorDeSerie(data.map((p) => p.time))
+  const rotulosX = data.map((p) => rotularX(p.time))
+  const instantes = data.map((p) => Date.parse(p.time))
+  const ticksX = tickIndices(rotulosX, plotW, minTickGap, instantes)
 
   const aoMover = (evento: React.MouseEvent<SVGSVGElement>) => {
     const caixa = evento.currentTarget.getBoundingClientRect()
@@ -280,6 +452,23 @@ export function TimeSeriesChart({
           </defs>
         )}
 
+        {/* Linhas de grade horizontais: dão ao olho uma régua para comparar dois
+            instantes distantes da série sem seguir a curva com o dedo. É o que
+            todo terminal de mercado desenha, e o custo aqui é um <line>. */}
+        {ticksY.map((valor) => (
+          <line
+            key={`grade-${valor}`}
+            x1={margem.left}
+            x2={margem.left + plotW}
+            y1={escalaY(valor)}
+            y2={escalaY(valor)}
+            stroke="var(--border)"
+            strokeWidth={1}
+            opacity={0.55}
+            shapeRendering="crispEdges"
+          />
+        ))}
+
         {ticksY.map((valor) => (
           <text
             key={valor}
@@ -290,8 +479,24 @@ export function TimeSeriesChart({
             fontSize={11}
             fill={AXIS}
           >
-            {formatY(valor)}
+            {rotularY(valor)}
           </text>
+        ))}
+
+        {/* Grade vertical nas mesmas marcações do eixo X: é o que permite ler
+            "quanto valia às 21h" sem descer o dedo da curva até o rótulo. */}
+        {ticksX.map((i) => (
+          <line
+            key={`grade-x-${i}`}
+            x1={escalaX(i)}
+            x2={escalaX(i)}
+            y1={margem.top}
+            y2={margem.top + plotH}
+            stroke="var(--border)"
+            strokeWidth={1}
+            opacity={0.4}
+            shapeRendering="crispEdges"
+          />
         ))}
 
         {ticksX.map((i) => (
@@ -303,7 +508,7 @@ export function TimeSeriesChart({
             fontSize={11}
             fill={AXIS}
           >
-            {formatX(data[i]!.time)}
+            {rotulosX[i]}
           </text>
         ))}
 
@@ -369,6 +574,31 @@ export function TimeSeriesChart({
 // -------------------------------------------------------------------------
 
 export type DonutSlice = { label: string; value: number; color: string }
+
+/**
+ * Barra de composição: a alternativa honesta ao donut de fatia única.
+ *
+ * Um anel de 180 px de lado para informar "100,00%" gasta um quarto da largura
+ * do card e não diz nada que o número ao lado já não diga — e é exatamente o que
+ * a tela mostra no estado real de hoje, com o patrimônio todo em caixa. Uma
+ * barra cheia comunica a mesma coisa em 8 px de altura e deixa o resto do card
+ * para o que varia.
+ */
+export function CompositionBar({ data }: { data: DonutSlice[] }) {
+  const total = data.reduce((soma, s) => soma + s.value, 0)
+  if (data.length === 0 || total <= 0) return null
+  return (
+    <div className="composition-bar">
+      {data.map((slice) => (
+        <span
+          key={slice.label}
+          title={slice.label}
+          style={{ background: slice.color, width: `${(slice.value / total) * 100}%` }}
+        />
+      ))}
+    </div>
+  )
+}
 
 /** Ponto na circunferência. Ângulo em radianos, medido a partir do topo. */
 function naBorda(cx: number, cy: number, raio: number, angulo: number) {

@@ -8,7 +8,14 @@
 
   --text: #e6edf3;
   --text-muted: #8b949e;
-  --text-faint: #6e7681;
+  /* Texto terciario: rotulo de eixo, cabecalho de tabela, estado vazio.
+     Era #6e7681, e MEDIDO no navegador com composicao alpha correta dava 3,77:1
+     sobre o fundo do cartao — abaixo do 4,5 que a WCAG AA pede para texto menor
+     que 18px, e a frase do estado vazio (13px) e justamente a que o dono vai ler
+     por dias. #868f9b da 5,29:1 sobre o cartao e 4,94:1 sobre o fundo sutil.
+     Os numeros estao provados no `npm run check`, que le estas variaveis daqui
+     e recalcula a razao — reverter este valor derruba a verificacao. */
+  --text-faint: #868f9b;
 
   --accent: #58a6ff;
   --positive: #3fb950;
@@ -35,11 +42,20 @@
     --border-strong: #b9c0c8;
     --text: #1f2328;
     --text-muted: #59636e;
-    --text-faint: #818b98;
+    /* Era #818b98: 3,45:1 sobre o cartao branco e 3,04:1 sobre o fundo azulado
+       da faixa de modo — as duas piores medidas da paleta. #656d76 da 5,25:1 e
+       4,60:1 nos mesmos lugares. */
+    --text-faint: #656d76;
     --accent: #0969da;
-    --positive: #1a7f37;
-    --negative: #cf222e;
-    --warning: #9a6700;
+    /* Estas duas cores tambem sao texto de 11px dentro de etiquetas com fundo
+       tingido. Medido: #1a7f37 sobre o verde da etiqueta dava 4,48:1 e #9a6700
+       sobre o ambar dava 4,25:1 — os dois abaixo de AA por pouco, e "por pouco"
+       nao e uma categoria. */
+    --positive: #116329;
+    /* #cf222e media 4,40:1 sobre o fundo tinto da faixa de modo — e essa faixa,
+       em vermelho, e a que anuncia dinheiro real. #c31c26 da 4,88:1. */
+    --negative: #c31c26;
+    --warning: #7a5200;
     --shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
     color-scheme: light;
   }
@@ -112,12 +128,20 @@ a:hover { text-decoration: underline; }
 }
 .nav-link:hover { background: var(--bg-subtle); color: var(--text); text-decoration: none; }
 .nav-link.active { background: var(--bg-subtle); color: var(--text); }
-.nav-icon { width: 16px; text-align: center; opacity: 0.85; }
+.nav-icon { width: 17px; height: 17px; flex-shrink: 0; opacity: 0.9; }
+.nav-link.active .nav-icon { opacity: 1; color: var(--accent); }
 
 .main {
   padding: 22px 26px 60px;
   max-width: 1360px;
   width: 100%;
+  /* Item de grid tem tamanho minimo automatico igual ao min-content do conteudo,
+     e `overflow-x: auto` na tabela nao o zera atraves de tres niveis de caixa.
+     Sem este `min-width: 0`, a tabela de decisoes do Risk Manager empurrava a
+     COLUNA inteira: medido em 420 px de viewport, `scrollWidth` 443 contra
+     `clientWidth` 420 — 23 px de rolagem horizontal na pagina toda, com a barra
+     de navegacao saindo pela direita. */
+  min-width: 0;
 }
 
 .page-header {
@@ -148,6 +172,9 @@ a:hover { text-decoration: underline; }
 }
 
 .grid { display: grid; gap: 14px; }
+/* Mesma razao do `min-width: 0` no `.main`: um cartao com tabela larga nao pode
+   esticar a coluna do grid. */
+.grid > * { min-width: 0; }
 .grid-4 { grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); }
 .grid-2 { grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); }
 
@@ -165,6 +192,8 @@ a:hover { text-decoration: underline; }
 .faint { color: var(--text-faint); }
 .mono { font-family: var(--mono); font-size: 12px; }
 .num { font-variant-numeric: tabular-nums; }
+/* Unidade ao lado de um numero: presente, sem competir com o numero. */
+.unit { color: var(--text-muted); font-size: 11px; }
 
 /* Etiquetas --------------------------------------------------------------- */
 .badge {
@@ -180,7 +209,10 @@ a:hover { text-decoration: underline; }
 }
 .badge-neutral { background: var(--bg-subtle); color: var(--text-muted); border-color: var(--border); }
 .badge-positive { background: rgba(63, 185, 80, 0.14); color: var(--positive); border-color: rgba(63, 185, 80, 0.3); }
-.badge-negative { background: rgba(248, 81, 73, 0.14); color: var(--negative); border-color: rgba(248, 81, 73, 0.3); }
+/* Alpha 0.10 e nao 0.14: no tema escuro, #f85149 sobre o tinto a 0,14 media
+   4,39:1 — abaixo de AA para 11px. Escurecer o fundo em vez de clarear o texto
+   mantem a cor do PnL negativo identica em todos os lugares. Da 4,67:1. */
+.badge-negative { background: rgba(248, 81, 73, 0.1); color: var(--negative); border-color: rgba(248, 81, 73, 0.3); }
 .badge-warning { background: rgba(210, 153, 34, 0.16); color: var(--warning); border-color: rgba(210, 153, 34, 0.32); }
 .badge-accent { background: rgba(88, 166, 255, 0.14); color: var(--accent); border-color: rgba(88, 166, 255, 0.3); }
 
@@ -265,10 +297,33 @@ a:hover { text-decoration: underline; }
   box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
 }
 .chart-tooltip-label {
-  color: var(--text-faint);
+  color: var(--text-muted);
   font-size: 11px;
   margin-bottom: 2px;
 }
+
+/* Nota de rodape do grafico: o que a curva NAO mostra (serie cortada na troca
+   de moeda, unidade nao afirmada). Fica colada no grafico de proposito — a
+   ressalva tem que estar onde o numero e lido. */
+.chart-note {
+  margin-top: 10px;
+  padding-top: 9px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+.chart-note strong { color: var(--text); font-weight: 600; }
+
+/* Barra de composicao: substitui o donut quando ha um unico ativo. */
+.composition-bar {
+  display: flex;
+  height: 8px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: var(--bg-subtle);
+}
+.composition-bar span { display: block; height: 100%; }
 
 /* Tabelas ----------------------------------------------------------------- */
 .table-wrap { overflow-x: auto; }
@@ -301,9 +356,71 @@ td.right, th.right { text-align: right; font-variant-numeric: tabular-nums; }
 .empty {
   padding: 34px 16px;
   text-align: center;
-  color: var(--text-faint);
+  color: var(--text-muted);
   font-size: 13px;
+  line-height: 1.6;
 }
+
+/* Estado vazio "grande": o de uma tela inteira, nao o de um cartao. */
+.empty-title { font-size: 15px; font-weight: 600; letter-spacing: -0.01em; }
+.empty-text {
+  margin: 6px 0 0;
+  max-width: 68ch;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+
+/* Cartao que prefigura um resultado ainda inexistente. Borda tracejada porque
+   "vai aparecer aqui" precisa ser distinguivel de "esta aqui e vale zero". */
+.placeholder {
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 12px 14px;
+  background: var(--bg-subtle);
+}
+.placeholder-value {
+  font-size: 22px;
+  font-weight: 650;
+  color: var(--text-faint);
+  line-height: 1.2;
+  margin-bottom: 4px;
+}
+
+/* Lista do que esta sendo observado, dentro do estado vazio de Posicoes. */
+.watchlist {
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+  text-align: left;
+}
+.chip-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip {
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg-subtle);
+  color: var(--text-muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.strategy-row {
+  padding: 9px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg-subtle);
+}
+
+.disclaimer {
+  margin-top: 16px;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-muted);
+}
+
+.hint { font-size: 12px; line-height: 1.5; color: var(--text-muted); }
 
 /* Formularios ------------------------------------------------------------- */
 .field { display: flex; flex-direction: column; gap: 5px; }

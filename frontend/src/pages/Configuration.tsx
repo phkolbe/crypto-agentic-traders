@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useEffect, useState } from 'react'
 
 import { ApiError, api } from '../api/client'
+import { rotuloDeCampo } from '../api/format'
 import type { TradingConfig } from '../api/types'
 import { AgentsOffline, Card, Loading } from '../components/Shared'
 
@@ -217,6 +218,14 @@ export default function Configuration() {
 
   const atual = config.data
   const estrategiasSelecionadas = splitList(draft.strategies ?? '')
+  // Os valores em dinheiro na tela estao na moeda SALVA, nao na que esta sendo
+  // digitada: enquanto a alteracao nao e aplicada, 29.29 continua sendo 29,29
+  // da moeda antiga.
+  const unidadeSalva = atual.quote_currency
+  const moedaEmTroca =
+    draft.quote_currency !== undefined &&
+    draft.quote_currency.trim() !== '' &&
+    draft.quote_currency.trim().toUpperCase() !== unidadeSalva.toUpperCase()
 
   const alterado =
     TODOS.some((campo) => draft[campo.key] !== undefined && draft[campo.key] !== paraTexto(atual, campo)) ||
@@ -273,6 +282,26 @@ export default function Configuration() {
         </div>
       )}
 
+      {/* Trocar a moeda de cotacao NAO reconverte valor nenhum. A migracao de
+          BRL para USDC exigiu reescalar limites e capital autorizado a mao, na
+          cotacao do dia — e um campo de dinheiro que continua com o numero
+          antigo passa a significar outra coisa em silencio. */}
+      {moedaEmTroca && (
+        <div className="alert-banner" style={{ marginBottom: 14 }}>
+          <div>
+            <strong>
+              Trocar a cotação de {unidadeSalva} para {draft.quote_currency} não converte os valores.
+            </strong>{' '}
+            <span className="muted">
+              Os campos em dinheiro desta tela e todos os limites em <strong>Risco</strong>
+              {' '}continuam com o número que você vê agora, medido em {unidadeSalva}. Reescale-os
+              na mesma alteração ou logo depois — e confira o mínimo por ordem da exchange na moeda
+              nova.
+            </span>
+          </div>
+        </div>
+      )}
+
       {message && (
         <div className={`form-message ${message.ok ? 'ok' : 'err'}`} style={{ marginBottom: 14 }}>
           {message.text}
@@ -284,11 +313,10 @@ export default function Configuration() {
           <div className="form-grid">
             {grupo.campos.map((campo) => (
               <div className="field" key={campo.key}>
-                <label>
-                  {campo.label}
-                  {campo.sufixo && <span className="faint"> ({campo.sufixo})</span>}
-                  {campo.kind === 'percent' && <span className="faint"> (0–1)</span>}
-                </label>
+                {/* A unidade e parte do rotulo, nao enfeite: "Piso de liquidez
+                    em 24h = 9760000" nao se confere sem saber de que. Vem de
+                    `rotuloDeCampo`, que e verificada. */}
+                <label>{rotuloDeCampo(campo, unidadeSalva)}</label>
                 <input
                   type={campo.kind === 'int' || campo.kind === 'percent' ? 'number' : 'text'}
                   step={campo.kind === 'int' ? '1' : 'any'}
@@ -337,8 +365,11 @@ export default function Configuration() {
       </Card>
 
       <div className="row" style={{ marginTop: 14, gap: 10 }}>
+        {/* `primary`: nao existe `.btn` nem `.btn-primary` no CSS deste projeto,
+            e o botao que aplica a configuracao de negocio saia com a aparencia
+            de um botao secundario. */}
         <button
-          className="btn btn-primary"
+          className="primary"
           disabled={!alterado || save.isPending || estrategiasSelecionadas.length === 0}
           onClick={submit}
         >
@@ -346,7 +377,6 @@ export default function Configuration() {
         </button>
         {alterado && (
           <button
-            className="btn"
             onClick={() => {
               const inicial: Record<string, string> = {}
               for (const campo of TODOS) inicial[campo.key] = paraTexto(atual, campo)

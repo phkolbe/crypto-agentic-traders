@@ -2,7 +2,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useEffect, useState } from 'react'
 
 import { ApiError, api } from '../api/client'
-import { dateTime } from '../api/format'
+import { dateTime, money } from '../api/format'
 import type { AuditEntry, CapitalStatus, RiskConfig } from '../api/types'
 import {
   AgentsOffline,
@@ -11,6 +11,7 @@ import {
   CircuitBreakerBanner,
   Empty,
   Loading,
+  useQuoteCurrency,
 } from '../components/Shared'
 
 /**
@@ -126,6 +127,7 @@ const FIELDS: {
 
 export default function RiskSettings() {
   const queryClient = useQueryClient()
+  const moeda = useQuoteCurrency()
   const [draft, setDraft] = useState<Record<string, string>>({})
   const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null)
   const [confirming, setConfirming] = useState(false)
@@ -148,7 +150,7 @@ export default function RiskSettings() {
       setMessage({
         ok: true,
         text:
-          `Capital autorizado: ${novo.authorized_capital} ${novo.quote_currency}. ` +
+          `Capital autorizado: ${money(novo.authorized_capital, novo.quote_currency)}. ` +
           'O saldo passa a ser usado no próximo ciclo, e o registro foi para o log de auditoria.',
       })
       queryClient.invalidateQueries({ queryKey: ['capital'] })
@@ -274,6 +276,9 @@ export default function RiskSettings() {
             <div className="field" key={field.key}>
               <label>
                 {field.label}
+                {/* Limite de dinheiro sem unidade e um numero que nao se pode
+                    conferir: "5" e cinco de que? A moeda vem da configuracao. */}
+                {field.kind === 'money' && moeda && <span className="faint"> ({moeda})</span>}
                 {field.kind === 'percent' && <span className="faint"> (0–1)</span>}
                 {field.nullable && <span className="faint"> — vazio = sem limite</span>}
               </label>

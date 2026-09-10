@@ -1,22 +1,28 @@
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { useState } from 'react'
 import { ApiError, api } from '../api/client'
-import { money, percent, price, shortDate, signedPercent } from '../api/format'
+import { money, percent, price, quoteOf, shortDate, signedPercent } from '../api/format'
 import type { BacktestResult, StrategyInfo } from '../api/types'
 import { TimeSeriesChart } from '../components/Charts'
-import { Card, Empty, Stat } from '../components/Shared'
+import { Card, Empty, Stat, useQuoteCurrency } from '../components/Shared'
 
 const TIMEFRAMES = ['15m', '30m', '1h', '4h', '1d']
 
 export default function Backtest() {
+  const moeda = useQuoteCurrency()
   const [form, setForm] = useState({
-    symbol: 'BTC/USDT',
+    // Sem par fixo: `BTC/USDT` era o padrao e deixou de existir na configuracao
+    // quando a cotacao virou USDC — o backtest de fabrica rodava num par que o
+    // sistema nao negocia. Vazio + placeholder derivado da moeda vigente.
+    symbol: '',
     strategy: 'ma_crossover',
     timeframe: '1h',
     days: 90,
     initial_balance: '1000',
   })
   const [error, setError] = useState<string | null>(null)
+  const parPadrao = moeda ? `BTC/${moeda}` : ''
+  const par = form.symbol.trim() || parPadrao
 
   const strategies = useQuery<StrategyInfo[]>({
     queryKey: ['strategies'],
@@ -26,7 +32,7 @@ export default function Backtest() {
   const run = useMutation<BacktestResult, unknown, void>({
     mutationFn: () =>
       api.backtest({
-        symbol: form.symbol.toUpperCase(),
+        symbol: par.toUpperCase(),
         strategy: form.strategy,
         timeframe: form.timeframe,
         days: Number(form.days),
@@ -38,6 +44,9 @@ export default function Backtest() {
 
   const result = run.data
   const summary = result?.summary
+  // O resultado e do par que FOI rodado, que pode nao ser o da configuracao
+  // atual — quem rodou BTC/BRL nao pode ver o resultado rotulado em USDC.
+  const moedaDoResultado = quoteOf(summary?.symbol) || moeda
   const curve = (result?.equity_curve ?? []).map((point) => ({
     time: point.timestamp,
     value: point.value,
@@ -61,6 +70,7 @@ export default function Backtest() {
             <label>Par</label>
             <input
               value={form.symbol}
+              placeholder={parPadrao}
               onChange={(e) => setForm({ ...form, symbol: e.target.value.toUpperCase() })}
             />
           </div>
@@ -101,7 +111,10 @@ export default function Backtest() {
             />
           </div>
           <div className="field" style={{ maxWidth: 140 }}>
-            <label>Saldo inicial</label>
+            <label>
+              Saldo inicial
+              {moeda && <span className="faint"> ({moeda})</span>}
+            </label>
             <input
               type="number"
               min={1}
@@ -109,7 +122,11 @@ export default function Backtest() {
               onChange={(e) => setForm({ ...form, initial_balance: e.target.value })}
             />
           </div>
-          <button className="primary" onClick={() => run.mutate()} disabled={run.isPending}>
+          <button
+            className="primary"
+            onClick={() => run.mutate()}
+            disabled={run.isPending || !par}
+          >
             {run.isPending ? 'Rodando…' : 'Rodar backtest'}
           </button>
         </div>
@@ -117,13 +134,19 @@ export default function Backtest() {
         {error && <div className="form-message err" style={{ marginTop: 12 }}>{error}</div>}
       </Card>
 
-      {summary && (
+      {!summary ? (
+        <BacktestAindaNaoRodado
+          pendente={run.isPending}
+          estrategias={strategies.data ?? []}
+          selecionada={form.strategy}
+        />
+      ) : (
         <>
           <div className="grid grid-4" style={{ marginTop: 14 }}>
             <Stat
               label="Retorno da estratégia"
               value={signedPercent(summary.total_return_pct)}
-              hint={`${money(summary.final_value)} finais`}
+              hint={`${money(summary.final_value, moedaDoResultado)} finais`}
             />
             <Stat
               label="Comprar e segurar"
@@ -161,8 +184,7 @@ export default function Backtest() {
                 <TimeSeriesChart
                   data={curve}
                   height={280}
-                  formatX={shortDate}
-                  formatValue={(value) => money(value)}
+                  formatValue={(value) => money(value, moedaDoResultado)}
                   valueLabel="capital"
                   minTickGap={50}
                 />
@@ -181,9 +203,18 @@ export default function Backtest() {
                       <tr>
                         <th>Data</th>
                         <th>Lado</th>
-                        <th className="right">Preço</th>
-                        <th className="right">Valor</th>
-                        <th className="right">PnL</th>
+                        {/* Um backtest e de um unico par, entao aqui a unidade
+                            cabe no cabecalho — ao contrario do historico real,
+                            que mistura pares e precisa da unidade por linha. */}
+                        <th className="right">
+                          Preço{moedaDoResultado && ` (${moedaDoResultado})`}
+                        </th>
+                        <th className="right">
+                          Valor{moedaDoResultado && ` (${moedaDoResultado})`}
+                        </th>
+                        <th className="right">
+                          PnL{moedaDoResultado && ` (${moedaDoResultado})`}
+                        </th>
                       </tr>
                     </thead>
                     <tbody>
@@ -200,7 +231,7 @@ export default function Backtest() {
                             </span>
                           </td>
                           <td className="right">{price(trade.price)}</td>
-                          <td className="right">{money(trade.notional)}</td>
+                          <td className="right">{money(trade.notional, '')}</td>
                           <td
                             className={`right ${
                               trade.realized_pnl === null
@@ -260,12 +291,115 @@ export default function Backtest() {
             </Card>
           </div>
 
-          <div className="faint" style={{ marginTop: 14, fontSize: 12 }}>
-            Backtest não prova nada sobre o futuro. Antes de ligar o modo real: semanas em
-            simulação, depois testnet, e um teste deliberado do circuit breaker.
-          </div>
+          <div className="disclaimer">{AVISO}</div>
         </>
       )}
     </>
+  )
+}
+
+const AVISO =
+  'Backtest não prova nada sobre o futuro. Antes de ligar o modo real: semanas em simulação, ' +
+  'depois testnet, e um teste deliberado do circuit breaker.'
+
+/**
+ * O que a tela mede, dito ANTES de existir resultado.
+ *
+ * Cada item é exatamente um dos cartões que aparecem depois, na mesma ordem e no
+ * mesmo grid — o vazio prefigura o cheio em vez de ser um buraco.
+ */
+const PREVIA: { rotulo: string; descricao: string }[] = [
+  {
+    rotulo: 'Retorno da estratégia',
+    descricao: 'quanto o capital inicial virou no fim do período, já com taxa e slippage simulados',
+  },
+  {
+    rotulo: 'Comprar e segurar',
+    descricao: 'o mesmo período sem estratégia nenhuma — o piso que ela precisa superar',
+  },
+  {
+    rotulo: 'Queda máxima',
+    descricao: 'a maior distância do pico ao vale, que é o que se sente na hora',
+  },
+  {
+    rotulo: 'Taxa de acerto',
+    descricao: 'fração das operações fechadas no lucro, e quantas foram',
+  },
+]
+
+/**
+ * Estado da tela antes do primeiro backtest — o estado em que ela abre sempre.
+ *
+ * Tudo aqui era `{summary && …}`: da barra do formulário para baixo não havia
+ * um único elemento, e sobrava a maior parte do viewport em branco, sem uma
+ * linha dizendo o que vai aparecer. Nenhuma das outras telas faz isso; todas
+ * têm `<Empty>`.
+ */
+function BacktestAindaNaoRodado({
+  pendente,
+  estrategias,
+  selecionada,
+}: {
+  pendente: boolean
+  estrategias: StrategyInfo[]
+  selecionada: string
+}) {
+  return (
+    <div className="card" style={{ marginTop: 14 }}>
+      <div className="empty-title">
+        {pendente ? 'Rodando o backtest…' : 'Nenhum backtest rodado nesta sessão'}
+      </div>
+      <p className="empty-text">
+        {pendente
+          ? 'Buscando os candles na exchange e passando cada um pela mesma estratégia, mesmo ' +
+            'RiskEngine e mesmo PaperBroker que a produção usa.'
+          : 'Escolha par, estratégia, timeframe e período acima e clique em Rodar backtest. ' +
+            'Nada é gravado no histórico: o resultado vive nesta tela até você rodar outro.'}
+      </p>
+
+      <div className="grid grid-4" style={{ marginTop: 16 }}>
+        {PREVIA.map((item) => (
+          <div key={item.rotulo} className="placeholder">
+            <div className="card-title" style={{ marginBottom: 6 }}>{item.rotulo}</div>
+            <div className="placeholder-value">—</div>
+            <div className="hint">{item.descricao}</div>
+          </div>
+        ))}
+      </div>
+
+      <div className="hint" style={{ marginTop: 16 }}>
+        Também aparecem: a curva de capital, cada operação simulada com o motivo, e o painel do
+        Risk Manager com quantos sinais ele barrou e por quê.
+      </div>
+
+      {/* As estrategias vem da API e ja estao carregadas para preencher o
+          seletor acima — mostra-las aqui e de graca, e e a informacao que falta
+          para escolher qual rodar. */}
+      {estrategias.length > 0 && (
+        <div className="watchlist">
+          <div className="card-title" style={{ marginBottom: 8 }}>
+            Estratégias disponíveis
+          </div>
+          <div className="stack" style={{ gap: 9 }}>
+            {estrategias.map((estrategia) => (
+              <div key={estrategia.name} className="strategy-row">
+                <div className="row-tight" style={{ gap: 8 }}>
+                  <strong>{estrategia.name}</strong>
+                  {estrategia.name === selecionada && (
+                    <span className="badge badge-accent">selecionada</span>
+                  )}
+                  {estrategia.active && (
+                    <span className="badge badge-positive">ativa em produção</span>
+                  )}
+                </div>
+                <div className="hint">{estrategia.description}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <div className="disclaimer">{AVISO}</div>
+    </div>
   )
 }

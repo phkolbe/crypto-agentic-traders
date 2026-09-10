@@ -4,8 +4,8 @@ import { useQuery } from '@tanstack/react-query'
 import type { ReactNode } from 'react'
 
 import { api } from '../api/client'
-import { MODE_LABEL, money, signedPercent } from '../api/format'
-import type { CapitalStatus, Health } from '../api/types'
+import { MODE_LABEL, money, rodapeDoStat, toNumber } from '../api/format'
+import type { CapitalStatus, Health, TradingConfig } from '../api/types'
 
 export function useHealth() {
   return useQuery<Health>({
@@ -15,6 +15,39 @@ export function useHealth() {
     // ser retentado indefinidamente.
     retry: false,
   })
+}
+
+/**
+ * Moeda de cotacao vigente, lida da configuracao de negocio (banco).
+ *
+ * Nenhuma tela pode chutar isso. A migracao de BRL para USDC nao mexeu em
+ * codigo nenhum do frontend, e ainda assim o dashboard passou a mentir a
+ * moeda — porque `money()` tinha `'USDT'` como padrao de parametro. Enquanto a
+ * configuracao nao chegou, devolve `''`: numero sem unidade e incompleto, mas
+ * numero com a unidade errada e falso.
+ *
+ * `retry` NAO e `false` aqui, ao contrario do `useHealth`. A diferenca importa:
+ * 503 do health e um estado legitimo do sistema (agentes parados), mas uma falha
+ * ao ler a configuracao de negocio e sempre acidente — e o preco dela era alto
+ * demais para nao insistir. Com moeda `''`, toda a aplicacao perdia a unidade
+ * por cinco minutos (o `staleTime`) sem uma palavra na tela. Tres tentativas com
+ * espera crescente cobrem a falha transitoria, que e a comum.
+ *
+ * (O outro efeito daquele `''` — o caixa reaparecendo como posicao aberta —
+ * deixou de depender disto: `posicoesAbertas` filtra por `average_price` nulo,
+ * que e estrutural, e nao apenas pelo nome da moeda.)
+ */
+export function useQuoteCurrency(): string {
+  const config = useQuery<TradingConfig>({
+    queryKey: ['tradingConfig'],
+    queryFn: api.tradingConfig,
+    retry: 3,
+    retryDelay: (tentativa) => Math.min(1000 * 2 ** tentativa, 8000),
+    // Trocar a moeda de cotacao e um gesto raro e deliberado; nao vale
+    // revalidar isso a cada montagem de tela.
+    staleTime: 5 * 60 * 1000,
+  })
+  return config.data?.quote_currency ?? ''
 }
 
 export function Card({
@@ -59,15 +92,15 @@ export function Stat({
   change?: number | null
   hint?: string
 }) {
-  const tone = change === null || change === undefined ? '' : change >= 0 ? 'positive' : 'negative'
+  // A decisao de mostrar variacao, dica ou nada mora em `rodapeDoStat`, que e
+  // funcao pura e verificada — inclusive a diferenca entre `null` ("a API nao
+  // tem essa comparacao") e `undefined` ("esta tela decidiu nao comparar").
+  const rodape = rodapeDoStat(change, hint)
   return (
     <div className="card">
       <div className="card-title">{label}</div>
       <div className="stat-value">{value}</div>
-      {change !== undefined && (
-        <div className={`stat-sub ${tone}`}>{signedPercent(change)}{hint ? ` ${hint}` : ''}</div>
-      )}
-      {change === undefined && hint && <div className="stat-sub">{hint}</div>}
+      {rodape && <div className={`stat-sub ${rodape.tom}`}>{rodape.texto}</div>}
     </div>
   )
 }
@@ -83,12 +116,16 @@ export function ModeBanner({ health }: { health: Health | undefined }) {
   const mode = health.mode
   const className =
     mode === 'live' ? 'mode-live' : mode === 'testnet' ? 'mode-testnet' : 'mode-simulated'
+  // O texto NAO repete o rotulo que vem logo antes dele. "Simulação ·
+  // Simulação — nenhuma ordem sai da máquina" era o que estava na tela.
   const message =
     mode === 'live'
-      ? 'DINHEIRO REAL — ordens estão sendo enviadas à exchange.'
+      ? 'ordens estão sendo enviadas à exchange com dinheiro real.'
       : mode === 'testnet'
-        ? 'Testnet — ordens reais na sandbox da exchange, com dinheiro fictício.'
-        : 'Simulação — nenhuma ordem sai da máquina.'
+        ? 'ordens reais na sandbox da exchange, com dinheiro fictício.'
+        : 'nenhuma ordem sai da máquina.'
+
+  const pares = health.symbols.length
 
   return (
     <div className={`mode-banner ${className}`}>
@@ -96,8 +133,15 @@ export function ModeBanner({ health }: { health: Health | undefined }) {
       <span>
         <strong>{MODE_LABEL[mode] ?? mode}</strong> · {message}
       </span>
-      <span className="faint" style={{ marginLeft: 'auto', fontSize: 12 }}>
-        {health.exchange} · {health.symbols.join(', ') || 'sem pares'}
+      <span
+        className="faint"
+        style={{ marginLeft: 'auto', fontSize: 12 }}
+        // A lista inteira ocupava duas linhas do banner com 16 pares. A
+        // contagem cabe numa linha e o detalhe fica no title.
+        title={health.symbols.join(', ')}
+      >
+        {health.exchange} ·{' '}
+        {pares === 0 ? 'sem pares' : pares === 1 ? '1 par' : `${pares} pares`}
         {health.symbols_source === 'descoberta' && ' · descoberta automática'}
       </span>
     </div>
@@ -143,22 +187,27 @@ export function CapitalGateBanner({
   authorizing?: boolean
 }) {
   if (!status || !status.gate_active) return null
-  const parado = Number(status.unauthorized_value)
-  if (!(parado > 0)) return null
+  if (!(toNumber(status.unauthorized_value) > 0)) return null
+
+  // A moeda vem do proprio status, que e a fonte da verdade do portao.
+  const moeda = status.quote_currency
 
   return (
     <div className="alert-banner">
       <div>
         <strong>
-          {money(parado)} {status.quote_currency} disponíveis e não autorizados.
+          {money(status.unauthorized_value, moeda)} disponíveis e não autorizados.
         </strong>{' '}
         <span className="muted">
-          O patrimônio é {money(Number(status.total_value))} e o capital autorizado a operar é{' '}
-          {money(Number(status.authorized_capital ?? 0))}. O sistema{' '}
+          O patrimônio é {money(status.total_value, moeda)} e o capital autorizado a operar é{' '}
+          {money(status.authorized_capital ?? '0', moeda)}. O sistema{' '}
           <strong>não vai usar a diferença</strong> até você autorizar.
         </span>
       </div>
-      <button className="btn btn-primary" onClick={onAuthorize} disabled={authorizing}>
+      {/* `primary`, nao `btn btn-primary`: nao existe regra `.btn` nem
+          `.btn-primary` no CSS, e este botao — o que libera capital para operar —
+          renderizava com a aparencia de um botao secundario qualquer. */}
+      <button className="primary" onClick={onAuthorize} disabled={authorizing}>
         {authorizing ? 'Autorizando…' : 'Autorizar todo o saldo'}
       </button>
     </div>

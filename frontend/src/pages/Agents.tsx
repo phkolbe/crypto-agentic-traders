@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useState } from 'react'
+import { Link } from 'react-router-dom'
 
 import { ApiError, api } from '../api/client'
 import { dateTime, percent, relativeTime, timeOnly } from '../api/format'
@@ -161,9 +162,16 @@ export default function Agents() {
                   </div>
                 </div>
               ))}
+              {/* O texto anterior mandava editar STRATEGIES no `.env`. Alem de
+                  desatualizado, era instrucao para quebrar o sistema: variavel de
+                  negocio no arquivo de ambiente faz o backend RECUSAR SUBIR
+                  (D15). O lugar certo e a tela de Configuracoes, e vale na hora. */}
               <div className="faint" style={{ fontSize: 12, marginTop: 4 }}>
-                As estratégias ativas vêm de <span className="mono">STRATEGIES</span> no{' '}
-                <span className="mono">.env</span> e passam a valer no próximo start.
+                As estratégias ativas moram no banco e são editadas em{' '}
+                <Link to="/config">Configurações</Link> — valem no próximo candle fechado,
+                sem reiniciar. Não coloque <span className="mono">STRATEGIES</span> no{' '}
+                <span className="mono">.env</span>: variável de negócio nesse arquivo faz o
+                sistema recusar subir.
               </div>
             </div>
           )}
