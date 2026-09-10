@@ -38,7 +38,7 @@ from crypto_traders.db.repositories import TradeRepository
 from crypto_traders.db.session import get_engine, session_scope
 from crypto_traders.domain.enums import ExchangeName, OrderStatus, OrderType, Side
 from crypto_traders.domain.models import OrderRequest
-from crypto_traders.exchanges.base import ExchangeError
+from crypto_traders.exchanges.base import ExchangeError, InsufficientFunds
 from crypto_traders.exchanges.ccxt_adapter import CcxtExchange
 
 # ---------------------------------------------------------------------------
@@ -331,51 +331,55 @@ class TestContraAExchange:
             await adaptador._client.close()
 
     async def test_saldo_insuficiente_nao_e_retentado(self):
-        """Erro de negocio: a exchange respondeu "nao", retentar so atrasa."""
+        """Erro de negocio: a exchange respondeu "nao", retentar so atrasa.
+
+        A recusa sobe como `InsufficientFunds` desde o conserto de 2026-09-10
+        (ver `TestSaldoInsuficienteNoBrokerDeVerdade`); antes ela era engolida
+        pelo `except ExchangeError` do adaptador e voltava como FAILED.
+        """
         cliente = _ClienteQueFalha(ccxt.InsufficientFunds("saldo insuficiente"))
         async with _adaptador(cliente, max_retries=3) as adaptador:
-            await adaptador.place_order(_pedido())
+            with pytest.raises(InsufficientFunds):
+                await adaptador.place_order(_pedido())
         assert cliente.chamadas == 1, "erro de negocio nao pode ser retentado"
 
 
 class TestSaldoInsuficienteNoBrokerDeVerdade:
-    """O ramo que existe e nunca roda com o broker que a producao usa.
+    """Os dois brokers reais respondem em formatos diferentes e no MESMO desfecho.
 
-    `ExecutionAgent._execute` tem `except InsufficientFunds` -> `_rejected`, com
-    o comentario "a exchange respondeu, e a resposta foi nao". A suite prova esse
-    ramo com `BrokerProgramado`, um dublê que LEVANTA a excecao
-    (`test_execution.py::TestSaldoInsuficienteNoEnvio`).
+    Historia, porque ela e o motivo destes testes existirem. Medido em
+    2026-09-10: `ExecutionAgent._execute` tem `except InsufficientFunds` ->
+    `_rejected`, com o comentario "a exchange respondeu, e a resposta foi nao",
+    e esse ramo era **codigo morto com os dois brokers que a producao usa**. A
+    suite o provava com `BrokerProgramado`, um dublê que levanta a excecao
+    (`test_execution.py::TestSaldoInsuficienteNoEnvio`) -- e o dublê era o unico
+    lugar do sistema onde ele rodava.
 
-    Nenhum dos dois brokers reais levanta:
+    `CcxtExchange.place_order` capturava `ExchangeError`, e `InsufficientFunds`
+    HERDA de `ExchangeError`: a recusa voltava como FAILED. A diferenca gastava
+    dinheiro pelo cooldown -- `OrderRepository.last_order_time` exclui apenas
+    REJECTED, entao uma recusa que nunca chegou ao mercado queimava 900s do par,
+    enquanto a mesma recusa vinda do dublê nao queimava.
 
-    * `PaperBroker.place_order` captura o proprio `InsufficientFunds` e devolve
-      `OrderResult(REJECTED)`;
-    * `CcxtExchange.place_order` captura `ExchangeError` -- e
-      `InsufficientFunds` HERDA de `ExchangeError` -- e devolve
-      `OrderResult(FAILED)`.
+    CONSERTADO no mesmo dia, com `except InsufficientFunds: raise` ANTES do
+    `except ExchangeError` no adaptador -- a ordem dos blocos era o defeito. O
+    `xfail(strict=True)` que morava aqui virou XPASS e foi removido.
 
-    Com o broker real da exchange o desfecho e FAILED, e a diferenca custa: o
-    cooldown do Risk Manager (`OrderRepository.last_order_time`) exclui APENAS
-    `REJECTED`. Uma recusa que nao chegou ao mercado, vinda da Binance, queima o
-    cooldown do par; a mesma recusa vinda do dublê nao queima. Isso e o cenario
-    de mandato 5 (saldo insuficiente) medido no lugar onde a producao realmente
-    passa.
+    O que estes testes fixam agora: os formatos continuam diferentes de
+    proposito (o adaptador LEVANTA, o `PaperBroker` devolve REJECTED, cada um
+    coerente com sua camada), mas o desfecho no ExecutionAgent e o mesmo nos
+    dois. E o desfecho que o cooldown le, e portanto o que precisa concordar.
     """
 
-    async def test_o_adaptador_real_devolve_FAILED_e_nao_levanta(self):
-        """Realidade MEDIDA, nao desejada: o que a producao recebe hoje."""
+    async def test_o_adaptador_real_levanta_em_vez_de_devolver_failed(self):
+        """O conserto: a recusa sobe como excecao e o chamador pode distingui-la."""
         cliente = _ClienteQueFalha(ccxt.InsufficientFunds("saldo insuficiente de USDC"))
         async with _adaptador(cliente) as adaptador:
-            resultado = await adaptador.place_order(_pedido())
+            with pytest.raises(InsufficientFunds, match="insuficiente"):
+                await adaptador.place_order(_pedido())
 
-        assert resultado.status is OrderStatus.FAILED
-        assert resultado.status is not OrderStatus.REJECTED
-        assert "insuficiente" in (resultado.error or "")
-
-    async def test_o_paper_broker_devolve_REJECTED_e_tambem_nao_levanta(
-        self, settings
-    ):
-        """O outro broker real: mesmo formato de resposta, status diferente."""
+    async def test_o_paper_broker_devolve_REJECTED_e_nao_levanta(self, settings):
+        """O outro broker real: formato diferente, mesmo desfecho."""
         from crypto_traders.exchanges.paper import PaperBroker
 
         broker = PaperBroker(quote_currency="USDC", initial_balance=Decimal("1"))
@@ -383,21 +387,8 @@ class TestSaldoInsuficienteNoBrokerDeVerdade:
         resultado = await broker.place_order(_pedido())
         assert resultado.status is OrderStatus.REJECTED
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "DEFEITO MEDIDO 2026-09-10: com o broker real da exchange, saldo "
-            "insuficiente chega ao ExecutionAgent como FAILED, nunca como "
-            "REJECTED, porque CcxtExchange.place_order captura ExchangeError e "
-            "InsufficientFunds herda dele. O ramo `except InsufficientFunds` do "
-            "agente e inalcancavel em producao, e o cooldown do Risk Manager "
-            "(que ignora so REJECTED) fica armado por uma ordem que nunca chegou "
-            "ao mercado. O conserto e em exchanges/ccxt_adapter.py, fora do "
-            "escopo deste item -- xfail estrito para virar vermelho quando for "
-            "consertado."
-        ),
-    )
-    async def test_deveria_chegar_ao_agente_como_recusa_definitiva(self, settings):
+    async def test_chega_ao_agente_como_recusa_definitiva(self, settings):
+        """O ramo `except InsufficientFunds` do agente deixou de ser codigo morto."""
         from crypto_traders.agents.execution import ExecutionAgent
         from crypto_traders.bus import InMemoryEventBus
 
@@ -408,6 +399,31 @@ class TestSaldoInsuficienteNoBrokerDeVerdade:
 
         assert resultado is not None
         assert resultado.status is OrderStatus.REJECTED
+
+    async def test_a_recusa_nao_queima_mais_o_cooldown_do_par(self, settings):
+        """A consequencia em dinheiro, medida onde ela acontece.
+
+        `last_order_time` e a fonte do cooldown e exclui apenas REJECTED. Com a
+        recusa voltando como FAILED, o par ficava 900s sem poder ser negociado
+        por causa de uma ordem que a exchange nunca criou.
+        """
+        from crypto_traders.agents.execution import ExecutionAgent
+        from crypto_traders.bus import InMemoryEventBus
+        from crypto_traders.db.repositories import OrderRepository
+        from crypto_traders.db.session import session_scope
+
+        pedido = _pedido()
+        cliente = _ClienteQueFalha(ccxt.InsufficientFunds("saldo insuficiente de USDC"))
+        async with _adaptador(cliente) as adaptador:
+            agente = ExecutionAgent(InMemoryEventBus(), adaptador, settings)
+            await agente._execute(pedido)
+
+        async with session_scope(settings) as session:
+            marca = await OrderRepository(session).last_order_time(pedido.symbol)
+
+        assert marca is None, (
+            f"a recusa queimou o cooldown de {pedido.symbol}: last_order_time={marca}"
+        )
 
 
 # ---------------------------------------------------------------------------

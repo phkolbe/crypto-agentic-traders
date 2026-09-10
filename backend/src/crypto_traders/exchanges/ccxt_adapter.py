@@ -269,6 +269,22 @@ class CcxtExchange(MarketDataSource, Broker):
             # precisa poder distinguir "esta ordem falhou" de "o sistema perdeu
             # acesso a exchange", que exige alerta imediato.
             raise
+        except InsufficientFunds:
+            # Mesmo motivo do bloco acima, e o mesmo cuidado com a ORDEM destes
+            # `except`: `InsufficientFunds` herda de `ExchangeError`, entao sem
+            # este bloco vindo ANTES ela era engolida pelo generico e voltava
+            # como FAILED. O `except InsufficientFunds` do ExecutionAgent --
+            # escrito para dizer "a exchange respondeu, e a resposta foi nao" --
+            # era codigo morto com os dois brokers que a producao usa, e a mesma
+            # recusa produzia desfecho diferente conforme o broker: o
+            # `PaperBroker` devolvia REJECTED e este devolvia FAILED.
+            #
+            # A diferenca gasta dinheiro pelo cooldown: `last_order_time`
+            # (repositories.py:249) exclui apenas REJECTED, entao uma recusa que
+            # NUNCA chegou ao mercado queimava 900s do par. Nao ha risco de laco
+            # apertado em retentar: uma ordem nova exige um sinal novo, que exige
+            # um candle FECHADO -- em 1d, uma vez por dia por par.
+            raise
         except ExchangeError as exc:
             return OrderResult(
                 order_request_id=request.id,

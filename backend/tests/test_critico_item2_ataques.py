@@ -213,13 +213,19 @@ def test_chave_de_api_vazia_nao_muda_nada_para_a_estrategia():
     a exchange que uma credencial pudesse habilitar.
     """
     import ast
-    import pathlib
 
+    from helpers import arquivo_do_repo
+
+    # Ancorado em `__file__` via `arquivo_do_repo`, e nao em caminho relativo:
+    # com `pathlib.Path("src/...")` este teste passava rodando de `backend/` e
+    # falhava rodando da raiz do repositorio -- medido pelo item 10 do gauntlet.
+    # Um teste que muda de resultado conforme o `cd` de quem roda o pytest mede
+    # o shell, nao o sistema.
     proibidos = ("exchanges", "agents.execution", "broker", "ccxt")
     for caminho in [
-        pathlib.Path("src/crypto_traders/agents/strategy.py"),
-        *pathlib.Path("src/crypto_traders/strategies").glob("*.py"),
-        *pathlib.Path("src/crypto_traders/indicators").glob("*.py"),
+        arquivo_do_repo("src/crypto_traders/agents/strategy.py"),
+        *arquivo_do_repo("src/crypto_traders/strategies").glob("*.py"),
+        *arquivo_do_repo("src/crypto_traders/indicators").glob("*.py"),
     ]:
         arvore = ast.parse(caminho.read_text(encoding="utf-8"))
         for no in ast.walk(arvore):

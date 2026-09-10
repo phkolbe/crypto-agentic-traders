@@ -206,6 +206,35 @@ class PortfolioBacktestEngine:
             max((s.min_candles for s in strategies), default=50), min_warmup
         )
 
+    def _chave_de_ativo(self, symbol: str) -> str:
+        """Chave de preco, posicao, base de custo e protecao para um par.
+
+        Mesmo contrato de `MarketDataAgent._chave_de_preco`, e pelo mesmo motivo.
+        `symbol.partition("/")[0]` -- so o ativo base -- fazia BTC/USDC e
+        BTC/BRL gravarem na MESMA chave "BTC", e o ultimo par do instante
+        vencia. Foi a QUARTA divergencia backtest/producao encontrada neste
+        projeto: producao aprendeu a nao misturar unidades (defeito 10 do
+        gauntlet) e o backtest nao recebeu a licao.
+
+        O dano medido nao era um numero um pouco errado, era o backtest
+        emudecer: com BTC/USDC e BTC/BRL na lista, a compra aprovada em USDC
+        chegava ao broker com o preco em BRL e era recusada por saldo
+        insuficiente -- 0 trades, retorno 0,00% e `beat_the_market` verdadeiro,
+        sem uma linha dizendo que nada aconteceu.
+
+        O ativo base continua sendo a chave do par cotado NA MOEDA DE COTACAO,
+        porque e por ativo que o `PaperBroker` guarda saldo e que a carteira e
+        avaliada contra o caixa. O par divergente vai para o nome COMPLETO: nao
+        colide, e o `RiskEngine` -- que ja recusa ordem cuja cotacao difere da
+        configurada -- continua sendo quem barra a ordem. Um par a mais na
+        lista, cotado em moeda que o sistema nao usa, passa a ser inofensivo em
+        vez de fatal.
+        """
+        base, _, quote = symbol.partition("/")
+        if quote.upper() == self.quote_currency.upper():
+            return base
+        return symbol
+
     async def run(
         self, candles_by_symbol: dict[str, list[Candle]]
     ) -> PortfolioBacktestResult:
@@ -256,7 +285,7 @@ class PortfolioBacktestEngine:
             for symbol, frame in frames.items():
                 if now not in frame.index:
                     continue
-                base = symbol.partition("/")[0]
+                base = self._chave_de_ativo(symbol)
                 price = Decimal(str(frame.at[now, "close"]))
                 prices[base] = price
                 broker.set_price(base, price)
@@ -349,7 +378,7 @@ class PortfolioBacktestEngine:
         for symbol, frame in frames.items():
             if now not in frame.index:
                 continue
-            base = symbol.partition("/")[0]
+            base = self._chave_de_ativo(symbol)
             niveis = protection.get(base)
             held = balances.get(base, Decimal(0))
             if niveis is None or held <= 0:
@@ -455,7 +484,7 @@ class PortfolioBacktestEngine:
         self, signal, assessment, broker, prices, cost_basis, protection,
         last_order_at, result, now, order_seq,
     ) -> None:
-        base = signal.symbol.partition("/")[0]
+        base = self._chave_de_ativo(signal.symbol)
         side = Side.BUY if signal.direction is SignalDirection.LONG else Side.SELL
         request = OrderRequest(
             client_order_id=f"pbt-{order_seq}",

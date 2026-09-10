@@ -587,9 +587,16 @@ class TestAQuartaDivergencia:
     plausivel -- "a estrategia nao achou nada" -- e e ela que reprova a
     estrategia antes de o dinheiro entrar.
 
-    O conserto e em `src/crypto_traders/backtest/portfolio.py`, fora do escopo
-    deste item. Fica medido, e o `xfail(strict=True)` abaixo vira vermelho no dia
-    em que for consertado.
+    CONSERTADO em 2026-09-10, em `PortfolioBacktestEngine._chave_de_ativo`, com
+    o mesmo contrato de `MarketDataAgent._chave_de_preco`: ativo base para o par
+    cotado na moeda do sistema, nome COMPLETO para o divergente. Os dois testes
+    abaixo mudaram de lado no mesmo dia -- o que pinava o defeito passou a
+    exigir a ausencia dele, e o `xfail(strict=True)` cumpriu exatamente o papel
+    de avisar, virando XPASS quando o conserto entrou.
+
+    Medido depois do conserto: as duas listas dao **10 trades e +15,51%**, e o
+    par divergente fica em `last_prices` sob o nome completo
+    (`{'BTC/USDC': 100.05, 'BTC/BRL': 499928.93}`), sem colidir com "BTC".
     """
 
     #: A referencia: o par de USDC sozinho opera.
@@ -627,51 +634,37 @@ class TestAQuartaDivergencia:
             f"realizado do backtest = {backtest.realized_pnl}"
         )
 
-    async def test_um_par_da_cotacao_antiga_zera_o_backtest_do_par_certo(self):
+    async def test_um_par_da_cotacao_antiga_nao_zera_mais_o_backtest_do_par_certo(self):
         """O efeito de ponta a ponta, com a estrategia e o risco reais decidindo.
 
-        Este teste PINA o defeito medido em vez de asserir o desejado: enquanto
-        ele passar, o comportamento errado esta documentado com numero. Ele muda
-        de resultado no dia do conserto, junto com o xfail abaixo.
+        Antes do conserto este teste PINAVA o defeito: exigia `0 trades` e
+        `beat_the_market` verdadeiro, para que o comportamento errado ficasse
+        documentado com numero em vez de descrito em prosa. Consertado o
+        defeito, ele passou a exigir o contrario -- que o par divergente nao
+        mude nada -- e continua sendo a rede que pega a volta do problema.
         """
         referencia = await rodar(self.SO_USDC)
         contaminado = await rodar(self.COM_BRL)
 
         assert len(referencia.trades) >= 6, "a referencia precisa operar"
-        assert len(contaminado.trades) == 0, (
-            f"o par de BRL deixou de zerar o backtest: {len(contaminado.trades)} trades"
+        assert len(contaminado.trades) == len(referencia.trades), (
+            f"o par de BRL mudou o numero de trades: {len(contaminado.trades)} "
+            f"contra {len(referencia.trades)} da referencia"
         )
-        # E o mais grave: o resultado nao denuncia nada. Zero trades, zero
-        # retorno, e `beat_the_market` verdadeiro porque nao operar foi melhor
-        # que o mercado caindo.
-        assert contaminado.total_return_pct == 0.0
-        assert contaminado.realized_pnl == Decimal(0)
+        assert contaminado.total_return_pct == referencia.total_return_pct
+        assert contaminado.realized_pnl == referencia.realized_pnl
 
-        # O RiskEngine barra a ORDEM em BRL -- essa defesa existe e age --, mas
-        # ela chega tarde: o preco ja contaminou a chave "BTC" no passo 1 do
-        # laco, antes de qualquer decisao.
+        # O preco do par divergente nao se perde: fica sob o nome COMPLETO, onde
+        # nao pode ser confundido com o preco na moeda de cotacao.
+        assert contaminado.last_prices["BTC/BRL"] > Decimal("100000")
+        assert contaminado.last_prices["BTC/USDC"] < Decimal("1000")
+
+        # O RiskEngine continua barrando a ORDEM em BRL -- a defesa de moeda
+        # segue agindo, e agora ela e a UNICA coisa que o par divergente causa.
         motivos = " ".join(contaminado.rejection_reasons)
         assert "moeda de cotacao" in motivos
-        # Nao ha uma unica rejeicao por conta do par de USDC: os sinais dele
-        # foram APROVADOS e morreram no preenchimento, sem contabilizacao.
-        assert contaminado.signals_generated > contaminado.signals_rejected
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "DEFEITO MEDIDO 2026-09-10: backtest/portfolio.py usa "
-            "symbol.partition('/')[0] como chave de preco, posicao, base de "
-            "custo e protecao, entao um par cotado em outra moeda sobrescreve o "
-            "par principal -- exatamente o defeito 10 do gauntlet, que foi "
-            "consertado em MarketDataAgent._chave_de_preco e em "
-            "PortfolioAgent._apurar e nunca chegou ao backtest. Medido: BTC/USDC "
-            "sozinho da 10 trades e +15,51%; com BTC/BRL na lista da 0 trades e "
-            "0,00%, sem aviso nenhum. Conserto em "
-            "src/crypto_traders/backtest/portfolio.py, fora do escopo do item 10 "
-            "-- xfail estrito para virar vermelho quando for consertado."
-        ),
-    )
-    async def test_o_par_de_outra_cotacao_deveria_ser_inofensivo(self):
+    async def test_o_par_de_outra_cotacao_e_inofensivo(self):
         """O que o backtest DEVERIA fazer: ignorar o par de outra cotacao.
 
         Producao ja se comporta assim -- o preco vai para o nome completo e os
