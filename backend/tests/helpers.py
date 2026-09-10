@@ -4,9 +4,29 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 
 from crypto_traders.domain.enums import ExchangeName
 from crypto_traders.domain.models import Candle
+
+#: Raiz do repositorio, ancorada no arquivo e nao no diretorio de trabalho.
+#: `backend/tests/helpers.py` -> `backend/tests` -> `backend` -> raiz.
+RAIZ_DO_REPO = Path(__file__).resolve().parents[2]
+
+#: Raiz do pacote de producao, para o teste que precisa LER codigo-fonte.
+RAIZ_DO_BACKEND = RAIZ_DO_REPO / "backend"
+
+
+def arquivo_do_repo(relativo: str) -> Path:
+    """Caminho absoluto de um arquivo do repositorio.
+
+    Existe porque `pathlib.Path("src/crypto_traders/...")` num teste depende do
+    diretorio de trabalho de quem chamou o pytest: medido em 2026-09-10, a suite
+    tem 1118 verdes rodando de `backend/` e 1 vermelho rodando da raiz do
+    repositorio (`test_critico_item2_ataques.py` abre `src/...` relativo). Um
+    teste que muda de resultado conforme o `cd` de quem roda nao mede o sistema.
+    """
+    return (RAIZ_DO_BACKEND / relativo).resolve()
 
 
 def make_candles(

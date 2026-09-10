@@ -60,6 +60,91 @@ O Market Data Agent recebe uma `MarketDataSource` construída **sem credenciais*
 interfaces separadas de propósito: o código com poder de gastar fica em uma
 superfície pequena e revisável.
 
+## Ciclo de vida de um agente
+
+`BaseAgent` cuida de start/pause/resume/stop/restart, heartbeat e tratamento de
+erro. Três coisas ali não são gosto de arquitetura — são consequência de defeitos
+medidos, e quem escrever um agente novo precisa conhecê-las.
+
+**1. A batida de ocioso.** Um agente orientado a evento só batia heartbeat quando
+recebia trabalho. Com candle diário ele fica legitimamente parado por horas, e o
+watchdog o declarou travado e o reiniciou 17 vezes em 16 minutos. O sinal correto
+de vitalidade é "estou vivo esperando", não "recebi trabalho". O timeout de 10
+minutos **não** foi afrouxado — afrouxá-lo trocaria um alarme falso por um
+travamento real não detectado, que é a troca errada.
+
+**2. A vitalidade é por TAREFA, não por agente.** A primeira versão da batida de
+ocioso guardava um único "estou esperando" por agente, e isso espelhou o defeito
+em vez de corrigi-lo. O Risk Manager tem duas tarefas — uma que alimenta a fila
+de sinais e outra que avalia os lotes —, e quem marcava a espera era a
+alimentadora. Com o laço de avaliação pendurado para sempre, o alimentador seguia
+ocioso, o agente seguia batendo e o watchdog via verde: **o guardião pelo qual
+toda ordem passa podia travar indefinidamente.** Antes o ocioso parecia travado;
+depois o travado parecia ocioso. Hoje cada tarefa vigiada reivindica a própria
+espera, e o agente só bate como ocioso quando **todas** estão esperando.
+
+> Por isso tarefa interna de agente se cria com `self.spawn()`, nunca com
+> `asyncio.create_task`: o que não é vigiado não conta para a vitalidade, e uma
+> tarefa fora do registro é exatamente o ponto cego acima. Existe teste que varre
+> o pacote `agents` cobrando essa regra.
+
+**3. A caixa de entrada é durável e pertence ao AGENTE, não à tarefa.** O reinício
+era `stop()` + `start()`, e entre os dois o agente não estava assinando o tópico.
+Candle é publicado uma única vez (fechado e inédito), e o Market Data publica os
+16 pares em rajada com ~0,4 s entre eles — um reinício caindo na rajada derrubava
+vários, sem uma linha no log dizendo "sinal perdido". Medido: pelo caminho antigo
+o agente perdia **16 de 16** da rajada; pelo novo recebe 16.
+
+A assinatura e a fila vivem fora do ciclo de vida da tarefa de processamento, e só
+os tópicos de evento **único** ganham caixa durável:
+
+| Tópicos | Caixa durável? | Por quê |
+|---|---|---|
+| `CANDLES`, `SIGNALS`, `ORDER_REQUESTS` | **sim** | publicados uma vez cada; perder um é perder trabalho para sempre |
+| preço, snapshot, heartbeat, alerta | não | estado repetido — a próxima publicação substitui a anterior |
+
+A caixa tem teto (1000, igual ao do bus). Fila sem teto guardando eventos para um
+consumidor que nunca volta cresce sem limite; com teto, a pressão volta para o
+bus, que já descarta **com aviso**. Perder com aviso é melhor que crescer em
+silêncio.
+
+## Pausar não é bloquear
+
+Distinção estrutural, e a mais fácil de errar: **pausar o Execution Agent desliga
+o stop-loss.** Por isso o orquestrador nunca o pausa. A trava desce como
+*bloqueio de abertura* (`block_openings`), que recusa `Side.BUY` e deixa passar
+`Side.SELL` — exatamente a assimetria de D4.
+
+Isso vale para os três caminhos que "param" o sistema: o circuit breaker, a pausa
+pela interface e a indisponibilidade da execução detectada pelo orquestrador. Os
+três chamam o bloqueio de abertura; nenhum pausa quem fecha posição. Detalhe e
+medições na seção 2 de [`SEGURANCA.md`](SEGURANCA.md).
+
+Consequência para o dashboard: a execução sob trava aparece com
+`openings_blocked` preenchido, não como `paused` — `paused` seria sempre `False`
+e o operador não veria que a compra está barrada.
+
+## Observabilidade: os estados que parecem saudáveis
+
+`Orchestrator.health()` expõe, por agente, campos que existem porque cada um deles
+já foi um estado indistinguível de "tudo certo":
+
+| Campo | O estado que ele nomeia |
+|---|---|
+| `idle` / `idle_detail` | ocioso por direito — não é o mesmo que travado |
+| `deaf_topics` | de pé, sem erro, sem eventos: **surdo**. O estado que mais parece saudável |
+| `pending_events` / `lost_events` | fila crescendo, ou evento descartado |
+| `inbox_failures` / `restarts` / `given_up` | falha na caixa, churn de reinício, desistência do watchdog |
+| `openings_blocked` (execução) | compra barrada com o agente rodando |
+| `tasks` | as tarefas do **orquestrador**, porque uma delas morta (alertas) apaga o único caminho de notificação |
+
+A supervisão é mútua: o watchdog vigia os agentes, e o caminho movido pelo
+Portfolio Agent (`_on_snapshot`) vigia as tarefas do próprio orquestrador — é dali
+que a morte do watchdog é vista. A ordem dentro desse caminho é deliberada:
+ressuscitar as tarefas próprias vem **antes** de publicar o aviso de posições sem
+stop, porque um listener de alertas morto faria o aviso não chegar a ninguém.
+Ressuscitar o carteiro antes de mandar a carta.
+
 ## Event bus
 
 Contrato único (`EventBus`), dois backends:
@@ -108,6 +193,74 @@ o dashboard congela justamente quando há atividade.
 `trades` é uma tabela só para agentes e lançamentos manuais, distinguidos por
 `origin`. Isso mantém filtros, dashboard e exportação fiscal simples — sem UNION.
 
+### Defesas dentro do banco
+
+O append-only deixou de ser só contrato de repositório e passou a ter duas camadas
+no banco:
+
+- **Gatilhos.** `audit_log` recusa `UPDATE` e `DELETE`; `trades` recusa `UPDATE` e
+  só aceita `DELETE` de lançamento manual. Existem para SQLite e para PostgreSQL,
+  com um teste que confere a lista de gatilhos esperados em cada dialeto.
+- **O autorizador do driver.** No SQLite, `sqlite3_set_authorizer` é consultado ao
+  **preparar** cada comando, depois do parser, e recebe o que o comando faz — não
+  o texto dele. Substituiu uma barreira de regex que caía com comentário no meio
+  do comando e com pragma qualificado por schema.
+
+A limitação honesta dessa camada está na seção 5 de
+[`SEGURANCA.md`](SEGURANCA.md): contra código hostil **dentro deste processo** não
+há barreira do lado do SQLite, porque `setconfig` não é SQL. Fechar exigiria
+separação de privilégio, que só o PostgreSQL oferece.
+
+## Como o patrimônio é apurado
+
+O Portfolio Agent não produz número de relatório: o **preço médio** é a única
+entrada do nível de stop, e o **resultado de negociação** é o número que arma ou
+desarma o circuit breaker. Errar a conta aqui vende dinheiro real sem perda
+nenhuma, ou deixa de proteger diante de prejuízo de verdade.
+
+Uma varredura única do histórico de trades produz as duas coisas, e três decisões
+governam essa varredura:
+
+**1. O modo separa o dinheiro.** Valem os trades do modo **corrente**, mais os
+`manual`. O ensaio em `dry_run` roda contra o mesmo banco que será usado em LIVE,
+e sem o filtro uma compra de papel a 100 contamina o médio da compra real a 50. O
+filtro não é "ignorar papel": excluir `dry_run` sempre deixaria o ensaio sem preço
+médio, logo **sem stop**. Detalhe na seção 4 de [`SEGURANCA.md`](SEGURANCA.md).
+
+**2. O realizado é derivado do histórico**, por custo médio móvel, e não somado da
+coluna `trades.realized_pnl` — aquela coluna só é preenchida pelo Execution Agent
+quando ele mesmo fecha a posição que abriu. Não há corte por âncora de tempo:
+`executed_at` não é monotônico, e cortar por ele fazia um lançamento datado no
+futuro somar o mesmo lucro 1.440 vezes por dia.
+
+**3. Saldo e histórico são de instantes diferentes.** A exchange responde o saldo
+de agora; a linha em `trades` chega depois. A quantidade que já saiu do saldo e
+ainda consta no histórico é um **fantasma**, e é o razão de fantasmas que
+reconcilia os dois — uma vez por fantasma, desfazendo o crédito quando ele deixa
+de existir. O razão mora no `audit_log` porque precisa durar entre reinícios, ser
+append-only e ser legível por uma pessoa; o registro do ajuste **é** o razão.
+
+Tudo o que a apuração descarta — trade de outro modo, de outra cotação, taxa,
+venda sem base de custo — vai para o `audit_log`. Por isso a consulta que alimenta
+a apuração é deliberadamente **sem filtro**: quem apura precisa ver o que vai
+descartar. Filtrar na consulta deixaria o descarte invisível.
+
+### Preço por par, não por ativo
+
+`latest_prices` era indexado pelo ativo base, e `BTC/USDC` e `BTC/USDT` gravavam
+na **mesma** chave `"BTC"`: o último par da rajada vencia, em silêncio, e o preço
+de um mercado avaliava a posição do outro. Não é cenário teórico — a lista de
+pares é editável pela interface e o sistema acabou de migrar de BRL para USDC.
+
+A regra hoje: o ativo base continua sendo a chave **apenas** do par cotado na
+moeda de cotação do sistema; qualquer outro par guarda o preço sob o nome
+completo. O motivo é de unidade, não de organização — Portfolio e Risk leem esse
+dicionário por ativo, multiplicam pela quantidade em carteira e somam ao caixa,
+que está em `quote_currency`. Somar um preço em outra unidade seria erro de conta,
+não arredondamento. O par divergente não se perde (continua publicado, gravado e
+visível no dashboard) e não pode ser confundido: quem lê por ativo simplesmente
+não o encontra, e preço ausente já tem caminho conservador.
+
 ## Configuração: duas naturezas, dois lugares
 
 ```
@@ -140,7 +293,7 @@ a mudança de universo. Sem isso a tela mostraria uma configuração que o siste
 não está usando.
 
 Escrever uma variável de negócio no `.env` faz `Settings` recusar subir. Ver
-seção 11 de [`SEGURANCA.md`](SEGURANCA.md) para o episódio que tornou isso uma
+seção 14 de [`SEGURANCA.md`](SEGURANCA.md) para o episódio que tornou isso uma
 regra.
 
 ## Gráficos
@@ -177,6 +330,31 @@ O que foi preciso reimplementar, e o que cada peça resolve:
   mesmo ponto e não pinta nada. Esse era justamente o caso em que o donut do
   Recharts sumia, e agora não existe animação nem estado interno para congelar.
 
+O bundle hoje é **283 kB** (era 268,2 kB na saída do Recharts): o endurecimento
+das telas acrescentou ~15 kB de lógica de rótulo, moeda e contraste. Nenhuma
+biblioteca de gráfico foi reintroduzida.
+
+### O que o `tsc` não vê, e o harness vê
+
+`npx tsc -b` e `npx vite build` passam limpos com a tela errada na frente do
+usuário — os defeitos encontrados no endurecimento tinham todos a mesma
+assinatura: **tipo certo, tela errada.** Eixo X com oito rótulos idênticos, eixo Y
+colapsando três marcações em "29", a tela anunciando USDT depois da migração para
+USDC, um tooltip afirmando "150,00 USDC" sobre um valor de 150 BRL, texto
+secundário abaixo do contraste mínimo de WCAG AA (3,77 no tema escuro, 3,04 no
+claro), `.btn` usado nas telas e nunca declarado no CSS.
+
+`src/checks/telas.check.ts`, rodado com `npm run check`, faz **174 verificações**
+sem framework de teste novo (usa o esbuild que o Vite já traz). Duas regras que
+ele segue, e que valem para qualquer verificação nova:
+
+1. **Casar string de código-fonte não prova quase nada.** Um regex sobre
+   `event.decision === null ?` passa com qualquer lógica atrás do ternário. As
+   decisões de exibição vivem em funções puras em `format.ts` e o harness as
+   **chama** com os dados reais do sistema.
+2. **Toda alegação de conserto precisa de uma verificação que veja o DEFEITO
+   também.** Cada bloco tem par: "o defeito existe" e "o conserto age".
+
 O maior item restante é o `react-router` (308 kB de fonte, 48% do que sobrou) —
 mais que o `react-dom`. Trocá-lo por um roteador mínimo é viável, já que as 8
 rotas são planas e sem parâmetros, mas mexe em histórico e deep link: categoria
@@ -200,8 +378,15 @@ resultado medido, isso é evidência, não ruído. Foi assim que apareceu — 48
 
 Hoje a execução da proteção existe nos dois motores de backtest
 (`_apply_protective_exits`), com convenções deliberadamente pessimistas
-documentadas na seção 11 de [`SEGURANCA.md`](SEGURANCA.md). Em produção **ainda
-não existe**: `ccxt_adapter.place_order` não envia `stopPrice` nem OCO.
+documentadas na seção 12 de [`SEGURANCA.md`](SEGURANCA.md), **e em produção**, no
+`RiskManagerAgent.enforce_protective_exits`, que compara cada posição contra os
+níveis a cada snapshot.
+
+O que continua não existindo é a proteção **do lado da exchange**:
+`ccxt_adapter.place_order` não envia `stopPrice` nem OCO. A distinção não é
+detalhe — é a diferença entre "protegido enquanto o processo vive" e "protegido".
+A seção 12 do `SEGURANCA.md` lista, uma por uma, as oito situações em que uma
+posição fica sem stop; leia antes de assumir cobertura.
 
 ## Quem ganha o caixa quando os sinais competem
 
@@ -229,7 +414,9 @@ a ser frequente e alinhar os dois critérios deixa de ser cosmético.
 
 | Plano | Implementado | Motivo |
 |---|---|---|
-| Postgres/TimescaleDB + Redis via Docker | SQLite + bus in-process, com adapters Postgres/Redis prontos | Docker não instalado na máquina; troca é uma linha no `.env`, sem retrabalho |
+| Postgres/TimescaleDB + Redis via Docker | SQLite + bus in-process, com adapters Postgres/Redis prontos | Docker não instalado na máquina; troca é uma linha no `.env`, sem retrabalho — mas **nunca exercitada**: os 6 testes de Postgres são `skipped` |
+| Circuit breaker "pausa todos os agentes" | **bloqueia a abertura**; nunca pausa quem fecha posição | pausar o Execution Agent desligava o stop-loss justamente quando o mercado cai. Medido: execução ativa 1 ordem `sell`, pausada **0** |
+| Stop-loss como parâmetro calculado | comparado contra preço a cada snapshot, com registro em `risk_events` antes da ordem | parâmetro inerte não falha: era calculado, gravado e exposto, e nunca comparado com preço nenhum |
 | `pandas-ta` para indicadores | Indicadores próprios em pandas/numpy | `pandas-ta` não acompanha o pandas 3.0; e o Risk Manager exige cobertura de teste sobre cálculo próprio, não caixa-preta |
 | `vectorbt`/`backtrader` para backtest | Backtester próprio orientado a eventos | Reutiliza o **mesmo** Strategy Agent, Risk Manager e PaperBroker da produção — testa o código real, não uma reimplementação |
 | Celery/APScheduler | Loops `asyncio` no orquestrador | Um processo só; agendamento externo adicionaria infraestrutura sem ganho |
