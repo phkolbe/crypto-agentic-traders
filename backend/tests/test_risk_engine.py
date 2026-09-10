@@ -318,3 +318,245 @@ class TestAuditTrail:
         assert result.signal_id is not None
         assert result.snapshot != {}
         assert result.reasons
+
+
+class TestDegenerateInputsOnTheClosePath:
+    """O caminho de FECHAR tem as suas proprias entradas degeneradas.
+
+    Elas importam mais que as de abrir: uma excecao aqui e uma saida que nao
+    acontece, e a assimetria do sistema e nunca travar uma saida -- muito menos
+    por acidente.
+    """
+
+    def test_rejects_a_close_with_a_non_positive_price(self, engine):
+        """Sem preco nao ha notional, e uma ordem sem valor nao pode ser enviada."""
+        state = make_state(positions={"BTC": "0.01"})
+        result = engine.evaluate(
+            make_signal(direction=SignalDirection.FLAT, price="0"), state, NOW
+        )
+        assert result.decision is RiskDecision.REJECTED
+        assert any("preco de referencia invalido" in r for r in result.reasons)
+
+    def test_rejects_a_quantity_that_rounds_down_to_zero(self, engine):
+        """Preco absurdo contra ordem minima: 8 casas decimais nao alcancam.
+
+        Enviar quantidade zero seria uma ordem que a exchange recusa e que ja
+        consumiu o cooldown do par.
+        """
+        result = engine.evaluate(
+            make_signal(price="100000000000"), make_state(total="1000", cash="1000"), NOW
+        )
+        assert result.decision is RiskDecision.REJECTED
+        assert any("arredondou para zero" in r for r in result.reasons)
+
+    def test_the_exposure_percentage_never_divides_by_zero(self):
+        """Formatador de mensagem nao pode ser o que derruba o guardiao."""
+        from crypto_traders.risk.rules import _pct
+
+        assert _pct(Decimal("10"), Decimal("0")) == "0%"
+        assert _pct(Decimal("10"), Decimal("-5")) == "0%"
+        assert _pct(Decimal("25"), Decimal("100")) == "25.0%"
+
+
+class TestNoOrderLeavesWithoutItsProtection:
+    """A ultima barreira antes de a ordem sair do guardiao.
+
+    O item da lista de verificacao e "toda ordem carrega stop-loss/take-profit
+    antes de ser enviada". O motor cumpre isso hoje, mas a garantia nao pode
+    depender de o motor continuar cumprindo: uma aprovacao incompleta que
+    chegasse aqui viraria posicao aberta e desprotegida.
+    """
+
+    async def _agente(self, settings):
+        from crypto_traders.agents.risk_manager import RiskManagerAgent
+        from crypto_traders.bus import InMemoryEventBus
+
+        bus = InMemoryEventBus()
+        await bus.start()
+        return RiskManagerAgent(bus, settings)
+
+    async def _publicadas(self, agente, avaliacao, signal):
+        import asyncio
+
+        from crypto_traders.bus import Topics
+
+        pedidos: list = []
+
+        async def escuta():
+            async for pedido in agente.bus.subscribe(Topics.ORDER_REQUESTS):
+                pedidos.append(pedido)
+
+        tarefa = asyncio.create_task(escuta())
+        await asyncio.sleep(0)
+        await agente._persist_and_publish(avaliacao, signal)
+        await asyncio.sleep(0.05)
+        tarefa.cancel()
+        return pedidos
+
+    async def test_an_approved_opening_carries_both_levels(self, settings):
+        from crypto_traders.domain.models import RiskAssessment
+
+        agente = await self._agente(settings)
+        signal = make_signal()
+        avaliacao = RiskAssessment(
+            signal_id=signal.id,
+            decision=RiskDecision.APPROVED,
+            approved_quantity=Decimal("0.001"),
+            approved_notional=Decimal("50"),
+            stop_loss=Decimal("48500"),
+            take_profit=Decimal("53000"),
+        )
+        pedidos = await self._publicadas(agente, avaliacao, signal)
+        assert len(pedidos) == 1
+        assert pedidos[0].stop_loss == Decimal("48500")
+        assert pedidos[0].take_profit == Decimal("53000")
+
+    async def test_an_opening_without_a_stop_never_becomes_an_order(self, settings):
+        from crypto_traders.domain.models import RiskAssessment
+
+        agente = await self._agente(settings)
+        signal = make_signal()
+        avaliacao = RiskAssessment(
+            signal_id=signal.id,
+            decision=RiskDecision.APPROVED,
+            approved_quantity=Decimal("0.001"),
+            approved_notional=Decimal("50"),
+            stop_loss=None,
+            take_profit=Decimal("53000"),
+        )
+        assert await self._publicadas(agente, avaliacao, signal) == []
+
+    async def test_the_refusal_is_written_to_the_audit_log(self, settings):
+        """Ordem que deixou de existir em silencio e indistinguivel de nenhuma."""
+        from crypto_traders.db.repositories import AuditLogRepository
+        from crypto_traders.db.session import session_scope
+        from crypto_traders.domain.models import RiskAssessment
+
+        agente = await self._agente(settings)
+        signal = make_signal()
+        await agente._persist_and_publish(
+            RiskAssessment(
+                signal_id=signal.id,
+                decision=RiskDecision.APPROVED,
+                approved_quantity=Decimal("0.001"),
+                approved_notional=Decimal("50"),
+            ),
+            signal,
+        )
+        async with session_scope(settings) as session:
+            entradas = await AuditLogRepository(session).list()
+        bloqueio = next(e for e in entradas if e.action == "incomplete_approval_blocked")
+        assert "stop-loss" in bloqueio.detail
+
+    async def test_a_zero_quantity_never_becomes_an_order(self, settings):
+        from crypto_traders.domain.models import RiskAssessment
+
+        agente = await self._agente(settings)
+        signal = make_signal()
+        avaliacao = RiskAssessment(
+            signal_id=signal.id,
+            decision=RiskDecision.APPROVED,
+            approved_quantity=Decimal(0),
+            approved_notional=Decimal(0),
+            stop_loss=Decimal("48500"),
+            take_profit=Decimal("53000"),
+        )
+        assert await self._publicadas(agente, avaliacao, signal) == []
+
+    async def test_a_close_needs_no_levels(self, settings):
+        """Fechamento nao carrega stop: exigir um travaria a saida (D4)."""
+        from crypto_traders.domain.models import RiskAssessment
+
+        agente = await self._agente(settings)
+        signal = make_signal(direction=SignalDirection.FLAT)
+        avaliacao = RiskAssessment(
+            signal_id=signal.id,
+            decision=RiskDecision.APPROVED,
+            approved_quantity=Decimal("0.001"),
+            approved_notional=Decimal("50"),
+        )
+        pedidos = await self._publicadas(agente, avaliacao, signal)
+        assert len(pedidos) == 1
+        assert str(pedidos[0].side) == "sell"
+        assert pedidos[0].stop_loss is None
+
+
+class TestChangingLimitsIsSerialized:
+    """Alterar limite e ler-alterar-gravar com `await` no meio.
+
+    Sem serializar, duas alteracoes simultaneas leem o mesmo estado inicial e a
+    segunda a gravar apaga a primeira -- que devolveu sucesso afirmando o valor
+    novo. Apertar um teto de risco e receber a confirmacao de um aperto que nao
+    ficou de pe e a pior forma de perder uma alteracao: banco, memoria e
+    resposta ficam coerentes entre si, e uma delas e falsa.
+    """
+
+    async def _agente(self, settings):
+        from crypto_traders.agents.risk_manager import RiskManagerAgent
+        from crypto_traders.bus import InMemoryEventBus
+
+        bus = InMemoryEventBus()
+        await bus.start()
+        return RiskManagerAgent(bus, settings)
+
+    async def test_two_simultaneous_changes_both_survive(self, settings):
+        import asyncio
+
+        agente = await self._agente(settings)
+        await asyncio.gather(
+            agente.update_limits({"max_order_notional": "10"}),
+            agente.update_limits({"min_signal_confidence": 0.99}),
+        )
+
+        limites = agente.configured_limits
+        assert limites.max_order_notional == Decimal("10")
+        assert limites.min_signal_confidence == 0.99
+
+    async def test_what_each_call_returns_is_what_ends_up_in_force(self, settings):
+        """A resposta nao pode prometer um aperto que o estado final nao tem."""
+        import asyncio
+
+        agente = await self._agente(settings)
+        apertado, _ = await asyncio.gather(
+            agente.update_limits({"max_order_notional": "10"}),
+            agente.update_limits({"min_signal_confidence": 0.99}),
+        )
+
+        # Quem apertou o teto ou ve o proprio valor, ou ve um valor que continua
+        # em vigor -- nunca um numero que foi apagado por outro pedido.
+        assert apertado.max_order_notional == Decimal("10")
+        assert agente.configured_limits.max_order_notional == Decimal("10")
+
+    async def test_the_database_agrees_with_memory(self, settings):
+        import asyncio
+
+        from crypto_traders.db.repositories import RiskConfigRepository
+        from crypto_traders.db.session import session_scope
+
+        agente = await self._agente(settings)
+        await asyncio.gather(
+            agente.update_limits({"max_order_notional": "10"}),
+            agente.update_limits({"min_signal_confidence": 0.99}),
+        )
+
+        async with session_scope(settings) as session:
+            config = await RiskConfigRepository(session).get_or_create({})
+        assert config.values["max_order_notional"] == "10"
+        assert config.values["min_signal_confidence"] == 0.99
+
+    async def test_both_changes_leave_their_own_audit_line(self, settings):
+        import asyncio
+
+        from crypto_traders.db.repositories import AuditLogRepository
+        from crypto_traders.db.session import session_scope
+
+        agente = await self._agente(settings)
+        await asyncio.gather(
+            agente.update_limits({"max_order_notional": "10"}, actor="a"),
+            agente.update_limits({"min_signal_confidence": 0.99}, actor="b"),
+        )
+
+        async with session_scope(settings) as session:
+            entradas = await AuditLogRepository(session).list()
+        atores = {e.actor for e in entradas if e.action == "risk_limits_updated"}
+        assert atores == {"a", "b"}

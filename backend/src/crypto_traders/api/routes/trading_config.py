@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 
 from ...agents.orchestrator import Orchestrator
 from ...strategies import available_strategies
-from ..deps import orchestrator_dep
+from ..deps import config_write_lock, orchestrator_dep
 from ..schemas import TradingConfigIn, TradingConfigOut
 
 router = APIRouter()
@@ -56,11 +56,23 @@ async def update_trading_config(
     if not changes:
         raise HTTPException(status_code=400, detail="nenhum campo enviado")
 
-    try:
-        atualizado = await orchestrator.update_trading(changes, actor="user")
-    except ValueError as exc:
-        # Validacao de negocio (estrategia inexistente, combinacao incoerente)
-        # e erro do pedido, nao falha do servidor.
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    # A trava e o que faz a validacao valer sobre o merge que REALMENTE fica
+    # gravado. `update_trading` le a configuracao atual, monta o merge, valida e
+    # grava com `await` no meio: sem serializar, dois PUT concorrentes leem a
+    # MESMA base e o segundo a gravar apaga a alteracao do primeiro -- que
+    # recebeu 200 e um corpo confirmando o valor novo. Medido no codigo
+    # anterior, 6 vezes em 6.
+    #
+    # O caso que mais dói: `quote_currency` e `symbols` tem de andar juntos (foi
+    # o que a migracao para USDC fez). Se os dois chegarem concorrentes, um se
+    # perde e o sistema termina medindo o caixa numa moeda em que nenhum par
+    # negociado liquida, com o dashboard verde.
+    async with config_write_lock("trading"):
+        try:
+            atualizado = await orchestrator.update_trading(changes, actor="user")
+        except ValueError as exc:
+            # Validacao de negocio (estrategia inexistente, combinacao incoerente)
+            # e erro do pedido, nao falha do servidor.
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     return _to_out(atualizado)

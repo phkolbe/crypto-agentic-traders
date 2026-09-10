@@ -20,6 +20,7 @@ from ..domain.enums import ExchangeName, OrderStatus, OrderType, Side
 from ..domain.models import Candle, OrderRequest, OrderResult, Position, Ticker
 from ..logging_setup import get_logger
 from .base import ApiAccessDenied, Broker, ExchangeError, InsufficientFunds, MarketDataSource
+from .filters import MarketFilter, baseline_market_filter
 
 log = get_logger(__name__)
 
@@ -65,6 +66,54 @@ def _dec(value: Any) -> Decimal:
     if value is None:
         return Decimal(0)
     return Decimal(str(value))
+
+
+def _linhas_ohlcv_confiaveis(
+    exchange: str, symbol: str, raw: Any
+) -> list[tuple[Any, Any, Any, Any, Any, Any]]:
+    """Filtra, ordena e desduplica as linhas cruas de `fetch_ohlcv`.
+
+    Tres coisas que a resposta da exchange nao garante, e que quebram de formas
+    diferentes se assumidas:
+
+    * **Linha completa.** Resposta truncada no meio (conexao cortada, proxy) traz
+      linha curta ou com `None`. Desempacotar direto levanta `ValueError` e
+      derruba o par inteiro; deixar o `None` virar `Decimal(0)` e pior ainda,
+      porque produz candle com preco ZERO -- e preco zero viaja para
+      `latest_prices`, que o Portfolio e o Risk usam para avaliar posicao.
+    * **Ordem cronologica.** Quem esta "em formacao" e decidido por posicao. Se a
+      resposta vier decrescente (ou embaralhada por um failover de replica), o
+      candle mais antigo seria marcado como aberto e o mais NOVO como fechado --
+      e o agente publicaria um candle velho como se fosse o atual.
+    * **Timestamp unico.** Uma duplicata do candle em formacao promove a copia
+      anterior a "fechada", entregando a estrategia um preco que ainda vai mudar.
+
+    Descartar linha ruim e correto aqui: o candle volta na proxima coleta, e o
+    custo de esperar um ciclo e infinitamente menor que decidir com preco falso.
+    """
+    validas: dict[Any, tuple[Any, Any, Any, Any, Any, Any]] = {}
+    for row in raw or []:
+        if not isinstance(row, (list, tuple)) or len(row) < 6:
+            log.warning(
+                "exchange.ohlcv_linha_truncada",
+                exchange=exchange,
+                symbol=symbol,
+                linha=str(row)[:120],
+            )
+            continue
+        timestamp, open_, high, low, close, volume = row[:6]
+        if timestamp is None or any(v is None for v in (open_, high, low, close)):
+            log.warning(
+                "exchange.ohlcv_linha_incompleta",
+                exchange=exchange,
+                symbol=symbol,
+                linha=str(row)[:120],
+            )
+            continue
+        # A duplicata mais tardia na resposta vence: e a leitura mais recente da
+        # mesma janela de tempo.
+        validas[timestamp] = (timestamp, open_, high, low, close, volume)
+    return [validas[chave] for chave in sorted(validas)]
 
 
 class CcxtExchange(MarketDataSource, Broker):
@@ -149,12 +198,17 @@ class CcxtExchange(MarketDataSource, Broker):
             "fetch_ohlcv", self._client.fetch_ohlcv, symbol, timeframe, None, limit
         )
         exchange_name = self._exchange_enum()
+        linhas = _linhas_ohlcv_confiaveis(self.name, symbol, raw)
         candles: list[Candle] = []
-        for index, row in enumerate(raw):
-            timestamp, open_, high, low, close, volume = row
+        for index, (timestamp, open_, high, low, close, volume) in enumerate(linhas):
             candles.append(
                 Candle(
                     exchange=exchange_name,
+                    # Simbolo e timeframe sao os PEDIDOS, nunca o que a resposta
+                    # sugerir: a linha do ccxt e so [ts, o, h, l, c, v], e o
+                    # Market Data Agent recusa candle cuja identidade nao seja a
+                    # pedida. Se algum dia esta origem mudar, essa recusa la e
+                    # que impede o preco de um par virar o preco de outro.
                     symbol=symbol,
                     timeframe=timeframe,
                     open_time=datetime.fromtimestamp(timestamp / 1000, tz=UTC),
@@ -163,10 +217,12 @@ class CcxtExchange(MarketDataSource, Broker):
                     low=_dec(low),
                     close=_dec(close),
                     volume=_dec(volume),
-                    # O ultimo candle devolvido pela exchange ainda esta em
-                    # formacao: marcamos como aberto para que nenhuma estrategia
-                    # decida com base em um preco que ainda vai mudar.
-                    closed=index < len(raw) - 1,
+                    # O candle mais RECENTE ainda esta em formacao: marcamos como
+                    # aberto para que nenhuma estrategia decida com base em um
+                    # preco que ainda vai mudar. Isso so vale porque
+                    # `_linhas_ohlcv_confiaveis` ja ordenou por tempo -- posicao
+                    # crua na resposta nao e garantia de ordem cronologica.
+                    closed=index < len(linhas) - 1,
                 )
             )
         return candles
@@ -233,6 +289,25 @@ class CcxtExchange(MarketDataSource, Broker):
             fee_currency=(raw.get("fee") or {}).get("currency"),
             raw={k: v for k, v in raw.items() if k != "info"},
         )
+
+    def market_filter(self, symbol: str) -> MarketFilter | None:
+        """Implementa `MarketFilterSource` com o catalogo da propria exchange.
+
+        Sem isto o `_preflight` do Execution Agent saia `None` na primeira linha
+        em LIVE e TESTNET (medido em 2026-09-09: `issubclass(CcxtExchange,
+        MarketFilterSource)` era False), e a ordem que o truncamento de lote
+        joga abaixo do MIN_NOTIONAL era enviada e recusada pela exchange.
+
+        `self._client.markets` so esta populado depois de um `load_markets`
+        nesta instancia -- o que acontece dentro do primeiro `create_order`.
+        Antes disso vale o catalogo versionado, para que a PRIMEIRA ordem do
+        processo tambem seja checada.
+        """
+        mercados = getattr(self._client, "markets", None) or {}
+        market = mercados.get(symbol)
+        if market:
+            return MarketFilter.from_ccxt({**market, "symbol": symbol})
+        return baseline_market_filter(symbol, self.name)
 
     async def fetch_balances(self) -> dict[str, Decimal]:
         raw = await self._with_retry("fetch_balance", self._client.fetch_balance)

@@ -45,6 +45,43 @@ class ApiAccessDenied(ExchangeError):
         self.operation = operation
 
 
+#: Duracao de cada unidade de timeframe do ccxt, em segundos.
+#:
+#: `m` (minuto) e `M` (mes) diferem SO pela caixa -- normalizar a string para
+#: minusculo confundiria os dois por um fator de 43.200. Por isso a busca aqui e
+#: sensivel a caixa, de proposito.
+_TIMEFRAME_UNITS = {
+    "s": 1,
+    "m": 60,
+    "h": 3_600,
+    "d": 86_400,
+    "w": 604_800,
+    "M": 2_592_000,  # 30 dias: aproximacao suficiente para "este periodo fechou?"
+}
+
+
+def timeframe_seconds(timeframe: str) -> int:
+    """Duracao de um candle em segundos ("15m" -> 900).
+
+    Serve para responder a unica pergunta que a exchange nao responde de forma
+    confiavel: **este candle ja fechou?** `open_time + duracao <= agora` e a
+    unica verificacao que nao depende da ordem em que a exchange devolveu as
+    linhas nem do relogio dela.
+
+    Levanta `ValueError` no que nao souber interpretar. Recusar e mais seguro do
+    que adivinhar: com duracao errada, candle em formacao passaria por fechado.
+    """
+    texto = timeframe.strip()
+    if len(texto) < 2:
+        raise ValueError(f"timeframe invalido: {timeframe!r}")
+    quantidade, unidade = texto[:-1], texto[-1]
+    if unidade not in _TIMEFRAME_UNITS:
+        raise ValueError(f"unidade de timeframe desconhecida: {timeframe!r}")
+    if not quantidade.isdigit() or int(quantidade) <= 0:
+        raise ValueError(f"quantidade de timeframe invalida: {timeframe!r}")
+    return int(quantidade) * _TIMEFRAME_UNITS[unidade]
+
+
 class MarketDataSource(abc.ABC):
     """Leitura de mercado. Nao requer credenciais."""
 

@@ -25,9 +25,30 @@ class StrategyAgent(BaseAgent):
         super().__init__(bus)
         self._strategies = strategies
         self._settings = settings
-        self._required_candles = max(
-            (s.min_candles for s in strategies), default=50
-        )
+        self._fetch_candles = self._greediest_warmup(strategies)
+        self._muted: dict[str, tuple[str, ...]] = {}
+        """Ultima combinacao de estrategias mudas por aquecimento, por simbolo.
+
+        Existe so para nao repetir a mesma linha de log a cada candle. O
+        projeto ja pagou por log repetitivo: o watchdog alertou 1.440 vezes por
+        dia sobre o mesmo agente ocioso e o ruido virou cegueira."""
+
+    @staticmethod
+    def _greediest_warmup(strategies: list[Strategy]) -> int:
+        """Quantos candles buscar: o suficiente para a estrategia mais exigente.
+
+        Isto dimensiona a BUSCA, e nao mais a decisao. Antes, o mesmo maximo
+        tambem era a porta de entrada: o agente saia sem avaliar NENHUMA
+        estrategia quando o simbolo tinha menos candles que o maximo, e so
+        registrava em `log.debug` -- invisivel com `LOG_LEVEL=INFO`. Habilitar
+        `macd_trend` pela interface eleva a exigencia de 26 para 105 candles;
+        em 1d, um par recem-descoberto ficava meses sem nenhuma estrategia,
+        inclusive as que ja tinham aquecimento sobrando, e nada no log em nivel
+        operacional dizia isso. E a mesma familia de defeito do reindex
+        assimetrico: o sistema segue verde operando com menos estrategias do
+        que as configuradas.
+        """
+        return max((s.min_candles for s in strategies), default=50)
 
     @property
     def strategy_names(self) -> list[str]:
@@ -42,7 +63,8 @@ class StrategyAgent(BaseAgent):
         esta separacao de ambiente e negocio existe para eliminar.
         """
         self._strategies = strategies
-        self._required_candles = max((s.min_candles for s in strategies), default=50)
+        self._fetch_candles = self._greediest_warmup(strategies)
+        self._muted.clear()  # a proxima recusa por aquecimento volta a ser dita
         self.log.info("strategy.replaced", estrategias=self.strategy_names)
 
     async def _run(self) -> None:
@@ -65,21 +87,50 @@ class StrategyAgent(BaseAgent):
                 str(candle.exchange),
                 candle.symbol,
                 candle.timeframe,
-                max(self._required_candles + 10, self._settings.trading.candle_history_limit),
+                max(self._fetch_candles + 10, self._settings.trading.candle_history_limit),
             )
 
-        if len(candles) < self._required_candles:
-            self.log.debug(
-                "strategy.warmup",
+        # Cada estrategia e julgada pelo PROPRIO aquecimento. Uma exigente nao
+        # pode calar as outras: `ma_crossover` precisa de 26 candles e nao tem
+        # por que emudecer porque `macd_trend`, habilitada ao lado, precisa de
+        # 105. (A propria `evaluate` reconfere via `_has_warmup`; aqui o ponto e
+        # nao descartar o simbolo inteiro, e dizer quem ficou de fora.)
+        prontas = [s for s in self._strategies if len(candles) >= s.min_candles]
+        mudas = tuple(s.name for s in self._strategies if len(candles) < s.min_candles)
+        if mudas and self._muted.get(candle.symbol) != mudas:
+            # Nivel INFO, nao DEBUG: "o sistema esta operando com menos
+            # estrategias do que as configuradas" e informacao operacional, e em
+            # DEBUG ela nao aparece com o `LOG_LEVEL` de producao.
+            self.log.info(
+                "strategy.warmup_incompleto",
                 symbol=candle.symbol,
-                have=len(candles),
-                need=self._required_candles,
+                timeframe=candle.timeframe,
+                candles=len(candles),
+                mudas=list(mudas),
+                avaliando=[s.name for s in prontas],
+                motivo="candles insuficientes para o aquecimento declarado",
+            )
+        self._muted[candle.symbol] = mudas
+        if not prontas:
+            return
+
+        try:
+            market = MarketFrame.from_candles(candles)
+        except ValueError as exc:
+            # Janela recusada pelo dado (hoje: `open_time` repetido). Recusar e
+            # o comportamento certo, mas recusa calada faz o agente parecer
+            # ocioso -- e o nivel tem que ser visivel com `LOG_LEVEL=INFO`.
+            self.log.warning(
+                "strategy.janela_recusada",
+                symbol=candle.symbol,
+                timeframe=candle.timeframe,
+                candles=len(candles),
+                motivo=str(exc),
             )
             return
 
-        market = MarketFrame.from_candles(candles)
         signals = []
-        for strategy in self._strategies:
+        for strategy in prontas:
             try:
                 signal = strategy.evaluate(market)
             except Exception as exc:

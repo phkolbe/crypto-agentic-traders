@@ -34,7 +34,19 @@ async def run_system(with_api: bool = True) -> int:
             # abaixo cobre esse caso.
             loop.add_signal_handler(sig, request_stop)
 
-    await orchestrator.start()
+    _handle_break_on_windows(loop, request_stop)
+
+    try:
+        await orchestrator.start()
+    except Exception as exc:
+        # Subida abortada no meio deixava broker, conexao da exchange e agentes
+        # ja iniciados para tras, sem nada desligar. Pior: sem `stop()`, a
+        # proxima subida acusaria "o processo anterior foi derrubado" -- um
+        # alerta verdadeiro pela razao errada.
+        log.error("runtime.start_failed", error=str(exc))
+        with contextlib.suppress(Exception):
+            await orchestrator.stop()
+        return 1
 
     api_task: asyncio.Task[None] | None = None
     if with_api:
@@ -54,6 +66,29 @@ async def run_system(with_api: bool = True) -> int:
         await orchestrator.stop()
 
     return 0
+
+
+def _handle_break_on_windows(loop: asyncio.AbstractEventLoop, request_stop) -> None:
+    """Ctrl+Break tambem desliga limpo, em vez de matar o processo.
+
+    Ctrl+C ja chega como `KeyboardInterrupt` e cai no desligamento normal;
+    `SIGBREAK` (so existe no Windows) por padrao derruba o processo, e um
+    desligamento derrubado e indistinguivel da morte por suspensao da maquina
+    que matou o ensaio de D25. Nao substitui supervisao do sistema operacional
+    -- so evita criar um caso falso dela.
+    """
+    sigbreak = getattr(signal, "SIGBREAK", None)
+    if sigbreak is None:
+        return
+
+    def on_break(*_: object) -> None:
+        # O handler roda fora do event loop: `call_soon_threadsafe` devolve o
+        # controle a ele antes de tocar no Event.
+        with contextlib.suppress(RuntimeError):
+            loop.call_soon_threadsafe(request_stop)
+
+    with contextlib.suppress(ValueError, OSError, AttributeError):
+        signal.signal(sigbreak, on_break)
 
 
 async def _serve_api(orchestrator: Orchestrator, stop_signal: asyncio.Event) -> None:

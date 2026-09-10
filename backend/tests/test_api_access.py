@@ -37,6 +37,11 @@ def make_request(client_order_id: str = "cat-acesso-001") -> OrderRequest:
         order_type=OrderType.MARKET,
         quantity=Decimal("0.001"),
         notional=Decimal("50"),
+        # Abertura sem stop-loss e recusada no ultimo portao do Execution Agent
+        # (e nenhuma aprovacao real do Risk Manager sai sem ele), entao a
+        # fabrica precisa produzir um pedido que chegue ao envio.
+        stop_loss=Decimal("48500"),
+        take_profit=Decimal("53000"),
         strategy="ma_crossover",
     )
 
@@ -234,7 +239,14 @@ class TestExecutionAgentOnAccessDenied:
         assert not agent.access_denied
 
     async def test_a_plain_failure_does_not_trigger_the_access_alert(self, settings):
-        """Saldo insuficiente não é perda de acesso; confundir os dois gera ruído."""
+        """Falha de rede não é perda de acesso; confundir os dois gera ruído.
+
+        O desfecho de um timeout é `PENDING`, não `FAILED`: a chamada não voltou,
+        e isso não prova que a ordem não aconteceu (ver `_classificar` no
+        Execution Agent). Ele tem alerta próprio — `order_outcome_unknown` —, e o
+        que este teste garante é que ele **não** vira `api_access_denied`, que
+        mandaria o operador investigar whitelist de IP à toa.
+        """
         bus = InMemoryEventBus()
         await bus.start()
 
@@ -255,8 +267,8 @@ class TestExecutionAgentOnAccessDenied:
         await asyncio.sleep(0.1)
         task.cancel()
 
-        assert result is not None and result.status is OrderStatus.FAILED
-        assert alerts == []
+        assert result is not None and result.status is OrderStatus.PENDING
+        assert [a["type"] for a in alerts] == ["order_outcome_unknown"]
         assert not agent.access_denied
 
 

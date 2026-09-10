@@ -8,6 +8,7 @@ sem tocar na logica de negocio.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -359,12 +360,33 @@ class TradeRepository:
         await self._session.delete(trade)
         return True
 
+    async def for_cost_basis(self, limit: int = 200_000) -> list[orm.Trade]:
+        """Historico inteiro, para derivar custo medio e PnL realizado.
+
+        Sem filtro de modo, de cotacao ou de origem **de proposito**: quem apura
+        (`PortfolioAgent._apurar`) precisa VER o trade que vai descartar para
+        registrar o descarte no `audit_log`. Filtrar aqui deixaria o descarte
+        invisivel, que e como este projeto perde protecao.
+
+        A ordenacao final e feita em Python: compra tem de vir antes de venda
+        quando o instante empata, e isso o banco nao sabe.
+        """
+        stmt = select(orm.Trade).order_by(orm.Trade.executed_at.asc()).limit(limit)
+        return list((await self._session.execute(stmt)).scalars().all())
+
     async def realized_pnl_total(self) -> Decimal:
-        """Soma o PnL realizado em Python, nao com `SUM()` no banco.
+        """Soma a COLUNA `realized_pnl` em Python, nao com `SUM()` no banco.
 
         No SQLite estas colunas sao texto (ver `db.models.Money`), e deixar o
         banco somar forcaria uma conversao para float -- reintroduzindo pela
         agregacao o erro de precisao que o tipo evita no armazenamento.
+
+        ATENCAO: nao e o realizado do portfolio. Esta coluna so e preenchida pelo
+        Execution Agent quando ele mesmo fecha a posicao que abriu; lancamento
+        manual, venda parcial e posicao herdada a deixam vazia. O realizado
+        publicado no retrato e DERIVADO do historico por custo medio em
+        `PortfolioAgent._apurar` -- com esta soma, um historico de 650 de lucro
+        publicava zero.
         """
         stmt = select(orm.Trade.realized_pnl).where(orm.Trade.realized_pnl.is_not(None))
         values = (await self._session.execute(stmt)).scalars().all()
@@ -391,12 +413,18 @@ class PortfolioSnapshotRepository:
             )
         )
 
-    async def latest(self) -> orm.PortfolioSnapshot | None:
-        stmt = (
-            select(orm.PortfolioSnapshot)
-            .order_by(orm.PortfolioSnapshot.timestamp.desc())
-            .limit(1)
-        )
+    async def latest(self, mode: str | None = None) -> orm.PortfolioSnapshot | None:
+        """Ultimo retrato; com `mode`, o ultimo retrato DAQUELE modo.
+
+        O recorte por modo existe porque o retrato do ensaio em dry_run carrega
+        contabilidade de dinheiro de papel (realizado, saldo reconciliado). Usar
+        esse retrato como referencia do modo real seria a contaminacao do papel
+        entrando pela porta de tras, depois de barrada na apuracao dos trades.
+        """
+        stmt = select(orm.PortfolioSnapshot)
+        if mode is not None:
+            stmt = stmt.where(orm.PortfolioSnapshot.mode == mode)
+        stmt = stmt.order_by(orm.PortfolioSnapshot.timestamp.desc()).limit(1)
         return (await self._session.execute(stmt)).scalar_one_or_none()
 
     async def history(
@@ -517,6 +545,37 @@ class AuditLogRepository:
     async def list(self, limit: int = 100, offset: int = 0) -> list[orm.AuditLog]:
         stmt = (
             select(orm.AuditLog).order_by(orm.AuditLog.timestamp.desc()).limit(limit).offset(offset)
+        )
+        return list((await self._session.execute(stmt)).scalars().all())
+
+
+class PortfolioLedgerRepository:
+    """Leitura do razao de fantasmas do Portfolio Agent, gravado no `audit_log`.
+
+    O razao registra quanta quantidade o historico afirma e a exchange nao
+    confirma, e quanto credito ja foi atribuido a ela. Precisa das tres
+    propriedades ao mesmo tempo: durar entre reinicios, ser append-only e ser
+    legivel por uma pessoa -- e o registro do ajuste E o razao dele.
+
+    Mora numa classe propria, e nao em `AuditLogRepository`, porque aquela e
+    append-only por contrato e expoe EXATAMENTE `append` e `list` (existe teste
+    cobrando o conjunto de metodos). Ler linhas ja gravadas nao afrouxa esse
+    contrato -- nada aqui faz update nem delete --, e a separacao mantem obvio,
+    para quem le a outra classe, que o contrato dela nao mudou.
+    """
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def movements(
+        self, actions: Sequence[str], limit: int = 20_000
+    ) -> list[orm.AuditLog]:
+        """Movimentos do razao, em ordem cronologica."""
+        stmt = (
+            select(orm.AuditLog)
+            .where(orm.AuditLog.action.in_(list(actions)))
+            .order_by(orm.AuditLog.timestamp.asc())
+            .limit(limit)
         )
         return list((await self._session.execute(stmt)).scalars().all())
 

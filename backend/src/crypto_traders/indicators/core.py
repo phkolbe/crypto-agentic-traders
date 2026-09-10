@@ -42,22 +42,47 @@ def _smooth(series: pd.Series, period: int, alpha: float) -> pd.Series:
     no grafico da exchange, e o backtest passa a validar um sistema diferente do
     que roda ao vivo.
 
-    NaN inicial (produzido por `diff()`/`shift()`) e ignorado na semente.
+    NaN **inicial** (produzido por `diff()`/`shift()`) e artefato de aquecimento e
+    e pulado na semente. NaN **no meio** da serie e outra coisa: e dado
+    corrompido, e a recursao a partir dele fica indefinida -- por isso ele
+    envenena o resultado para frente em vez de ser costurado.
+
+    A versao anterior fazia `dropna()` antes da recursao e reindexava no fim.
+    Isso produzia dois defeitos medidos:
+
+    * um NaN no meio era **emendado em silencio**: com um furo no candle 20 de
+      uma serie de 40, `rma(.., 14)` devolvia 113,3873 onde a serie intacta
+      dava 113,4732. Numero plausivel, calculado sobre uma serie que nao
+      existiu, sem NaN nenhum na saida para denunciar.
+    * o `reindex` estourava `ValueError: cannot reindex on an axis with
+      duplicate labels` quando a janela tinha `open_time` repetido. E estourava
+      de forma assimetrica: `rsi`/`atr` (que passam serie com NaN inicial, logo
+      indice diferente do original) quebravam, `ema`/`sma` (indice identico,
+      atalho do pandas) passavam. O agente registrava `strategy.failed` so para
+      as estrategias de RSI, e o sistema seguia verde operando com menos
+      estrategias do que as configuradas.
+
+    A recursao agora e posicional, sem `reindex`.
     """
     _validate(period)
-    valid = series.dropna()
-    if len(valid) < period:
-        return pd.Series(np.nan, index=series.index, dtype="float64")
-
-    values = valid.to_numpy(dtype=float)
+    values = series.to_numpy(dtype=float)
     out = np.full(len(values), np.nan)
-    current = float(values[:period].mean())
-    out[period - 1] = current
-    for i in range(period, len(values)):
-        current = alpha * values[i] + (1.0 - alpha) * current
-        out[i] = current
 
-    return pd.Series(out, index=valid.index).reindex(series.index)
+    start = 0
+    while start < len(values) and np.isnan(values[start]):
+        start += 1
+    usable = values[start:]
+    if len(usable) < period:
+        return pd.Series(out, index=series.index, dtype="float64")
+
+    # Semente com furo -> NaN, e o NaN se propaga sozinho pela recursao abaixo.
+    current = float(usable[:period].mean())
+    out[start + period - 1] = current
+    for offset in range(period, len(usable)):
+        current = alpha * usable[offset] + (1.0 - alpha) * current
+        out[start + offset] = current
+
+    return pd.Series(out, index=series.index, dtype="float64")
 
 
 def ema(series: pd.Series, period: int) -> pd.Series:
@@ -72,10 +97,60 @@ def rma(series: pd.Series, period: int) -> pd.Series:
     return _smooth(series, period, alpha=1.0 / period)
 
 
-def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    """Indice de Forca Relativa (Wilder).
+@dataclass(frozen=True)
+class RsiResult:
+    value: pd.Series
+    """O RSI, 0-100, identico ao que o TradingView desenha."""
 
-    Retorna 0-100. Convencao classica: <30 sobrevendido, >70 sobrecomprado.
+    avg_gain: pd.Series
+    avg_loss: pd.Series
+    """As duas medias de Wilder que formam o RS. Ficam expostas porque o VALOR
+    do RSI, sozinho, nao diz se a janela tinha informacao: com `avg_gain`
+    exatamente zero o RSI e 0 por definicao, e 0 aqui nao significa
+    "sobrevendido", significa "nenhuma alta na janela inteira"."""
+
+    @property
+    def one_sided(self) -> pd.Series:
+        """True onde a janela tem so ganho ou so perda -- RSI colado em 100 ou 0.
+
+        Nao e limiar calibrado: e aritmetica exata. `avg_gain == 0` significa
+        que nao houve **uma unica** barra de alta desde a semente, e
+        `avg_loss == 0`, nenhuma de baixa.
+
+        ATENCAO -- isto detecta apenas o CANTO exato, e canto exato tem medida
+        zero. Medido em 2026-09-09: um unico tique de alta de 1e-08 em qualquer
+        barra da janela tira `avg_gain` do zero (vira 1,62e-10) e `one_sided`
+        vira False, embora a janela continue sem informacao nenhuma. Quem
+        precisa decidir "esta janela tem movimento economico?" tem que usar
+        `relative_width`, que e RELATIVA ao preco, e nao esta propriedade.
+        """
+        return (self.avg_gain == 0.0) | (self.avg_loss == 0.0)
+
+    def relative_width(self, reference: pd.Series) -> pd.Series:
+        """Movimento medio por barra da janela, dividido pelo preco.
+
+        `avg_gain + avg_loss` e a media de Wilder de `|delta|`: quanto o preco
+        anda por barra, em unidade de preco. Dividido pelo preco de referencia
+        vira adimensional, e portanto comparavel entre BTC a 60.000 e PEPE a
+        0,00001 -- que e o ponto. O RSI e invariante a escala e essa invariancia
+        e justamente o defeito: ele le "sobrevenda profunda" num par que andou
+        um tique porque a razao entre dois ruidos e um numero bem-comportado.
+
+        `reference` deve ser a serie de fechamentos alinhada a mesma janela.
+        Preco zero devolve NaN (nao 0), para que o resultado seja "nao sei" e
+        nao "janela larga".
+        """
+        return (self.avg_gain + self.avg_loss) / reference.replace(0, np.nan)
+
+
+def rsi_detail(series: pd.Series, period: int = 14) -> RsiResult:
+    """RSI de Wilder junto das medias que o formam.
+
+    A formula e a do Pine Script (`ta.rsi`), incluindo os dois casos de canto:
+    `avg_loss == 0` -> 100, `avg_gain == 0` -> 0. Serie totalmente plana cai no
+    primeiro deles e devolve **100**, nao 50 -- e o que o TradingView devolve, e
+    manter a paridade com o grafico da exchange vale mais aqui do que uma
+    convencao mais bonita. Quem decide sobre isso usa `one_sided`.
     """
     _validate(period)
     delta = series.diff()
@@ -88,7 +163,39 @@ def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     rs = avg_gain / avg_loss.replace(0, np.nan)
     result = 100.0 - (100.0 / (1.0 + rs))
     # Sem nenhuma perda na janela, RS -> infinito e o RSI e 100 por definicao.
-    return result.where(avg_loss != 0, 100.0).where(avg_gain.notna())
+    value = result.where(avg_loss != 0, 100.0).where(avg_gain.notna())
+    return RsiResult(value=value, avg_gain=avg_gain, avg_loss=avg_loss)
+
+
+def relative_move(series: pd.Series, period: int = 14) -> pd.Series:
+    """Movimento medio absoluto por barra dividido pelo preco -- adimensional.
+
+    `rma(|delta|, period) / preco`. E a resposta a pergunta "esta janela andou?"
+    numa unidade comparavel entre BTC a 60.000 e PEPE a 0,00001. Serve de piso
+    de operabilidade para qualquer estrategia: indicador normalizado (RSI, %B,
+    cruzamento de medias) e cego a largura da janela por construcao, e num par
+    morto le a razao entre dois ruidos como se fosse mercado.
+
+    Vale a identidade `relative_move(close, p) == rsi_detail(close, p).
+    relative_width(close)`: `rma` e linear e `gains + losses == |delta|`, entao
+    `rma(gains) + rma(losses) == rma(|delta|)`. Sao a mesma grandeza por dois
+    caminhos, e existe teste comparando as duas serie a serie -- o que torna o
+    piso de `MIN_WINDOW_WIDTH` uma medida unica para as quatro estrategias, e
+    nao quatro numeros calibrados separadamente.
+
+    Usa `rma` (Wilder, D2) e nao media simples para que a janela herde a mesma
+    memoria que o RSI e o ATR ja usam.
+    """
+    _validate(period)
+    return rma(series.diff().abs(), period) / series.replace(0, np.nan)
+
+
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    """Indice de Forca Relativa (Wilder).
+
+    Retorna 0-100. Convencao classica: <30 sobrevendido, >70 sobrecomprado.
+    """
+    return rsi_detail(series, period).value
 
 
 @dataclass(frozen=True)
@@ -185,14 +292,17 @@ def _validate(period: int) -> None:
 __all__ = [
     "BollingerResult",
     "MacdResult",
+    "RsiResult",
     "atr",
     "bollinger_bands",
     "crossed_above",
     "crossed_below",
     "ema",
     "macd",
+    "relative_move",
     "rma",
     "rsi",
+    "rsi_detail",
     "sma",
     "true_range",
 ]

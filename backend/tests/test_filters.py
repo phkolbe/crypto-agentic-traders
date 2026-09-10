@@ -15,9 +15,14 @@ from decimal import Decimal
 import pytest
 
 from crypto_traders.exchanges.filters import (
+    FONTE_AO_VIVO,
+    FONTE_BASELINE,
     MarketFilter,
+    baseline_filters,
+    baseline_market_filter,
     check_all,
     check_order_viability,
+    check_quantity_viability,
 )
 
 #: Preços e passos reais da Binance no momento da medição.
@@ -207,3 +212,210 @@ class TestCheckCommand:
         from crypto_traders.cli import _check_market_filters
 
         assert _check_market_filters(settings, {}, {}, [], self._sizing("10"))
+
+
+#: BNB/USDC do ensaio em curso (D24): passo de 0,001 BNB, minimo de 5 USDC.
+BNB = MarketFilter("BNB/USDC", Decimal("0.001"), Decimal("5"), Decimal("0"))
+
+#: Valor por ordem medido no ensaio de hoje: 20% de 29,29 USDC autorizados.
+ORDEM_DO_ENSAIO = Decimal("5.86")
+
+
+class TestOEnsaioDeHoje:
+    """Os numeros exatos que estao rodando agora, em USDC.
+
+    Existe para que uma mudanca de sizing ou de par nao passe sem que alguem
+    veja o que ela faz com a fronteira do MIN_NOTIONAL.
+    """
+
+    def test_bnb_a_862_passa_de_raspao(self):
+        """5,86 vira 0,006 BNB = 5,175 USDC. Sobra 0,175 acima do minimo."""
+        r = check_order_viability(BNB, ORDEM_DO_ENSAIO, Decimal("862.50"))
+        assert r.viable
+        assert r.effective_amount == Decimal("0.006")
+        assert r.effective_notional == Decimal("5.175")
+
+    def test_um_passo_de_bnb_vale_quase_um_setimo_da_ordem(self):
+        """A margem e fina porque o passo e grosso: 0,8625 USDC por passo."""
+        passo = BNB.amount_step * Decimal("862.50")
+        assert passo == Decimal("0.86250")
+        assert ORDEM_DO_ENSAIO - Decimal("5.175") < passo
+
+    def test_bnb_subindo_para_1200_joga_a_mesma_ordem_abaixo_do_minimo(self):
+        """Nada muda na configuracao; so o preco sobe -- e a ordem morre."""
+        r = check_order_viability(BNB, ORDEM_DO_ENSAIO, Decimal("1200"))
+        assert not r.viable
+        assert r.effective_amount == Decimal("0.004")
+        assert r.effective_notional == Decimal("4.800")
+        assert "abaixo do minimo de 5" in r.reason
+
+    def test_a_sugestao_para_bnb_a_1200_realmente_passa(self):
+        r = check_order_viability(BNB, ORDEM_DO_ENSAIO, Decimal("1200"))
+        segunda = check_order_viability(BNB, r.suggested_notional, Decimal("1200"))
+        assert segunda.viable
+
+    def test_a_margem_de_cada_par_do_ensaio_fica_registrada(self):
+        """Tres pares com passos bem diferentes, mesmo valor de ordem.
+
+        Medido: dos 5,86 sobram 5,175 no BNB, 5,5332 no BTC e 5,7169 no ETH.
+        O BNB e o par apertado da lista -- 0,175 USDC acima do minimo de 5,
+        contra 0,53 do BTC e 0,72 do ETH. E por isso que o BNB e o par que
+        estoura primeiro se o preco subir.
+        """
+        casos = [
+            (BNB, Decimal("862.50"), Decimal("5.175")),
+            (
+                MarketFilter("BTC/USDC", Decimal("0.00001"), Decimal("5"), Decimal("0")),
+                Decimal("79045.71"),
+                Decimal("5.5331997"),
+            ),
+            (
+                MarketFilter("ETH/USDC", Decimal("0.0001"), Decimal("5"), Decimal("0")),
+                Decimal("2485.60"),
+                Decimal("5.716880"),
+            ),
+        ]
+        for market, preco, esperado in casos:
+            r = check_order_viability(market, ORDEM_DO_ENSAIO, preco)
+            assert r.viable, market.symbol
+            assert r.effective_notional == esperado, market.symbol
+
+
+class TestTruncate:
+    """`truncate` tem que reproduzir o `amount_to_precision` do ccxt (TRUNCATE)."""
+
+    def test_trunca_para_baixo_nunca_para_cima(self):
+        assert BNB.truncate(Decimal("0.004883")) == Decimal("0.004")
+        assert BNB.truncate(Decimal("0.0049999")) == Decimal("0.004")
+
+    def test_multiplo_exato_nao_muda(self):
+        assert BNB.truncate(Decimal("0.006")) == Decimal("0.006")
+
+    def test_menos_de_um_passo_vira_zero(self):
+        assert BNB.truncate(Decimal("0.0009")) == Decimal(0)
+
+    def test_passo_invalido_nao_altera_a_quantidade(self):
+        livre = MarketFilter("X/USDT", Decimal(0), Decimal(0), Decimal(0))
+        assert livre.truncate(Decimal("1.23456789")) == Decimal("1.23456789")
+
+
+class TestPelaQuantidade:
+    """`check_quantity_viability` e a porta do caminho de ENVIO."""
+
+    def test_concorda_com_a_checagem_por_valor(self):
+        pelo_valor = check_order_viability(BNB, Decimal("5.86"), Decimal("1200"))
+        pela_qtd = check_quantity_viability(
+            BNB, Decimal("5.86") / Decimal("1200"), Decimal("1200")
+        )
+        assert pela_qtd.viable == pelo_valor.viable
+        assert pela_qtd.effective_amount == pelo_valor.effective_amount
+        assert pela_qtd.effective_notional == pelo_valor.effective_notional
+
+    def test_quantidade_ja_no_passo_passa(self):
+        r = check_quantity_viability(BNB, Decimal("0.006"), Decimal("862.50"))
+        assert r.viable
+        assert r.requested_notional == Decimal("5.17500")
+
+    def test_preco_invalido_e_recusado(self):
+        r = check_quantity_viability(BNB, Decimal("0.006"), Decimal(0))
+        assert not r.viable
+        assert "preco" in r.reason
+
+    def test_quantidade_que_zera_diz_que_zerou(self):
+        """Mensagem que descreve a causa, nao o sintoma."""
+        r = check_quantity_viability(BNB, Decimal("0.0009"), Decimal("862.50"))
+        assert not r.viable
+        assert "arredonda para zero" in r.reason
+
+
+class TestCatalogoVersionado:
+    """O catalogo que faz a checagem AGIR sem depender de rede nem de setter.
+
+    Motivo de existir, medido em 2026-09-09: `MarketFilterSource` estava
+    implementado e testado, e `set_market_filter` nao tinha UM chamador em
+    `src/`. Em dry_run o `PaperBroker` subia sem conhecer filtro de par nenhum,
+    `market_filter()` devolvia `None`, o `_preflight` devolvia `None` -- e a
+    ordem abaixo do MIN_NOTIONAL continuava sendo enviada e recusada pela
+    exchange. Codigo que existe e nao roda nao protege ninguem.
+
+    Os numeros abaixo sao os da Binance real, capturados por
+    `load_markets()` (endpoint publico, sem credencial) em 2026-09-09.
+    """
+
+    def test_o_par_do_mandato_esta_no_catalogo_com_os_numeros_reais(self):
+        bnb = baseline_market_filter("BNB/USDC")
+        assert bnb is not None, "BNB/USDC fora do catalogo: a checagem nao teria dado"
+        assert bnb.amount_step == Decimal("0.001")
+        assert bnb.min_cost == Decimal("5")
+        assert bnb.min_amount == Decimal("0.001")
+        assert bnb.source == FONTE_BASELINE
+
+    def test_o_caso_do_mandato_e_recusado_usando_so_o_catalogo(self):
+        """5,86 USDC com BNB a 1.200 -> 0,004 BNB = 4,80: abaixo do minimo de 5.
+
+        Nenhum filtro escrito a mao neste teste: o dado vem do catalogo, que e
+        o que o sistema realmente usa quando ninguem carregou nada.
+        """
+        bnb = baseline_market_filter("BNB/USDC")
+        assert bnb is not None
+        r = check_quantity_viability(bnb, Decimal("5.86") / Decimal("1200"), Decimal("1200"))
+        assert not r.viable
+        assert r.effective_amount == Decimal("0.004")
+        assert r.effective_notional == Decimal("4.800")
+        assert r.source == FONTE_BASELINE
+        assert "minimo de 5" in r.reason
+
+    def test_o_mesmo_valor_passa_onde_o_passo_e_fino(self):
+        """A recusa e do par, nao do valor: em ETH os mesmos 5,86 passam."""
+        eth = baseline_market_filter("ETH/USDC")
+        assert eth is not None and eth.amount_step == Decimal("0.0001")
+        r = check_quantity_viability(eth, Decimal("5.86") / Decimal("3000"), Decimal("3000"))
+        assert r.viable
+
+    def test_par_inexistente_nao_e_inventado(self):
+        assert baseline_market_filter("MOEDAINEXISTENTE/USDC") is None
+
+    def test_exchange_fora_do_catalogo_nao_herda_os_filtros_da_binance(self):
+        """Aplicar o passo de lote da Binance a outra exchange seria inventar dado."""
+        assert baseline_filters("coinbase") == {}
+        assert baseline_market_filter("BTC/USDC", "coinbase") is None
+
+    def test_o_catalogo_e_grande_e_todo_passo_e_positivo(self):
+        catalogo = baseline_filters("binance")
+        assert len(catalogo) > 1000, f"catalogo com apenas {len(catalogo)} pares"
+        assert all(f.amount_step > 0 for f in catalogo.values())
+        assert all(f.source == FONTE_BASELINE for f in catalogo.values())
+
+    def test_filtro_ao_vivo_do_ccxt_e_marcado_como_ao_vivo(self):
+        """A fonte tem que viajar com o filtro: e ela que diz o quanto confiar."""
+        vivo = MarketFilter.from_ccxt(
+            {
+                "symbol": "BNB/USDC",
+                "precision": {"amount": 0.001},
+                "limits": {"cost": {"min": 5}, "amount": {"min": 0.001}},
+            }
+        )
+        assert vivo.source == FONTE_AO_VIVO
+
+    def test_catalogo_ilegivel_volta_vazio_em_vez_de_derrubar_o_processo(
+        self, monkeypatch, tmp_path
+    ):
+        """Arquivo corrompido nao pode impedir o sistema de subir.
+
+        Sem catalogo o comportamento volta a ser o antigo (envia e a exchange
+        decide), que e ruim mas conhecido; levantar aqui mataria a subida do
+        processo por causa de um dado auxiliar.
+        """
+        from crypto_traders.exchanges import filters as mod
+
+        mod.baseline_filters.cache_clear()
+        monkeypatch.setitem(mod._ARQUIVOS_BASELINE, "quebrada", "nao_existe.json")
+        try:
+            assert mod.baseline_filters("quebrada") == {}
+        finally:
+            mod.baseline_filters.cache_clear()
+
+    def test_o_catalogo_e_somente_leitura(self):
+        """Cacheado por processo: quem mutasse mudaria o filtro de todo mundo."""
+        with pytest.raises(TypeError):
+            baseline_filters("binance")["BTC/USDC"] = None  # type: ignore[index]

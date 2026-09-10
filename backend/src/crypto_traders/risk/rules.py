@@ -273,7 +273,7 @@ class RiskEngine:
             assessment = self.evaluate(signal, working, now)
             results.append((signal, assessment))
             if assessment.decision is RiskDecision.APPROVED:
-                _apply_fill(working, signal, assessment, now)
+                _apply_fill(working, signal, assessment, now, self.limits.min_order_notional)
         return results
 
     # ------------------------------------------------------------------
@@ -499,7 +499,11 @@ class RiskEngine:
 
 
 def _apply_fill(
-    state: PortfolioState, signal: Signal, assessment: RiskAssessment, now: datetime
+    state: PortfolioState,
+    signal: Signal,
+    assessment: RiskAssessment,
+    now: datetime,
+    min_executable: Decimal,
 ) -> None:
     """Reflete uma aprovacao no estado, para o proximo sinal do lote ver a realidade.
 
@@ -507,12 +511,27 @@ def _apply_fill(
     slippage. O objetivo aqui nao e contabilidade -- e impedir que dois sinais
     concorrentes sejam ambos aprovados contra o mesmo caixa. Quem contabiliza de
     verdade e o broker.
+
+    `min_executable` e o menor valor que a exchange aceita negociar. Ele existe
+    aqui por causa de um furo MEDIDO no portao de capital: o fechamento de uma
+    posicao de poeira e aprovado de proposito (D4 nunca trava uma saida), mas a
+    exchange o RECUSA por valor minimo -- e creditar o caixa dessa venda no
+    estado simulado financiava abertura com dinheiro que nunca ia existir.
+    Medido com a configuracao de producao (29,29 USDC autorizados, 20% por
+    ordem, minimo de 5): 28 USDC parados em sete posicoes de poeira liberaram
+    11,72 USDC de nova exposicao, levando a exposicao total a 39,72 -- 35,6%
+    acima do autorizado.
     """
     base, _ = _split_symbol(signal.symbol)
     quantity = assessment.approved_quantity or Decimal(0)
     notional = assessment.approved_notional or Decimal(0)
 
     if signal.direction is SignalDirection.FLAT:
+        if notional < min_executable:
+            # Saida aprovada e irrealizavel: nada de caixa, nada de vaga. So o
+            # cooldown, porque o pedido foi de fato publicado.
+            state.last_order_at[signal.symbol] = now
+            return
         state.cash += notional
         state.positions[base] = state.quantity_of(base) - quantity
     else:

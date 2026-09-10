@@ -10,7 +10,13 @@ from ...config import Settings
 from ...exchanges import build_market_data_source
 from ...strategies import get_strategy
 from ..deps import settings_dep
-from ..schemas import BacktestIn, BacktestOut
+from ..schemas import (
+    BacktestEquityPoint,
+    BacktestIn,
+    BacktestOut,
+    BacktestSummaryOut,
+    BacktestTradeOut,
+)
 
 router = APIRouter()
 
@@ -63,25 +69,31 @@ async def run_backtest(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    # Dinheiro sai como string (D7). Os Decimais vem do proprio `result`, e nao
+    # do `summary()`, porque `summary()` entrega `initial_balance` e
+    # `final_value` ja convertidos para float -- reserializar aquele float
+    # gravaria o residuo em vez do valor exato.
+    summary = result.summary() | {
+        "initial_balance": result.initial_balance,
+        "final_value": result.final_value,
+    }
     return BacktestOut(
-        summary=result.summary(),
+        summary=BacktestSummaryOut.model_validate(summary),
         equity_curve=[
-            {"timestamp": moment.isoformat(), "value": float(value)}
+            BacktestEquityPoint(timestamp=moment.isoformat(), value=value)
             for moment, value in result.equity_curve
         ],
         trades=[
-            {
-                "timestamp": trade.timestamp.isoformat(),
-                "side": trade.side,
-                "quantity": float(trade.quantity),
-                "price": float(trade.price),
-                "notional": float(trade.notional),
-                "fee": float(trade.fee),
-                "reason": trade.reason,
-                "realized_pnl": float(trade.realized_pnl)
-                if trade.realized_pnl is not None
-                else None,
-            }
+            BacktestTradeOut(
+                timestamp=trade.timestamp.isoformat(),
+                side=trade.side,
+                quantity=trade.quantity,
+                price=trade.price,
+                notional=trade.notional,
+                fee=trade.fee,
+                reason=trade.reason,
+                realized_pnl=trade.realized_pnl,
+            )
             for trade in result.trades
         ],
     )

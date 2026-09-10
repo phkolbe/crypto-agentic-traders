@@ -256,6 +256,52 @@ class CapitalStatusOut(MoneyModel):
     quote_currency: str
 
 
+class CapitalAuthorizationIn(BaseModel):
+    """Corpo de `POST /api/risk/capital/authorize`.
+
+    Existe porque autorizar capital E afrouxar um limite de risco: e o unico
+    numero que decide quanto do patrimonio o sistema pode por para trabalhar.
+    Antes esta rota nao tinha corpo nenhum -- medido, com o portao do ensaio
+    real em 29,29 USDC e um aporte de 5.000 na conta, um POST vazio devolvia
+    200 e deixava `authorized_capital=5000`: 170x mais dinheiro autorizado por
+    um clique, enquanto a rota irma (`PUT /api/risk/config`), que edita o MESMO
+    campo, recusava com 400 sem `confirm=true`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    confirm: bool = Field(
+        default=False,
+        description="Confirmacao explicita: autorizar capital afeta dinheiro real.",
+    )
+    expected_total_value: Decimal | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Patrimonio que a pessoa viu na tela ao clicar. Quando enviado, a "
+            "rota recusa se o valor apurado mudou -- autorizar passa a ser um "
+            "ato sobre um numero conhecido, e nao sobre o que aparecer na hora."
+        ),
+    )
+
+
+class CircuitBreakerResetIn(BaseModel):
+    """Corpo de `POST /api/risk/circuit-breaker/reset`.
+
+    Rearmar a trava devolve ao sistema a permissao de abrir posicao depois de
+    algo ter saido do esperado. Mesma razao da rota de limites: nao pode ser
+    efeito colateral de um clique -- nem de um POST disparado por uma aba
+    qualquer aberta na maquina.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    confirm: bool = Field(
+        default=False,
+        description="Confirmacao explicita: rearmar libera novas posicoes.",
+    )
+
+
 # ---------------------------------------------------------------------------
 class TradingConfigOut(MoneyModel):
     """Configuracao de negocio vigente. Vem do banco, nunca do `.env`."""
@@ -396,7 +442,52 @@ class BacktestIn(BaseModel):
     initial_balance: Decimal = Field(default=Decimal("1000"), gt=0)
 
 
+class BacktestSummaryOut(MoneyModel):
+    """Resumo do backtest.
+
+    Tipado campo a campo de proposito. Enquanto era `dict[str, Any]`, dinheiro
+    saia como number no JSON: medido, `initial_balance: 1000.0`,
+    `final_value: 1000.0` e cada ponto da curva de capital. Um `dict[str, Any]`
+    nao tem como o `MoneyModel` saber que aquele valor e dinheiro -- e sem tipo
+    nenhum a regra D7 nao tinha onde ser aplicada nem onde quebrar em teste.
+    """
+
+    strategy: str
+    symbol: str
+    timeframe: str
+    start: str
+    end: str
+    initial_balance: Decimal
+    final_value: Decimal
+    total_return_pct: float
+    buy_and_hold_pct: float
+    max_drawdown_pct: float
+    trades: int
+    closed_trades: int
+    win_rate: float
+    profit_factor: float
+    signals_generated: int
+    signals_rejected: int
+    top_rejection_reasons: list[tuple[str, int]]
+
+
+class BacktestEquityPoint(MoneyModel):
+    timestamp: str
+    value: Decimal
+
+
+class BacktestTradeOut(MoneyModel):
+    timestamp: str
+    side: str
+    quantity: Decimal
+    price: Decimal
+    notional: Decimal
+    fee: Decimal
+    reason: str
+    realized_pnl: Decimal | None = None
+
+
 class BacktestOut(BaseModel):
-    summary: dict[str, Any]
-    equity_curve: list[dict[str, Any]]
-    trades: list[dict[str, Any]]
+    summary: BacktestSummaryOut
+    equity_curve: list[BacktestEquityPoint]
+    trades: list[BacktestTradeOut]
