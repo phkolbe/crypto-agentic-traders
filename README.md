@@ -32,7 +32,9 @@ O diagrama esconde o caminho que mais importa: **o Portfolio Agent volta ao Risk
 Manager.** A cada snapshot (60s) ele alimenta a comparação de stop-loss e a
 reavaliação do circuit breaker — a proteção é um laço, não uma etapa da esteira.
 
-Detalhamento em [`docs/ARQUITETURA.md`](docs/ARQUITETURA.md).
+Detalhamento em [`docs/ARQUITETURA.md`](docs/ARQUITETURA.md). Os três níveis do
+C4 — contexto, contêineres e componentes — em diagramas que o GitHub renderiza:
+[`docs/C4.md`](docs/C4.md).
 
 ### Estado atual, sem otimismo
 
@@ -40,8 +42,10 @@ Detalhamento em [`docs/ARQUITETURA.md`](docs/ARQUITETURA.md).
   no histórico, e todo número de retorno neste repositório vem de backtest.
 - Suíte verde em **1118 passed, 6 skipped, 1 xfailed** — e o que os skips e o
   xfail escondem está em [Os limites conhecidos](#os-limites-conhecidos-em-uma-tela).
-- O processo **não sobrevive** à suspensão da máquina. Ele detecta e alerta que
-  morreu na subida seguinte, o que não é a mesma coisa que continuar rodando.
+- O processo agora roda sob **supervisão do sistema operacional** (Tarefa Agendada,
+  que tenta subi-lo a cada 2 min). Medido: derrubado à força, volta sozinho em ~2
+  min. A supervisão cobre o **logon do operador**, não a máquina sem ninguém
+  conectado — essa opção exige guardar a senha no Agendador.
 
 ### Onde está o quê
 
@@ -240,7 +244,7 @@ Um engenheiro novo deve sair desta seção sabendo o que o sistema **não** gara
 | **Seis** situações em que uma posição aberta fica sem stop — inclusive posição sem preço médio e poeira abaixo do mínimo da exchange | [`SEGURANCA.md` §12](docs/SEGURANCA.md) |
 | PostgreSQL/TimescaleDB **nunca rodaram** aqui; os 6 testes deles são `skipped` | [`SEGURANCA.md` §17](docs/SEGURANCA.md) |
 | **Nunca houve teste de integração contra a testnet.** Nenhuma ordem deste sistema chegou a um servidor da Binance | [`SEGURANCA.md` §17](docs/SEGURANCA.md) |
-| O processo **não sobrevive** à suspensão da máquina — "deixa rodando alguns dias" ainda não é executável | [`SEGURANCA.md` §17](docs/SEGURANCA.md) |
+| A supervisão do SO cobre o **logon do operador**, não a máquina sem usuário conectado | [`SEGURANCA.md` §17](docs/SEGURANCA.md) |
 | Aporte menor que a perda ainda mascara parte dela no circuit breaker (`xfail` estrito) | [`SEGURANCA.md` §17](docs/SEGURANCA.md) |
 | A trilha append-only **não** resiste a código hostil dentro do próprio processo | [`SEGURANCA.md` §5](docs/SEGURANCA.md) |
 | Três filtros de regime medidos e desligados; nenhum replicou fora da janela | [`SEGURANCA.md` §11](docs/SEGURANCA.md) |

@@ -1,5 +1,9 @@
 # Arquitetura
 
+> Para a visão em diagramas — contexto, contêineres e componentes, no modelo C4 —
+> veja [`C4.md`](C4.md). Este documento é a versão em prosa, e desce a detalhes
+> que um diagrama não comporta.
+
 ## Princípio central
 
 O sistema é dividido em agentes com **uma responsabilidade cada**, ligados por um

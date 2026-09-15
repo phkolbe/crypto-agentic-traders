@@ -1141,9 +1141,9 @@ acabou de criá-la com os padrões de fábrica.
 > limitações é uma decisão consciente, não um esquecimento.
 >
 > ⚠️ **Leia a seção 17 também.** Ela lista o que a medição NÃO cobre. Em
-> particular: nunca houve teste de integração contra a testnet, e o processo não
-> sobrevive à suspensão da máquina — então o passo 2 desta lista ("`dry_run` por
-> semanas") ainda não é uma instrução que o sistema consegue cumprir sozinho.
+> particular: nunca houve teste de integração contra a testnet, e a supervisão do
+> processo cobre o logon do operador, não a máquina sem usuário conectado — então
+> o passo 2 desta lista ("`dry_run` por semanas") depende de a sessão ficar aberta.
 
 Uma sequência, não uma escolha:
 
@@ -1256,18 +1256,40 @@ em processo único. Os filtros reais de cada par são consultados pelo
 Por isso os passos 3 a 6 da seção 15 não são formalidade: eles são a única
 evidência que este sistema **não tem**.
 
-**3. O processo não sobrevive à suspensão da máquina.** Achado 3 de D25, e ele
-continua valendo. O ensaio em `dry_run` de 08/09 morreu em 26 minutos, junto com
-a árvore de processos derrubada pela suspensão da máquina — sem traceback, com o
-log parando no meio. O endurecimento tornou isso **visível** (a subida seguinte
-denuncia a morte anterior e alerta), e não o resolveu: manter o processo vivo é
-trabalho de sistema operacional — Tarefa Agendada com "executar mesmo sem usuário
-conectado" no Windows, `systemd` no Linux, e nenhuma das duas existe hoje.
+**3. A supervisão do processo existe, e cobre menos do que o nome sugere.**
 
-**"Deixa rodando alguns dias" continua não sendo uma instrução que o sistema
-consegue cumprir.** E enquanto for assim, o passo 2 da seção 15 (`dry_run` por
-semanas) não é executável, o que significa que a evidência mais básica antes do
-LIVE não existe.
+Correção de uma causa que este documento afirmou errado. O achado 3 de D25 dizia
+que a suspensão da máquina derrubava a árvore de processos. **Não era isso.** A
+segunda morte, em 10/09 às 23:12, foi medida no log de eventos do Windows em vez
+de suposta, e a suspensão só veio à **00:19 — uma hora e sete minutos depois**. O
+que matou está no mesmo segundo da morte:
+
+```
+Application Hang 1002   conhost.exe travou e foi fechado
+CoworkVMService         "stopped" e "starting" as 23:12:42
+AppXDeploymentServer    evento de servicing de pacote
+```
+
+O serviço do aplicativo que hospedava a sessão reiniciou por atualização e levou
+junto o console host ao qual o processo estava amarrado. Isso é **pior** que
+suspensão, porque acontece sem aviso e se repete a cada atualização — e nenhuma
+robustez de código evita, porque o processo não é dono da própria árvore.
+
+**O que existe hoje:** Tarefa Agendada com gatilho repetitivo de 2 minutos e
+`IgnoreNew` — a cada 2 min tenta subir; se já roda, a tentativa é descartada; se
+morreu, sobe. Medido: processo derrubado à força às 12:51:20, de volta às
+12:53:21.
+
+Vale registrar o que **não** funcionou, porque é a opção óbvia: a configuração
+"reiniciar se a tarefa falhar" **não age**. O `LastTaskResult` registrou a falha
+(`4294967295`) e nada reiniciou em 4 minutos de observação. Quem ressuscita é o
+gatilho repetitivo, não o reinício-em-falha.
+
+**O que continua descoberto:** a tarefa roda no **logon do operador**. Cobrir a
+máquina sem usuário conectado exige marcar "executar mesmo sem usuário conectado"
+e digitar a senha no Agendador — decisão do dono da conta. Até lá, logoff ou
+reinício sem login interrompem o ensaio, e o passo 2 da seção 15 (`dry_run` por
+semanas) depende de o operador manter a sessão aberta.
 
 **4. Uma limitação conhecida do circuit breaker, registrada em `xfail`.** É o
 único `xfail` do repositório, e é `strict=True` com motivo escrito — não é teste
