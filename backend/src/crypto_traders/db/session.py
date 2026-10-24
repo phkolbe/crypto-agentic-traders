@@ -21,8 +21,10 @@ from ..config import Settings, get_settings
 from ..logging_setup import get_logger
 from .models import (
     Base,
+    ProtecaoAusenteError,
     aplicar_protecao_append_only,
     avisar_se_a_aplicacao_pode_derrubar_gatilho,
+    conceder_a_aplicacao,
     hypertable_possivel,
     instalar_autorizador_sqlite,
     relatar_dinheiro_fora_de_escala,
@@ -208,10 +210,31 @@ async def criar_hypertables(engine: AsyncEngine) -> list[str]:
     return criadas
 
 
-async def init_db(settings: Settings | None = None) -> None:
-    """Cria o schema e, no Postgres, converte as series temporais em hypertables."""
+async def init_db(
+    settings: Settings | None = None,
+    *,
+    migrar: bool | None = None,
+    usuario_aplicacao: str | None = None,
+) -> None:
+    """Cria o schema e, no Postgres, converte as series temporais em hypertables.
+
+    Com `migrar=False` (ou `DB_MIGRAR_NA_SUBIDA=false`) nao cria nada: so confere
+    que o schema e os gatilhos append-only estao no banco e recusa subir se nao
+    estiverem. E o caminho do Docker, onde a aplicacao roda com um usuario sem
+    privilegio de DDL e o schema e do `crypto-traders migrar` (usuario dono).
+
+    `usuario_aplicacao` (Postgres, so no `migrar`): concede a ele leitura e
+    escrita de linhas, e a sonda de privilegio passa a perguntar por ELE -- o
+    dono, que roda o `migrar`, sempre pode mexer em gatilho, e acusa-lo seria
+    um alarme falso.
+    """
     settings = settings or get_settings()
+    if migrar is None:
+        migrar = settings.db_migrar_na_subida
     engine = get_engine(settings)
+    if not migrar:
+        await _conferir_db(settings, engine)
+        return
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         # Re-aplicado a cada subida: banco criado antes destes gatilhos
@@ -240,11 +263,33 @@ async def init_db(settings: Settings | None = None) -> None:
     # comando que falha aborta a transacao inteira e leva o schema junto no
     # COMMIT seguinte. Vale para a hypertable e vale para a sonda de privilegio.
     if settings.database_url.startswith("postgresql"):
-        async with engine.connect() as conn:
-            await conn.run_sync(avisar_se_a_aplicacao_pode_derrubar_gatilho)
         await criar_hypertables(engine)
+        if usuario_aplicacao:
+            # Depois das hypertables: o GRANT vale para as tabelas que existem agora.
+            async with engine.begin() as conn:
+                await conn.run_sync(conceder_a_aplicacao, usuario_aplicacao)
+            log.info("db.privilegios_da_aplicacao", usuario=usuario_aplicacao)
+        async with engine.connect() as conn:
+            await conn.run_sync(avisar_se_a_aplicacao_pode_derrubar_gatilho, usuario_aplicacao)
 
     log.info("db.initialized")
+
+
+async def _conferir_db(settings: Settings, engine: AsyncEngine) -> None:
+    """A metade de `init_db` que so le: gatilhos presentes, privilegios, escala."""
+    try:
+        async with engine.connect() as conn:
+            await conn.run_sync(verificar_protecao_append_only)
+            await conn.run_sync(relatar_dinheiro_fora_de_escala)
+    except ProtecaoAusenteError as exc:
+        raise ProtecaoAusenteError(
+            f"{exc} Banco sem schema ou sem gatilhos: rode `crypto-traders migrar` "
+            "com o usuario dono do banco antes de subir."
+        ) from exc
+    if settings.database_url.startswith("postgresql"):
+        async with engine.connect() as conn:
+            await conn.run_sync(avisar_se_a_aplicacao_pode_derrubar_gatilho)
+    log.info("db.conferido", detail="schema e gatilhos presentes; nada criado na subida")
 
 
 async def dispose_engine() -> None:

@@ -1750,11 +1750,15 @@ class TestPostgresDeVerdade:
         await dispose_engine()
 
     async def test_round_trip_de_18_casas(self, pg):
+        # Par proprio deste teste: o banco do POSTGRES_TEST_URL e compartilhado com
+        # os outros testes da classe e `trades` e append-only (nao se limpa entre
+        # execucoes). "A ultima trade" lia a de outro teste -- medido na primeira
+        # vez que esta classe rodou contra um Postgres de verdade (24/10/2026).
         async with session_scope(pg) as ses:
             await TradeRepository(ses).record(
                 executed_at=datetime(2026, 1, 5, tzinfo=UTC),
                 exchange="binance",
-                symbol="BTC/USDC",
+                symbol="DEZOITO/USDC",
                 side="buy",
                 quantity=DEZOITO_CASAS,
                 price=Decimal("1"),
@@ -1762,7 +1766,7 @@ class TestPostgresDeVerdade:
                 realized_pnl=-UM_WEI,
             )
         async with session_scope(pg) as ses:
-            trade = (await TradeRepository(ses).list(limit=1))[0]
+            trade = (await TradeRepository(ses).list(limit=1, symbol="DEZOITO/USDC"))[0]
 
         assert isinstance(trade.quantity, Decimal)
         assert trade.quantity == DEZOITO_CASAS
@@ -1771,7 +1775,11 @@ class TestPostgresDeVerdade:
 
     async def test_hypertables_existem_quando_a_extensao_existe(self, pg):
         engine = get_engine(pg)
-        assert await timescale_instalado(engine), "instale a extensao para valer este teste"
+        if not await timescale_instalado(engine):
+            # O Postgres do Docker (o da plataforma) e o 16 puro: Timescale e
+            # otimizacao opcional (`criar_hypertables`), e sem a extensao este
+            # teste nao tem o que medir -- passar aqui seria mentir.
+            pytest.skip("Postgres sem a extensao TimescaleDB")
         async with session_scope(pg) as ses:
             nomes = (
                 await ses.execute(

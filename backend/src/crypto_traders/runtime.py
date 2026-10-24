@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import signal
 
+from . import observabilidade
 from .agents.orchestrator import Orchestrator
 from .config import get_settings
 from .logging_setup import get_logger
@@ -19,6 +20,9 @@ log = get_logger(__name__)
 
 async def run_system(with_api: bool = True) -> int:
     settings = get_settings()
+    # Antes do orquestrador: a instrumentacao do SQLAlchemy precisa do engine, e
+    # a subida em si ja tem linhas de log que valem estar no coletor.
+    observabilidade.instalar(settings)
     orchestrator = Orchestrator(settings)
 
     stop_signal = asyncio.Event()
@@ -46,11 +50,13 @@ async def run_system(with_api: bool = True) -> int:
         log.error("runtime.start_failed", error=str(exc))
         with contextlib.suppress(Exception):
             await orchestrator.stop()
+        observabilidade.desligar()
         return 1
 
     api_task: asyncio.Task[None] | None = None
     if with_api:
         api_task = asyncio.create_task(_serve_api(orchestrator, stop_signal), name="api")
+    telemetria = asyncio.create_task(observabilidade.acompanhar(orchestrator), name="telemetria")
 
     banner(settings, with_api)
 
@@ -59,11 +65,13 @@ async def run_system(with_api: bool = True) -> int:
     except KeyboardInterrupt:  # pragma: no cover - interativo
         pass
     finally:
+        telemetria.cancel()
         if api_task is not None:
             api_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await api_task
         await orchestrator.stop()
+        observabilidade.desligar()
 
     return 0
 
@@ -97,8 +105,10 @@ async def _serve_api(orchestrator: Orchestrator, stop_signal: asyncio.Event) -> 
     from .api.app import create_app
 
     settings = orchestrator.settings
+    app = create_app(orchestrator)
+    observabilidade.instrumentar_api(app)
     config = uvicorn.Config(
-        create_app(orchestrator),
+        app,
         host=settings.api_host,
         port=settings.api_port,
         log_level=settings.log_level.lower(),

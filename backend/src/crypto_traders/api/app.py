@@ -11,13 +11,15 @@ pessoal -- nunca abra a porta no roteador.
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import TYPE_CHECKING
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
-from ..config import get_settings
+from ..config import PROJECT_ROOT, get_settings
 from ..logging_setup import get_logger
 from .deps import origem_confiavel, settings_dep
 from .routes import (
@@ -118,5 +120,33 @@ def create_app(orchestrator: Orchestrator | None = None) -> FastAPI:
     app.include_router(notifications.router, prefix="/api", tags=["notificacoes"])
     app.include_router(trading_config.router, prefix="/api", tags=["configuracao"])
     app.include_router(ws.router, tags=["tempo real"])
+    _servir_telas(app, PROJECT_ROOT / "frontend" / "dist")
 
     return app
+
+
+def _servir_telas(app: FastAPI, pasta: Path) -> None:
+    """Serve o dashboard ja montado (`npm run build`), quando ele existe.
+
+    No Docker nao ha Vite: a imagem traz `frontend/dist` e a propria API entrega
+    as telas na mesma origem, entao `/api` e `/ws` continuam relativos e a trava
+    de origem segue valendo. Rota desconhecida fora de `/api` devolve o
+    `index.html` (o React Router resolve); dentro de `/api` continua 404.
+    Em desenvolvimento com `npm run dev`, nada muda.
+    """
+    indice = pasta / "index.html"
+    if not indice.is_file():
+        return
+    raiz = pasta.resolve()
+    if (pasta / "assets").is_dir():
+        app.mount("/assets", StaticFiles(directory=pasta / "assets"), name="telas")
+
+    @app.get("/{caminho:path}", include_in_schema=False)
+    async def telas(caminho: str) -> FileResponse:
+        if caminho == "api" or caminho.startswith(("api/", "ws")):
+            raise HTTPException(status_code=404, detail="Not Found")
+        alvo = (pasta / caminho).resolve()
+        if caminho and alvo.is_file() and alvo.is_relative_to(raiz):
+            return FileResponse(alvo)
+        # O index muda a cada build (nomes dos assets com hash): nunca em cache.
+        return FileResponse(indice, headers={"Cache-Control": "no-cache"})

@@ -1,55 +1,95 @@
-# Infraestrutura opcional: PostgreSQL/TimescaleDB + Redis.
+# Desenvolvimento do Sistema Cripto em Docker: Postgres 16, o `migrar` (roda e sai)
+# e o sistema (agentes + API + telas) em http://127.0.0.1:8000.
 #
-# O sistema roda sem Docker (SQLite + event bus in-process). Este compose existe
-# para quando quiser as series temporais do TimescaleDB e o replay de eventos do
-# Redis Streams. Depois de `docker compose up -d`, troque no .env:
+#     docker compose up -d --build
 #
-#   DATABASE_URL=postgresql+asyncpg://crypto:crypto@localhost:5432/crypto_traders
-#   EVENT_BUS=redis
+# Ambiente do sistema: o `.env` da raiz (o mesmo de sempre: TRADING_MODE, chaves da
+# Binance, SMTP, WhatsApp). O que muda por estar em conteiner -- banco, host da API,
+# telemetria -- esta abaixo em `environment` e vence o `.env`.
 #
-# e instale os extras: uv pip install -e ".[dev,postgres,redis]"
+# Observabilidade: traces, logs e metricas vao por OTLP ao coletor do compose de
+# desenvolvimento do pampufa-platform (`docker compose --profile observabilidade up -d`
+# la), pelo host.docker.internal:4318; Grafana em http://localhost:8080/grafana/,
+# painel "Sistema Cripto". Sem o coletor no ar o sistema roda igual e a telemetria
+# se perde. Producao: pampufa-platform/infra/implantacao/crypto/ (cofre cryptocoins).
 #
-# Nenhum codigo de agente muda.
+# Nenhuma porta sai do 127.0.0.1: a API nao tem login (cofre cryptocoins, decisoes).
 
-name: crypto-agentic-traders
+name: crypto
+
+x-imagem: &imagem
+  image: ghcr.io/phkolbe/crypto:${VERSAO_CRYPTO:-local}
+  build: .
 
 services:
-  db:
-    image: timescale/timescaledb:latest-pg16
-    container_name: crypto-db
+  postgres:
+    image: postgres:16-alpine
+    container_name: crypto-postgres
     restart: unless-stopped
     environment:
-      POSTGRES_USER: crypto
-      POSTGRES_PASSWORD: crypto
-      POSTGRES_DB: crypto_traders
-    # Exposto apenas em localhost: o banco nunca fica acessivel na rede.
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${SENHA_POSTGRES:-postgres}
+      CRYPTO_SENHA_DONO: ${SENHA_DB_CRYPTO_DONO:-crypto_dono}
+      CRYPTO_SENHA_APP: ${SENHA_DB_CRYPTO:-crypto}
+    # So para inspecao (psql, DBeaver) e para a suite de testes (POSTGRES_TEST_URL).
     ports:
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:${PORTA_POSTGRES:-5433}:5432"
     volumes:
-      - db_data:/var/lib/postgresql/data
-      - ./docker/timescale_init.sql:/docker-entrypoint-initdb.d/00-timescale.sql:ro
+      - postgres:/var/lib/postgresql/data
+      - ./docker/postgres_init.sh:/docker-entrypoint-initdb.d/00-crypto.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U crypto -d crypto_traders"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d crypto"]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 10
+    deploy:
+      resources:
+        limits: {memory: 256M}
 
-  redis:
-    image: redis:7-alpine
-    container_name: crypto-redis
+  migrar:
+    <<: *imagem
+    container_name: crypto-migrar
+    restart: "no"
+    command: ["crypto-traders", "migrar", "--usuario-aplicacao", "crypto"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://crypto_dono:${SENHA_DB_CRYPTO_DONO:-crypto_dono}@crypto-postgres:5432/crypto
+      LOG_JSON: "false"
+    depends_on:
+      postgres: {condition: service_healthy}
+
+  crypto:
+    <<: *imagem
+    container_name: crypto
     restart: unless-stopped
-    # appendonly garante que os eventos sobrevivem a um restart do container.
-    command: ["redis-server", "--appendonly", "yes"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      ENVIRONMENT: dev
+      DATABASE_URL: postgresql+asyncpg://crypto:${SENHA_DB_CRYPTO:-crypto}@crypto-postgres:5432/crypto
+      DB_MIGRAR_NA_SUBIDA: "false"
+      EVENT_BUS: memory
+      API_HOST: 0.0.0.0
+      API_PORT: "8000"
+      CORS_ORIGINS: http://127.0.0.1:${PORTA_CRYPTO:-8000},http://localhost:${PORTA_CRYPTO:-8000}
+      LOG_JSON: "true"
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_ENDPOINT:-http://host.docker.internal:4318}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
-      - "127.0.0.1:6379:6379"
-    volumes:
-      - redis_data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      - "127.0.0.1:${PORTA_CRYPTO:-8000}:8000"
+    depends_on:
+      migrar: {condition: service_completed_successfully}
+    # Os agentes terminam o ciclo corrente antes de parar (runtime.py): nenhuma
+    # ordem enviada fica sem registro. 10 s (o padrao) pode cortar isso.
+    stop_grace_period: 60s
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+    deploy:
+      resources:
+        limits: {memory: 512M}
 
 volumes:
-  db_data:
-  redis_data:
+  postgres:
+    name: crypto_postgres

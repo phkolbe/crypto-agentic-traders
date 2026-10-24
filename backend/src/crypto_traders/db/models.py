@@ -869,8 +869,36 @@ def verificar_protecao_append_only(connection: Connection) -> tuple[str, ...]:
     return tuple(sorted(existentes))
 
 
-def avisar_se_a_aplicacao_pode_derrubar_gatilho(connection: Connection) -> None:
+def conceder_a_aplicacao(connection: Connection, usuario: str) -> None:
+    """Postgres: o usuario da aplicacao le e grava linhas, e so isso.
+
+    Roda no `crypto-traders migrar`, com o DONO do banco. O dono e quem tem
+    TRIGGER e CREATE (sempre: e dono); a aplicacao recebe SELECT, INSERT, UPDATE
+    e DELETE nas tabelas e uso das sequencias. UPDATE e DELETE nas trilhas
+    append-only continuam recusados pelos gatilhos, e derrubar um gatilho exige
+    ser dono -- o servidor recusa, sem depender de nada neste processo. Isto e o
+    `SQL_REVOGACAO_POSTGRES` feito do jeito certo: em vez de tirar poder de quem
+    tem, nunca dar.
+    """
+    if connection.dialect.name != "postgresql":
+        return
+    alvo = connection.dialect.identifier_preparer.quote(usuario)
+    for comando in (
+        f"GRANT USAGE ON SCHEMA public TO {alvo}",
+        f"GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO {alvo}",
+        f"GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO {alvo}",
+        f"REVOKE TRIGGER ON audit_log, risk_events, trades FROM {alvo}",
+    ):
+        connection.execute(text(comando).execution_options(**_OPCAO_INTERNA))
+
+
+def avisar_se_a_aplicacao_pode_derrubar_gatilho(
+    connection: Connection, usuario: str | None = None
+) -> None:
     """No Postgres da para perguntar ao servidor quem pode mexer nos gatilhos.
+
+    `usuario` e o da aplicacao quando quem pergunta e o `migrar` (o dono, que
+    sempre pode); sem ele, pergunta pelo usuario desta conexao.
 
     Enquanto o usuario da aplicacao tiver o privilegio TRIGGER, ele consegue
     derrubar a propria protecao -- e ai a ultima barreira e removivel por quem
@@ -889,9 +917,10 @@ def avisar_se_a_aplicacao_pode_derrubar_gatilho(connection: Connection) -> None:
     try:
         pode = connection.execute(
             text(
-                "SELECT bool_or(has_table_privilege(current_user, t, 'TRIGGER')) "
-                "FROM unnest(ARRAY['audit_log', 'risk_events', 'trades']) AS t"
-            ).execution_options(**_OPCAO_INTERNA)
+                "SELECT bool_or(has_table_privilege(COALESCE(:usuario, current_user), t, "
+                "'TRIGGER')) FROM unnest(ARRAY['audit_log', 'risk_events', 'trades']) AS t"
+            ).execution_options(**_OPCAO_INTERNA),
+            {"usuario": usuario},
         ).scalar()
     except Exception as exc:  # pragma: no cover - servidor sem has_table_privilege
         log.warning("db.privilegio_indeterminado", error=str(exc))
@@ -899,6 +928,7 @@ def avisar_se_a_aplicacao_pode_derrubar_gatilho(connection: Connection) -> None:
     if pode:
         log.error(
             "db.aplicacao_pode_derrubar_gatilho",
+            usuario=usuario or "current_user",
             detail=(
                 "o usuario da aplicacao tem privilegio TRIGGER nas trilhas append-only; "
                 "rode como dono do banco: " + "; ".join(SQL_REVOGACAO_POSTGRES)

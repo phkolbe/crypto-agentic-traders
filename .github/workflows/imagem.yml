@@ -1,0 +1,60 @@
+# Imagem Docker do Sistema Cripto (linux/arm64) no GitHub Container Registry, para a
+# producao no vm-prd (Oracle A1, ARM). Cofre Obsidian cryptocoins (implantacao) e
+# grupo-sr, plataforma/arquitetura/implantacao-ambientes.md §9.
+#
+# Tag `vX.Y.Z` no main -> ghcr.io/phkolbe/crypto:vX.Y.Z (e :sha-<curto>); a versao que
+# roda em producao e a VERSAO_CRYPTO do versoes.env do servidor. `workflow_dispatch`
+# monta so a :sha-<curto>. O Crypto nao usa o pampufa-sdk: nao ha secret no build.
+name: Imagem
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: imagem-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  imagem:
+    name: Build linux/arm64 e push no GHCR
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/phkolbe/crypto
+          tags: |
+            type=ref,event=tag
+            type=sha,prefix=sha-
+          labels: |
+            org.opencontainers.image.title=crypto
+            org.opencontainers.image.vendor=Grupo SR
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false

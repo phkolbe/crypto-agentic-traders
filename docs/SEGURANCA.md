@@ -1246,6 +1246,19 @@ Consequência direta para a seção 5: a separação de privilégio que fecharia
 trilha append-only contra código hostil no processo depende justamente do
 PostgreSQL. Enquanto ele não rodar, essa limitação continua aberta.
 
+**Atualização em 24/10/2026 — o PostgreSQL rodou.** Com a ida para o Docker, a
+suíte passou a rodar contra um PostgreSQL 16 de verdade (`POSTGRES_TEST_URL`, no
+CI e no compose de desenvolvimento): os testes de Postgres passam, menos o das
+*hypertables*, que fica `skipped` porque o Postgres da plataforma não tem a
+extensão TimescaleDB — as séries ficam em tabela comum, e o Timescale continua
+**não exercitado**. A separação de privilégio da seção 5 agora existe: o dono do
+banco (`crypto_dono`) cria schema e gatilhos pelo `crypto-traders migrar`, a
+aplicação roda como `crypto`, só com leitura e escrita de linhas, e o **servidor**
+recusa o `DROP TRIGGER` e o `CREATE TABLE` dela (medido em
+`test_docker_e_observabilidade.py` e na stack de produção). Um teste antigo desta
+classe, que nunca tinha rodado, falhou na primeira vez por ler "a última trade"
+num banco compartilhado; foi corrigido para ler a própria.
+
 **2. Não houve teste de integração contra a testnet.** Nenhuma ordem deste
 sistema jamais chegou a um servidor da Binance. Tudo o que a suíte prova sobre
 execução, idempotência, reconciliação e stop-loss foi provado com `PaperBroker`
@@ -1284,6 +1297,14 @@ Vale registrar o que **não** funcionou, porque é a opção óbvia: a configura
 "reiniciar se a tarefa falhar" **não age**. O `LastTaskResult` registrou a falha
 (`4294967295`) e nada reiniciou em 4 minutos de observação. Quem ressuscita é o
 gatilho repetitivo, não o reinício-em-falha.
+
+**Atualização em 24/10/2026 — a supervisão passou ao Docker.** No notebook, o
+sistema roda no compose de desenvolvimento com `restart: unless-stopped`, e as
+duas Tarefas Agendadas ficaram desabilitadas (não apagadas). A lacuna de logon
+**continua no notebook**: o Docker Desktop só abre quando alguém entra na conta.
+Em produção (`vm-prd`, Linux) o Docker é serviço do sistema e sobe no boot sem
+ninguém conectado — lá a lacuna fecha. O texto abaixo é o registro da fase da
+Tarefa Agendada.
 
 **O que continua descoberto:** a tarefa roda no **logon do operador**. Cobrir a
 máquina sem usuário conectado exige marcar "executar mesmo sem usuário conectado"

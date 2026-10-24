@@ -3,6 +3,8 @@
     crypto-traders check                      diagnostico do ambiente
     crypto-traders backtest --symbol BTC/USDT valida uma estrategia
     crypto-traders run                        sobe agentes + API
+    crypto-traders migrar                     cria schema e gatilhos (usuario dono)
+    crypto-traders copiar-sqlite ARQUIVO      leva o historico do SQLite ao Postgres
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ import argparse
 import asyncio
 import sys
 from decimal import Decimal
+from pathlib import Path
 
 from .config import get_settings
 from .db.session import init_db, session_scope
@@ -50,6 +53,20 @@ def main(argv: list[str] | None = None) -> int:
     run = subparsers.add_parser("run", help="Sobe os agentes e a API")
     run.add_argument("--no-api", action="store_true", help="Sobe apenas os agentes")
 
+    migrar = subparsers.add_parser(
+        "migrar", help="Cria o schema e os gatilhos append-only (com o usuario dono do banco)"
+    )
+    migrar.add_argument(
+        "--usuario-aplicacao",
+        default=None,
+        help="Postgres: usuario da aplicacao que recebe so leitura e escrita de linhas",
+    )
+
+    copiar = subparsers.add_parser(
+        "copiar-sqlite", help="Copia o historico de um SQLite para o banco de DATABASE_URL (vazio)"
+    )
+    copiar.add_argument("arquivo", type=Path, help="Arquivo .db de origem (aberto so leitura)")
+
     args = parser.parse_args(argv)
     settings = get_settings()
     configure_logging(settings.log_level, settings.log_json)
@@ -62,7 +79,52 @@ def main(argv: list[str] | None = None) -> int:
         from .runtime import run_system
 
         return asyncio.run(run_system(with_api=not args.no_api))
+    if args.command == "migrar":
+        return asyncio.run(_migrar(settings, args.usuario_aplicacao))
+    if args.command == "copiar-sqlite":
+        return asyncio.run(_copiar_sqlite(settings, args.arquivo))
     return 1
+
+
+# ---------------------------------------------------------------------------
+async def _migrar(settings, usuario_aplicacao: str | None) -> int:
+    """Schema, gatilhos e privilegios. Roda e sai, antes do `run` (Docker).
+
+    No Postgres, quem roda isto e o DONO do banco; a aplicacao roda com
+    `usuario_aplicacao`, que recebe SELECT/INSERT/UPDATE/DELETE nas tabelas e uso
+    das sequencias -- e nada de TRIGGER nem CREATE, entao nao derruba a propria
+    trilha append-only (`db.models.conceder_a_aplicacao`).
+    """
+    from .db.session import dispose_engine
+
+    try:
+        await init_db(settings, migrar=True, usuario_aplicacao=usuario_aplicacao)
+    except Exception as exc:
+        log.error("migrar.falhou", error=str(exc))
+        return 1
+    finally:
+        await dispose_engine()
+    print("migrar: schema e gatilhos prontos")
+    return 0
+
+
+async def _copiar_sqlite(settings, arquivo: Path) -> int:
+    from .db.copia import copiar_sqlite_para
+    from .db.session import dispose_engine, get_engine
+
+    try:
+        copiadas = await copiar_sqlite_para(get_engine(settings), arquivo)
+    except Exception as exc:
+        log.error("copia.falhou", error=str(exc))
+        print(f"copia recusada: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        await dispose_engine()
+    largura = max(len(nome) for nome in copiadas)
+    for nome, linhas in copiadas.items():
+        print(f"  {nome:<{largura}}  {linhas:>9}")
+    print(f"copia concluida: {sum(copiadas.values())} linhas em {len(copiadas)} tabelas")
+    return 0
 
 
 # ---------------------------------------------------------------------------

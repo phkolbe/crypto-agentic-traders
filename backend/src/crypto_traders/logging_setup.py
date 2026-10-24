@@ -7,13 +7,16 @@ e colorida e legivel.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import sys
+from collections.abc import Callable
 from typing import Any
 
 import structlog
 
-_configured = False
+#: (nivel, json) da configuracao em vigor; None antes da primeira.
+_configured: tuple[str, bool] | None = None
 
 _SENSITIVE_KEYS = {
     "api_key",
@@ -39,9 +42,36 @@ def _redact_secrets(_logger: Any, _name: str, event_dict: dict[str, Any]) -> dic
     return event_dict
 
 
+#: Para onde vai uma copia de cada linha, alem do console: a observabilidade
+#: (`observabilidade.instalar`) liga isto ao coletor OpenTelemetry. Vazio, nada.
+_espelho: Callable[[str, dict[str, Any]], None] | None = None
+
+
+def definir_espelho(espelho: Callable[[str, dict[str, Any]], None] | None) -> None:
+    global _espelho
+    _espelho = espelho
+
+
+def _espelhar(_logger: Any, method_name: str, event_dict: dict[str, Any]) -> dict[str, Any]:
+    """Copia a linha, ja redigida e com a excecao formatada, para o espelho.
+
+    Fica depois de `_redact_secrets` de proposito: o que sai da maquina passa
+    pela mesma ultima linha de defesa que o que vai ao disco.
+    """
+    if _espelho is not None:
+        # Log nunca derruba quem loga.
+        with contextlib.suppress(Exception):
+            _espelho(method_name, event_dict)
+    return event_dict
+
+
 def configure_logging(level: str = "INFO", json_output: bool = False) -> None:
     global _configured
-    if _configured:
+    # Reconfigura quando o pedido muda. Antes era "configura uma vez so": o
+    # primeiro `get_logger` da importacao configurava com o padrao (console,
+    # INFO) e a chamada do `cli.main` com o `.env` era ignorada -- LOG_JSON=true
+    # nunca teve efeito. Mesmo defeito de sempre: configurado e inerte.
+    if _configured == (level.upper(), json_output):
         return
 
     renderer: Any = (
@@ -58,6 +88,7 @@ def configure_logging(level: str = "INFO", json_output: bool = False) -> None:
             _redact_secrets,
             structlog.processors.StackInfoRenderer(),
             structlog.processors.format_exc_info,
+            _espelhar,
             renderer,
         ],
         wrapper_class=structlog.make_filtering_bound_logger(
@@ -68,12 +99,14 @@ def configure_logging(level: str = "INFO", json_output: bool = False) -> None:
     )
 
     logging.basicConfig(level=level.upper(), stream=sys.stderr, format="%(message)s")
+    logging.getLogger().setLevel(level.upper())
     for noisy in ("ccxt", "urllib3", "asyncio", "apscheduler.executors.default"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
-    _configured = True
+    _configured = (level.upper(), json_output)
 
 
 def get_logger(name: str) -> structlog.stdlib.BoundLogger:
-    configure_logging()
+    if _configured is None:
+        configure_logging()
     return structlog.get_logger(name)

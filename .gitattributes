@@ -1,0 +1,3 @@
+# Scripts montados nos conteineres Linux: sempre LF, mesmo com core.autocrlf no Windows.
+*.sh text eol=lf
+Dockerfile text eol=lf
