@@ -21,7 +21,7 @@ from fastapi.staticfiles import StaticFiles
 
 from ..config import PROJECT_ROOT, get_settings
 from ..logging_setup import get_logger
-from .deps import origem_confiavel, settings_dep
+from .deps import HOSTS_LOOPBACK, origem_confiavel, settings_dep
 from .routes import (
     agents,
     backtest,
@@ -111,6 +111,9 @@ def create_app(orchestrator: Orchestrator | None = None) -> FastAPI:
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
         allow_headers=["*"],
     )
+    # Por ultimo, para ficar POR FORA de tudo: recusa antes do CORS e das rotas.
+    if settings.acesso_login_tailscale:
+        app.add_middleware(PortaoTailscale, login=settings.acesso_login_tailscale)
 
     app.include_router(portfolio.router, prefix="/api", tags=["portfolio"])
     app.include_router(trades.router, prefix="/api", tags=["trades"])
@@ -123,6 +126,55 @@ def create_app(orchestrator: Orchestrator | None = None) -> FastAPI:
     _servir_telas(app, PROJECT_ROOT / "frontend" / "dist")
 
     return app
+
+
+class PortaoTailscale:
+    """So deixa passar quem o `tailscale serve` identificou como `login`.
+
+    A API nao tem login proprio (escutava so em 127.0.0.1). Em producao ela fica
+    atras de um no Tailscale so dela, e o `tailscale serve` poe em cada pedido o
+    cabecalho `Tailscale-User-Login` com quem esta do outro lado -- e o
+    SOBRESCREVE se o cliente tentar manda-lo, entao de fora nao se forja. A porta
+    da API nao e publicada: o unico caminho ate aqui e o serve. Isto vale para
+    HTTP e para o WebSocket (o `@app.middleware("http")` nao ve WebSocket, por
+    isso o middleware e ASGI puro).
+
+    Excecao unica: `GET /api/health` vindo do proprio conteiner (a sonda de saude
+    do Docker), que nao passa pelo serve.
+    """
+
+    def __init__(self, app, login: str) -> None:  # type: ignore[no-untyped-def]
+        self.app = app
+        self.login = login.strip().lower()
+
+    async def __call__(self, scope, receive, send) -> None:  # type: ignore[no-untyped-def]
+        if scope["type"] not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
+        cabecalhos = dict(scope.get("headers") or [])
+        quem = cabecalhos.get(b"tailscale-user-login", b"").decode("latin-1").strip().lower()
+        cliente = (scope.get("client") or ("", 0))[0]
+        sonda = (
+            scope["type"] == "http"
+            and scope.get("path") == "/api/health"
+            and cliente in HOSTS_LOOPBACK
+        )
+        if quem == self.login or sonda:
+            await self.app(scope, receive, send)
+            return
+        log.warning(
+            "api.acesso_recusado",
+            login=quem or None,
+            rota=scope.get("path"),
+            detail="sem o login autorizado do Tailscale",
+        )
+        if scope["type"] == "websocket":
+            # Fechar antes de aceitar vira 403 no handshake.
+            await send({"type": "websocket.close", "code": 1008})
+            return
+        await JSONResponse(
+            status_code=403, content={"detail": "acesso so do administrador"}
+        )(scope, receive, send)
 
 
 def _servir_telas(app: FastAPI, pasta: Path) -> None:

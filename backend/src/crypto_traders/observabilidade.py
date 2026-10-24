@@ -1,10 +1,10 @@
-"""Observabilidade: o Sistema Cripto fala OpenTelemetry com o coletor da plataforma.
+"""Observabilidade: o Sistema Cripto fala OpenTelemetry com um coletor.
 
-O Crypto nao e um servico da Pampufa e nao usa o SDK dela, mas a observabilidade
-e a mesma (cofre grupo-sr, `plataforma/arquitetura/arquitetura-plataforma.md` §4):
-um coletor OpenTelemetry recebe, e Loki, Tempo, Prometheus e Grafana guardam e
-mostram. Tudo sai por OTLP/HTTP para `OTEL_EXPORTER_OTLP_ENDPOINT`, com
-`service.name=crypto` e `deployment.environment` vindo de `ENVIRONMENT`:
+A observabilidade e um servico que o Crypto usa, nao um sistema do qual ele faz
+parte: um coletor OpenTelemetry recebe, e Loki, Tempo, Prometheus e Grafana
+guardam e mostram. Tudo sai por OTLP/HTTP para `OTEL_EXPORTER_OTLP_ENDPOINT`, com
+`service.name=crypto` e `deployment.environment` vindo de `ENVIRONMENT`. O painel e
+os alertas sao deste repositorio (`observabilidade/publicar_grafana.py`):
 
 * **Logs** -- cada linha do structlog tambem vai ao coletor (Loki), ja com os
   segredos redigidos e com `trace_id` quando ha span ativo.

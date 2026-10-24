@@ -19,7 +19,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.testclient import TestClient
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
@@ -28,7 +28,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from crypto_traders import observabilidade
-from crypto_traders.api.app import _servir_telas
+from crypto_traders.api.app import PortaoTailscale, _servir_telas
 from crypto_traders.bus.base import Topics
 from crypto_traders.bus.memory import InMemoryEventBus
 from crypto_traders.config import Settings
@@ -175,6 +175,75 @@ class TestTelas:
         app = FastAPI()
         _servir_telas(app, tmp_path / "nao-existe")
         assert TestClient(app).get("/").status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Trava de producao: so o login Tailscale autorizado passa (HTTP e WebSocket)
+# ---------------------------------------------------------------------------
+class TestPortaoTailscale:
+    LOGIN = "paulo@exemplo.com"
+
+    @pytest.fixture
+    def app(self):
+        app = FastAPI()
+
+        @app.get("/api/health")
+        async def health():
+            return {"ok": True}
+
+        @app.post("/api/risk/circuit-breaker/reset")
+        async def rearmar():
+            return {"rearmado": True}
+
+        @app.websocket("/ws")
+        async def tempo_real(ws: WebSocket):
+            await ws.accept()
+            await ws.send_text("oi")
+            await ws.close()
+
+        app.add_middleware(PortaoTailscale, login=self.LOGIN)
+        return app
+
+    def test_sem_login_e_recusado_e_a_rota_nao_roda(self, app):
+        resposta = TestClient(app).post("/api/risk/circuit-breaker/reset")
+        assert resposta.status_code == 403
+        assert "rearmado" not in resposta.text
+
+    def test_login_errado_e_recusado(self, app):
+        resposta = TestClient(app).post(
+            "/api/risk/circuit-breaker/reset", headers={"Tailscale-User-Login": "sarah@exemplo.com"}
+        )
+        assert resposta.status_code == 403
+
+    def test_o_login_autorizado_passa_sem_diferenciar_maiusculas(self, app):
+        resposta = TestClient(app).post(
+            "/api/risk/circuit-breaker/reset", headers={"Tailscale-User-Login": "Paulo@Exemplo.com"}
+        )
+        assert resposta.json() == {"rearmado": True}
+
+    def test_websocket_sem_login_nao_abre(self, app):
+        with pytest.raises(WebSocketDisconnect), TestClient(app).websocket_connect("/ws"):
+            pass
+
+    def test_websocket_com_login_abre(self, app):
+        with TestClient(app).websocket_connect(
+            "/ws", headers={"Tailscale-User-Login": self.LOGIN}
+        ) as ws:
+            assert ws.receive_text() == "oi"
+
+    def test_sonda_local_de_saude_passa_e_so_ela(self, app):
+        local = TestClient(app, client=("127.0.0.1", 50000))
+        assert local.get("/api/health").status_code == 200
+        # Do proprio conteiner, mas fora da sonda: continua recusado.
+        assert local.post("/api/risk/circuit-breaker/reset").status_code == 403
+        # A sonda vinda de fora (pelo serve) nao tem excecao.
+        assert TestClient(app).get("/api/health").status_code == 403
+
+    def test_sem_configuracao_a_trava_nao_existe(self):
+        from crypto_traders.api.app import create_app
+
+        app = create_app()
+        assert not any(m.cls is PortaoTailscale for m in app.user_middleware)
 
 
 # ---------------------------------------------------------------------------

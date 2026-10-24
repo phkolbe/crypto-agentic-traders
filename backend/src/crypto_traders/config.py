@@ -431,6 +431,13 @@ class Settings(BaseSettings):
         default_factory=lambda: ["http://localhost:5173"]
     )
 
+    acesso_login_tailscale: str = ""
+    """Producao: o unico login Tailscale (e-mail) que passa pela API e pelas telas.
+
+    Vazio desliga a trava (desenvolvimento, so 127.0.0.1). Preenchido, todo pedido
+    sem `Tailscale-User-Login` igual a este recebe 403 (`api.app.PortaoTailscale`).
+    """
+
     # --- Exchange ---------------------------------------------------------
     # AMBIENTE: esta amarrada a qual credencial existe neste arquivo. Apontar
     # para uma exchange sem chave configurada e erro de instalacao, nao decisao

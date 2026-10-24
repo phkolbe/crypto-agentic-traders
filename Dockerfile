@@ -1,9 +1,7 @@
 # syntax=docker/dockerfile:1.10
-# Imagem do Sistema Cripto (desenvolvimento em Docker e producao). Mesmo molde das
-# imagens da plataforma (cofre Obsidian grupo-sr, plataforma/arquitetura/
-# implantacao-ambientes.md §9): tres estagios -- telas (npm), dependencias (uv) e
-# execucao (python slim, usuario sem privilegio). O Crypto nao usa o pampufa-sdk,
-# entao nao ha token no build.
+# Imagem do Sistema Cripto (desenvolvimento em Docker e producao, implantacao/producao/).
+# Tres estagios -- telas (npm), dependencias (uv) e execucao (python slim, usuario sem
+# privilegio). Nenhum segredo no build.
 #
 #     docker build -t ghcr.io/phkolbe/crypto:local .
 #     docker buildx build --platform linux/arm64 -t ghcr.io/phkolbe/crypto:vX.Y.Z .

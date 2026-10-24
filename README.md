@@ -40,15 +40,17 @@ C4 — contexto, contêineres e componentes — em diagramas que o GitHub render
 
 - Roda em `dry_run`. **Nunca operou em `live`**: não há uma ordem de dinheiro real
   no histórico, e todo número de retorno neste repositório vem de backtest.
-- Suíte verde com Postgres em **1187 passed, 1 skipped, 1 xfailed** (24/10/2026) —
+- Suíte verde com Postgres em **1194 passed, 1 skipped, 1 xfailed** (24/10/2026) —
   e o que o skip e o xfail escondem está em [Os limites conhecidos](#os-limites-conhecidos-em-uma-tela).
 - Desde 24/10/2026 roda em **Docker** (Postgres 16, `restart: unless-stopped`),
   com traces, logs e métricas no Grafana da plataforma. As Tarefas Agendadas do
   Windows ficaram desabilitadas. No notebook a supervisão ainda depende de alguém
   abrir a sessão (o Docker Desktop só sobe no login); em produção, não.
-- **Produção** está preparada no `pampufa-platform` (`infra/implantacao/crypto/`):
-  servidor `vm-prd`, porta 8443 do nó Tailscale, só para o administrador. Nasce em
-  `dry_run` e vai a `live` trocando as duas travas do `crypto.env` no servidor.
+- **Produção** está preparada neste repositório
+  ([`implantacao/producao/`](implantacao/producao/README.md)): stack isolada com
+  Postgres, nó Tailscale e backup próprios; só o login Tailscale do administrador
+  passa pela API. Nasce em `dry_run` e vai a `live` trocando as duas travas do
+  `crypto.env` no servidor.
 
 ### Onde está o quê
 
@@ -111,12 +113,17 @@ API em `http://127.0.0.1:8000` (a API serve as telas já montadas; nenhuma porta
 do `127.0.0.1`). O ambiente é o mesmo `.env` de sempre; banco, host da API e
 telemetria vêm do `docker-compose.yml` e vencem o `.env`.
 
-**Observabilidade:** traces, logs e métricas saem por OTLP para o coletor do
-compose de desenvolvimento do `pampufa-platform`
-(`docker compose --profile observabilidade up -d` lá). Grafana em
-`http://localhost:8080/grafana/`, painel **Sistema Cripto** e alertas na pasta
-**Sistema Cripto**. Sem o coletor o sistema roda igual. Detalhe em
-`backend/src/crypto_traders/observabilidade.py`.
+**Observabilidade:** traces, logs e métricas saem por OTLP para
+`OTEL_EXPORTER_OTLP_ENDPOINT` — no compose, `host.docker.internal:4318`, o coletor
+que estiver rodando na máquina (`OTEL_ENDPOINT` troca). Sem coletor o sistema roda
+igual. O painel **Sistema Cripto** e os alertas são deste repositório
+(`observabilidade/grafana/`) e entram em qualquer Grafana pela API:
+
+```bash
+GRAFANA_SENHA=... uv run python observabilidade/publicar_grafana.py --url http://localhost:8080/grafana
+```
+
+Detalhe em `backend/src/crypto_traders/observabilidade.py`.
 
 Histórico de um SQLite antigo para o Postgres (uma vez, banco recém-migrado e
 vazio; a cópia recusa destino com dados e confere tabela a tabela):
@@ -280,7 +287,7 @@ Com o Postgres do compose de pé (e o database de teste criado uma vez:
 cd backend && POSTGRES_TEST_URL=postgresql+asyncpg://postgres:postgres@127.0.0.1:5433/crypto_teste uv run pytest -q
 ```
 
-Verde em 24/10/2026: **1187 passed, 1 skipped, 1 xfailed** (é também o que o CI
+Verde em 24/10/2026: **1194 passed, 1 skipped, 1 xfailed** (é também o que o CI
 roda). Os três números importam:
 
 - o **1 skip** é o das *hypertables*: o Postgres da plataforma não tem a extensão

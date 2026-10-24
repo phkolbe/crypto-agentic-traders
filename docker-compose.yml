@@ -7,11 +7,10 @@
 # Binance, SMTP, WhatsApp). O que muda por estar em conteiner -- banco, host da API,
 # telemetria -- esta abaixo em `environment` e vence o `.env`.
 #
-# Observabilidade: traces, logs e metricas vao por OTLP ao coletor do compose de
-# desenvolvimento do pampufa-platform (`docker compose --profile observabilidade up -d`
-# la), pelo host.docker.internal:4318; Grafana em http://localhost:8080/grafana/,
-# painel "Sistema Cripto". Sem o coletor no ar o sistema roda igual e a telemetria
-# se perde. Producao: pampufa-platform/infra/implantacao/crypto/ (cofre cryptocoins).
+# Observabilidade: traces, logs e metricas vao por OTLP ao coletor que estiver na
+# maquina (host.docker.internal:4318; OTEL_ENDPOINT troca). Sem coletor no ar o sistema
+# roda igual e a telemetria se perde. Painel e alertas: observabilidade/publicar_grafana.py.
+# Producao: implantacao/producao/ (cofre Obsidian cryptocoins).
 #
 # Nenhuma porta sai do 127.0.0.1: a API nao tem login (cofre cryptocoins, decisoes).
 
