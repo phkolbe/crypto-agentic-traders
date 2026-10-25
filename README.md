@@ -40,7 +40,7 @@ C4 — contexto, contêineres e componentes — em diagramas que o GitHub render
 
 - Roda em `dry_run`. **Nunca operou em `live`**: não há uma ordem de dinheiro real
   no histórico, e todo número de retorno neste repositório vem de backtest.
-- Suíte verde com Postgres em **1206 passed, 1 skipped, 1 xfailed** (24/10/2026) —
+- Suíte verde com Postgres em **1212 passed, 1 skipped, 1 xfailed** (24/10/2026) —
   e o que o skip e o xfail escondem está em [Os limites conhecidos](#os-limites-conhecidos-em-uma-tela).
 - Desde 24/10/2026 roda em **Docker** (Postgres 16, `restart: unless-stopped`),
   com traces, logs e métricas no Grafana da plataforma. As Tarefas Agendadas do
@@ -108,9 +108,10 @@ docker compose up -d --build
 
 Sobe o Postgres 16, roda o `crypto-traders migrar` (schema e gatilhos, com o
 usuário **dono** do banco) e o sistema com o usuário da **aplicação**, que só lê e
-grava linhas — o servidor recusa que ele derrube a trilha append-only. Dashboard e
-API em `http://127.0.0.1:8000` (a API serve as telas já montadas; nenhuma porta sai
-do `127.0.0.1`). O ambiente é o mesmo `.env` de sempre; banco, host da API e
+grava linhas — o servidor recusa que ele derrube a trilha append-only. Tudo mora em
+`http://127.0.0.1:8000/crypto-traders/` — telas, API em `/crypto-traders/api` e
+tempo real em `/crypto-traders/ws`; o endereço sem caminho redireciona para lá (a
+API serve as telas já montadas; nenhuma porta sai do `127.0.0.1`). O ambiente é o mesmo `.env` de sempre; banco, host da API e
 telemetria vêm do `docker-compose.yml` e vencem o `.env`.
 
 **Observabilidade:** traces, logs e métricas saem por OTLP para
@@ -148,8 +149,10 @@ Dashboard:
 cd frontend && npm run dev
 ```
 
-O dashboard sobe em `http://localhost:5173` e a API em `http://127.0.0.1:8000`
-(apenas localhost — a porta nunca é exposta na rede).
+O dashboard sobe em `http://localhost:5173/crypto-traders/` e a API em
+`http://127.0.0.1:8000/crypto-traders/api` (apenas localhost — a porta nunca é
+exposta na rede). A raiz `/crypto-traders` mora no `base` do `vite.config.ts` e em
+`RAIZ` no `api/app.py`: muda nos dois juntos.
 
 Outros comandos:
 
@@ -287,7 +290,7 @@ Com o Postgres do compose de pé (e o database de teste criado uma vez:
 cd backend && POSTGRES_TEST_URL=postgresql+asyncpg://postgres:postgres@127.0.0.1:5433/crypto_teste uv run pytest -q
 ```
 
-Verde em 24/10/2026: **1206 passed, 1 skipped, 1 xfailed** (é também o que o CI
+Verde em 24/10/2026: **1212 passed, 1 skipped, 1 xfailed** (é também o que o CI
 roda). Os três números importam:
 
 - o **1 skip** é o das *hypertables*: o Postgres da plataforma não tem a extensão

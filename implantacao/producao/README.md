@@ -26,7 +26,7 @@ sudo systemctl enable --now crypto-backup.timer
 ```
 
 Depois: apagar o `TS_AUTHKEY` do `.env` e desligar a expiração da chave do nó `crypto` no painel do Tailscale.
-Endereço: `https://crypto.<tailnet>.ts.net/`, só para `CRYPTO_LOGIN` (a API recusa os outros com 403).
+Endereço: `https://crypto.<tailnet>.ts.net/crypto-traders/` (a raiz redireciona para lá), só para `CRYPTO_LOGIN` (a API recusa os outros com 403).
 
 ## Acesso
 

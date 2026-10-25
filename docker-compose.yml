@@ -1,5 +1,5 @@
 # Desenvolvimento do Sistema Cripto em Docker: Postgres 16, o `migrar` (roda e sai)
-# e o sistema (agentes + API + telas) em http://127.0.0.1:8000.
+# e o sistema (agentes + API + telas) em http://127.0.0.1:8000/crypto-traders/.
 #
 #     docker compose up -d --build
 #

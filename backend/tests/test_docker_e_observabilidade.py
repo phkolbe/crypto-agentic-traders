@@ -519,9 +519,7 @@ class TestPostgresComUsuarioDaAplicacao:
             await engine.dispose()
         await dispose_engine()
 
-    async def test_copia_do_sqlite_leva_tudo_e_recusa_destino_com_dados(
-        self, pg_novo, settings
-    ):
+    async def test_copia_do_sqlite_leva_tudo_e_recusa_destino_com_dados(self, pg_novo, settings):
         from crypto_traders.cli import _copiar_sqlite, _migrar
         from crypto_traders.db.models import AuditLog
 
@@ -571,3 +569,91 @@ class TestPostgresComUsuarioDaAplicacao:
 
         # Segunda copia: destino com dados, recusada sem gravar nada.
         assert await _copiar_sqlite(destino, Path(arquivo)) == 1
+
+
+# ---------------------------------------------------------------------------
+# O produto mora em /crypto-traders: telas, API e tempo real debaixo da raiz
+# ---------------------------------------------------------------------------
+class TestRaizDoProduto:
+    @pytest.fixture
+    def montado(self, tmp_path):
+        from fastapi.testclient import TestClient as Cliente
+
+        from crypto_traders.api.app import RAIZ, montar_na_raiz
+
+        dist = tmp_path / "dist"
+        (dist / "assets").mkdir(parents=True)
+        (dist / "index.html").write_text("<html>indice</html>", encoding="utf-8")
+        (dist / "assets" / "app.js").write_text("js", encoding="utf-8")
+        vida = {"subiu": False}
+
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def lifespan(_app):
+            vida["subiu"] = True
+            yield
+
+        interno = FastAPI(lifespan=lifespan)
+
+        @interno.get("/api/health")
+        async def health():
+            return {"ok": True}
+
+        @interno.get("/api/portfolio")
+        async def portfolio():
+            return {"total": "1"}
+
+        @interno.websocket("/ws")
+        async def tempo_real(ws: WebSocket):
+            await ws.accept()
+            await ws.send_text("oi")
+            await ws.close()
+
+        _servir_telas(interno, dist)
+        return RAIZ, interno, montar_na_raiz(interno), vida, Cliente
+
+    def test_raiz_e_crypto_traders(self, montado):
+        raiz, *_ = montado
+        assert raiz == "/crypto-traders"
+
+    def test_endereco_do_servidor_leva_as_telas(self, montado):
+        _, _, externo, _, Cliente = montado
+        resposta = Cliente(externo).get("/", follow_redirects=False)
+        assert resposta.status_code == 307
+        assert resposta.headers["location"] == "/crypto-traders/"
+
+    def test_api_telas_e_tempo_real_debaixo_da_raiz(self, montado):
+        _, _, externo, _, Cliente = montado
+        cliente = Cliente(externo)
+        assert cliente.get("/crypto-traders/api/portfolio").json() == {"total": "1"}
+        assert "indice" in cliente.get("/crypto-traders/").text
+        assert "indice" in cliente.get("/crypto-traders/portfolio").text  # rota do React
+        assert cliente.get("/crypto-traders/assets/app.js").text == "js"
+        assert cliente.get("/crypto-traders/api/nao-existe").status_code == 404
+        with cliente.websocket_connect("/crypto-traders/ws") as ws:
+            assert ws.receive_text() == "oi"
+
+    def test_fora_da_raiz_nao_ha_nada(self, montado):
+        _, _, externo, _, Cliente = montado
+        cliente = Cliente(externo)
+        assert cliente.get("/api/portfolio").status_code == 404
+        assert cliente.get("/dashboard").status_code == 404
+
+    def test_o_ciclo_de_vida_do_app_interno_roda(self, montado):
+        # E nele que o WebSocket liga o transmissor de eventos: app montado nao
+        # tem lifespan proprio no Starlette, quem roda e o externo.
+        _, _, externo, vida, Cliente = montado
+        with Cliente(externo):
+            assert vida["subiu"] is True
+
+    def test_a_trava_reconhece_a_sonda_debaixo_da_raiz(self, montado):
+        _, interno, externo, _, Cliente = montado
+        interno.add_middleware(PortaoTailscale, login="paulo@exemplo.com")
+        local = Cliente(externo, client=("127.0.0.1", 50000))
+        assert local.get("/crypto-traders/api/health").status_code == 200
+        assert local.get("/crypto-traders/api/portfolio").status_code == 403
+        com_login = Cliente(externo).get(
+            "/crypto-traders/api/portfolio", headers={"Tailscale-User-Login": "paulo@exemplo.com"}
+        )
+        assert com_login.status_code == 200

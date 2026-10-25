@@ -18,8 +18,9 @@ import type {
   TradePage,
   TradingConfig,
 } from './types'
+import { RAIZ } from './raiz'
 
-const BASE = '/api'
+const BASE = `${RAIZ}/api`
 
 export class ApiError extends Error {
   constructor(

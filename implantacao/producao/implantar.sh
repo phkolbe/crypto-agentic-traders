@@ -72,7 +72,7 @@ passo "Trava de acesso"
 codigo="$(docker exec crypto-prd python -c "
 import urllib.error, urllib.request
 try:
-    urllib.request.urlopen('http://127.0.0.1:8000/api/portfolio', timeout=5)
+    urllib.request.urlopen('http://127.0.0.1:8000/crypto-traders/api/portfolio', timeout=5)
     print(200)
 except urllib.error.HTTPError as erro:
     print(erro.code)
@@ -87,4 +87,4 @@ fi
 
 logger -t crypto-implantacao "Sistema Cripto $VERSAO" 2>/dev/null || true
 echo
-echo "No ar: https://$(valor TS_HOSTNAME "$PASTA/.env").$(valor TAILNET "$PASTA/.env")/ (so $(valor CRYPTO_LOGIN "$PASTA/.env"))"
+echo "No ar: https://$(valor TS_HOSTNAME "$PASTA/.env").$(valor TAILNET "$PASTA/.env")/crypto-traders/ (so $(valor CRYPTO_LOGIN "$PASTA/.env"))"

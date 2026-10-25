@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from ..config import PROJECT_ROOT, get_settings
@@ -128,6 +128,51 @@ def create_app(orchestrator: Orchestrator | None = None) -> FastAPI:
     return app
 
 
+#: Onde o produto mora na URL: telas em `/crypto-traders/`, API em
+#: `/crypto-traders/api/...`, tempo real em `/crypto-traders/ws`. O frontend le o
+#: mesmo valor do `base` do Vite (`import.meta.env.BASE_URL`); os dois mudam juntos.
+RAIZ = "/crypto-traders"
+
+
+def _caminho_da_rota(scope) -> str:  # type: ignore[no-untyped-def]
+    """O caminho DENTRO do app, sem a raiz onde ele esta montado.
+
+    O Starlette entrega ao app montado o caminho inteiro em `path` e a raiz em
+    `root_path`; comparar `path` direto com `/api/health` nunca casaria debaixo
+    de `/crypto-traders`.
+    """
+    caminho = scope.get("path") or ""
+    raiz = scope.get("root_path") or ""
+    return caminho[len(raiz) :] if raiz and caminho.startswith(raiz) else caminho
+
+
+def montar_na_raiz(interno: FastAPI, raiz: str = RAIZ) -> FastAPI:
+    """O app que o uvicorn serve: o `interno` debaixo de `raiz`, e `/` levando para la.
+
+    O `interno` continua com as rotas em `/api/...` -- e o que a suite testa --, e
+    so a montagem decide o prefixo. Duas coisas que a montagem sozinha nao faz:
+
+    - o ciclo de vida (lifespan) de app montado NAO roda no Starlette, e e nele
+      que o WebSocket liga o transmissor de eventos; o externo o executa;
+    - qualquer outro caminho fora da raiz e 404, menos `/`, que redireciona para
+      a raiz (quem digitar so o endereco do servidor cai nas telas).
+    """
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        async with interno.router.lifespan_context(interno):
+            yield
+
+    externo = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+
+    @externo.get("/", include_in_schema=False)
+    async def para_a_raiz() -> RedirectResponse:
+        return RedirectResponse(f"{raiz}/", status_code=307)
+
+    externo.mount(raiz, interno)
+    return externo
+
+
 class PortaoTailscale:
     """So deixa passar quem o `tailscale serve` identificou como `login`.
 
@@ -156,7 +201,7 @@ class PortaoTailscale:
         cliente = (scope.get("client") or ("", 0))[0]
         sonda = (
             scope["type"] == "http"
-            and scope.get("path") == "/api/health"
+            and _caminho_da_rota(scope) == "/api/health"
             and cliente in HOSTS_LOOPBACK
         )
         if quem == self.login or sonda:

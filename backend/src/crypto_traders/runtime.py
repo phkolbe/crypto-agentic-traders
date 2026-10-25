@@ -12,6 +12,7 @@ import signal
 
 from . import observabilidade
 from .agents.orchestrator import Orchestrator
+from .api.app import RAIZ
 from .config import get_settings
 from .logging_setup import get_logger
 
@@ -102,13 +103,15 @@ def _handle_break_on_windows(loop: asyncio.AbstractEventLoop, request_stop) -> N
 async def _serve_api(orchestrator: Orchestrator, stop_signal: asyncio.Event) -> None:
     import uvicorn
 
-    from .api.app import create_app
+    from .api.app import create_app, montar_na_raiz
 
     settings = orchestrator.settings
     app = create_app(orchestrator)
+    # Instrumenta o app INTERNO: os spans levam a rota dele (`/api/...`), e a
+    # montagem em `/crypto-traders` fica de fora do nome.
     observabilidade.instrumentar_api(app)
     config = uvicorn.Config(
-        app,
+        montar_na_raiz(app),
         host=settings.api_host,
         port=settings.api_port,
         log_level=settings.log_level.lower(),
@@ -139,7 +142,8 @@ def banner(settings, with_api: bool) -> None:
     print(f"  pares      : {', '.join(settings.trading.symbols)} ({settings.trading.timeframe})")
     print(f"  estrategias: {', '.join(settings.trading.strategies)}")
     if with_api:
-        print(f"  API        : http://{settings.api_host}:{settings.api_port}")
-        print(f"  docs       : http://{settings.api_host}:{settings.api_port}/docs")
+        endereco = f"http://{settings.api_host}:{settings.api_port}{RAIZ}"
+        print(f"  telas      : {endereco}/")
+        print(f"  docs       : {endereco}/docs")
     print("  Ctrl+C para encerrar.")
     print("=" * 66 + "\n")
