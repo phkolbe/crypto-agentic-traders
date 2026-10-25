@@ -40,7 +40,7 @@ C4 — contexto, contêineres e componentes — em diagramas que o GitHub render
 
 - Roda em `dry_run`. **Nunca operou em `live`**: não há uma ordem de dinheiro real
   no histórico, e todo número de retorno neste repositório vem de backtest.
-- Suíte verde com Postgres em **1194 passed, 1 skipped, 1 xfailed** (24/10/2026) —
+- Suíte verde com Postgres em **1206 passed, 1 skipped, 1 xfailed** (24/10/2026) —
   e o que o skip e o xfail escondem está em [Os limites conhecidos](#os-limites-conhecidos-em-uma-tela).
 - Desde 24/10/2026 roda em **Docker** (Postgres 16, `restart: unless-stopped`),
   com traces, logs e métricas no Grafana da plataforma. As Tarefas Agendadas do
@@ -287,7 +287,7 @@ Com o Postgres do compose de pé (e o database de teste criado uma vez:
 cd backend && POSTGRES_TEST_URL=postgresql+asyncpg://postgres:postgres@127.0.0.1:5433/crypto_teste uv run pytest -q
 ```
 
-Verde em 24/10/2026: **1194 passed, 1 skipped, 1 xfailed** (é também o que o CI
+Verde em 24/10/2026: **1206 passed, 1 skipped, 1 xfailed** (é também o que o CI
 roda). Os três números importam:
 
 - o **1 skip** é o das *hypertables*: o Postgres da plataforma não tem a extensão
@@ -304,7 +304,7 @@ cd backend && uv run ruff check src tests
 cd frontend && npx tsc -b && npx vite build && npm run check
 ```
 
-`npm run check` roda 174 verificações de tela (`src/checks/telas.check.ts`) que
+`npm run check` roda 198 verificações de tela (`src/checks/telas.check.ts`) que
 chamam as funções puras de formatação com os dados reais do sistema — existem
 porque `tsc` passa limpo com a tela errada na frente do usuário.
 

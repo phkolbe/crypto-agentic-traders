@@ -48,8 +48,66 @@ class PortfolioOut(MoneyModel):
 
 
 class EquityPoint(MoneyModel):
+    """Um ponto da serie: o ultimo retrato de uma faixa de tempo (o "fechamento")."""
+
     timestamp: datetime
     total_value: Decimal
+    cash_value: Decimal | None = None
+    positions_value: Decimal | None = None
+    realized_pnl: Decimal | None = None
+    unrealized_pnl: Decimal | None = None
+    allocations: dict[str, float] = Field(default_factory=dict)
+
+
+class FechamentoBenchmark(MoneyModel):
+    timestamp: datetime
+    close: Decimal
+
+
+class BenchmarkOut(MoneyModel):
+    simbolo: str
+    """Ex.: `BTC/USDC` -- o BTC na moeda de cotacao do sistema."""
+    fechamentos: list[FechamentoBenchmark]
+
+
+class ResultadoParOut(MoneyModel):
+    simbolo: str
+    moeda: str
+    realizado: Decimal
+    vendas: int
+    ganhos: int
+    perdas: int
+    compras: int
+    taxas: Decimal
+    vendas_sem_base: int
+
+
+class MotivoOut(BaseModel):
+    motivo: str
+    """Canonico: par, ativo e numeros trocados por marcadores (<par>, <ativo>, <n>)."""
+    total: int
+    exemplo: str
+
+
+class RiscoOut(BaseModel):
+    aprovadas: int
+    rejeitadas: int
+    motivos: list[MotivoOut]
+
+
+class AnaliseOut(MoneyModel):
+    """Tudo o que a tela Portfolio precisa alem da serie amostrada."""
+
+    inicio: datetime
+    fim: datetime
+    moeda: str
+    modo: str
+    fechamentos_diarios: list[EquityPoint]
+    """Ultimo retrato de cada dia UTC, desde o dia ANTERIOR ao inicio (base do
+    primeiro retorno diario)."""
+    benchmark: BenchmarkOut | None
+    pares: list[ResultadoParOut]
+    risco: RiscoOut
 
 
 class PortfolioSummary(MoneyModel):

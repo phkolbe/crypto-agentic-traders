@@ -570,6 +570,444 @@ export function TimeSeriesChart({
 }
 
 // -------------------------------------------------------------------------
+// Várias séries no tempo (linhas ou áreas empilhadas)
+// -------------------------------------------------------------------------
+
+export type Serie = { nome: string; cor: string; valores: (number | null)[] }
+
+/** Limites do eixo Y com folga, incluindo o zero quando pedido. */
+function limitesY(valores: number[], incluirZero: boolean): { min: number; max: number } {
+  const finitos = valores.filter(Number.isFinite)
+  let min = finitos.length ? Math.min(...finitos) : 0
+  let max = finitos.length ? Math.max(...finitos) : 1
+  if (incluirZero) {
+    min = Math.min(min, 0)
+    max = Math.max(max, 0)
+  }
+  const folga = (max - min) * 0.05 || Math.abs(max) * 0.01 || 1
+  return { min: incluirZero && min === 0 ? 0 : min - folga, max: max + folga }
+}
+
+/**
+ * Rótulo do eixo Y dos gráficos novos. O tick que deveria ser zero chega como
+ * -1,4e-17 (soma de passos em ponto flutuante) e saía "-0%" na tela: abaixo de
+ * um milionésimo do passo, é zero.
+ */
+function rotuladorDoEixo(
+  formatY: ((valor: number) => string) | undefined,
+  casas: number,
+  passo: number,
+): (valor: number) => string {
+  return (valor: number) => {
+    const limpo = Math.abs(valor) < Math.abs(passo) * 1e-6 ? 0 : valor
+    return formatY
+      ? formatY(limpo)
+      : limpo.toLocaleString('pt-BR', { minimumFractionDigits: casas, maximumFractionDigits: casas })
+  }
+}
+
+/** Trechos contínuos (sem `null`) de uma série, para a linha falhar onde falta dado. */
+function trechos(valores: (number | null)[]): number[][] {
+  const resultado: number[][] = []
+  let atual: number[] = []
+  valores.forEach((v, i) => {
+    if (v === null || !Number.isFinite(v)) {
+      if (atual.length) resultado.push(atual)
+      atual = []
+    } else atual.push(i)
+  })
+  if (atual.length) resultado.push(atual)
+  return resultado
+}
+
+/**
+ * Várias séries sobre o mesmo eixo de tempo.
+ *
+ * `empilhado`: cada série é uma área sobre a anterior (caixa + posições = total;
+ * alocação por ativo = 100%). Sem empilhar, linhas — e com uma série só e `area`,
+ * a área vai até o ZERO, que é o desenho do drawdown (o vale é o que se lê).
+ * O eixo X segue a mesma regra do `TimeSeriesChart`: indexado por amostra, com a
+ * granularidade do rótulo tirada do intervalo real da série.
+ */
+export function MultiSeriesChart({
+  instantes,
+  series,
+  height = 240,
+  empilhado = false,
+  area = false,
+  incluirZero = false,
+  formatValue,
+  formatY,
+  minTickGap = 40,
+}: {
+  instantes: string[]
+  series: Serie[]
+  height?: number
+  empilhado?: boolean
+  area?: boolean
+  incluirZero?: boolean
+  formatValue: (value: number) => string
+  formatY?: (value: number) => string
+  minTickGap?: number
+}) {
+  const [ref, largura] = useLarguraMedida()
+  const [ativo, setAtivo] = useState<number | null>(null)
+  const n = instantes.length
+
+  const margem = { top: 6, right: 6, bottom: 22, left: 62 }
+  const plotW = Math.max(0, largura - margem.left - margem.right)
+  const plotH = Math.max(0, height - margem.top - margem.bottom)
+
+  if (largura === 0 || n === 0) {
+    return <div ref={ref} style={{ width: '100%', height }} />
+  }
+
+  // Empilhado: o topo de cada camada é a soma das anteriores mais a dela.
+  const topos: (number | null)[][] = []
+  if (empilhado) {
+    const acumulado = new Array<number>(n).fill(0)
+    for (const s of series) {
+      topos.push(
+        s.valores.map((v, i) => {
+          acumulado[i]! += v ?? 0
+          return acumulado[i]!
+        }),
+      )
+    }
+  }
+  const desenhadas = empilhado ? topos : series.map((s) => s.valores)
+  const todos = desenhadas.flat().filter((v): v is number => v !== null)
+  const { min, max } = limitesY(todos, incluirZero || empilhado)
+
+  const escalaX = (i: number) => margem.left + (n === 1 ? plotW / 2 : (i / (n - 1)) * plotW)
+  const escalaY = (v: number) => margem.top + plotH - ((v - min) / (max - min)) * plotH
+  const zeroY = escalaY(Math.min(Math.max(0, min), max))
+
+  const ticksY = niceTicks(min, max, Math.min(5, Math.max(2, Math.floor(plotH / ALTURA_POR_ROTULO))))
+  const passoY = ticksY.length > 1 ? Math.abs(ticksY[1]! - ticksY[0]!) : Math.abs(max - min)
+  const casasY = casasParaPasso(passoY)
+  const rotularY = rotuladorDoEixo(formatY, casasY, passoY)
+  const rotularX = rotuladorDeSerie(instantes)
+  const rotulosX = instantes.map((t) => rotularX(t))
+  const ticksX = tickIndices(rotulosX, plotW, minTickGap, instantes.map((t) => Date.parse(t)))
+
+  const aoMover = (evento: React.MouseEvent<SVGSVGElement>) => {
+    const caixa = evento.currentTarget.getBoundingClientRect()
+    if (n === 1) return setAtivo(0)
+    const indice = Math.round(((evento.clientX - caixa.left - margem.left) / plotW) * (n - 1))
+    setAtivo(Math.min(n - 1, Math.max(0, indice)))
+  }
+
+  const camadas = series.map((s, k) => {
+    const valores = desenhadas[k]!
+    const caminhos = trechos(valores).map((idx) => {
+      const xs = idx.map(escalaX)
+      const ys = idx.map((i) => escalaY(valores[i]!))
+      const linha = monotonePath(xs, ys)
+      let preenchido: string | null = null
+      if (empilhado) {
+        // A base da camada é o topo da anterior (ou o zero, na primeira).
+        const base = k === 0 ? idx.map(() => zeroY) : idx.map((i) => escalaY(topos[k - 1]![i] ?? 0))
+        const volta = idx
+          .map((_, j) => `L ${xs[idx.length - 1 - j]} ${base[idx.length - 1 - j]}`)
+          .join(' ')
+        preenchido = `${linha} ${volta} Z`
+      } else if (area) {
+        preenchido = `${linha} L ${xs[xs.length - 1]} ${zeroY} L ${xs[0]} ${zeroY} Z`
+      }
+      return { linha, preenchido, unico: idx.length === 1 ? { x: xs[0]!, y: ys[0]! } : null }
+    })
+    return { serie: s, caminhos }
+  })
+
+  return (
+    <div ref={ref} style={{ position: 'relative', width: '100%' }}>
+      <svg
+        width={largura}
+        height={height}
+        onMouseMove={aoMover}
+        onMouseLeave={() => setAtivo(null)}
+        style={{ display: 'block', overflow: 'visible' }}
+      >
+        {ticksY.map((valor) => (
+          <g key={`y-${valor}`}>
+            <line
+              x1={margem.left}
+              x2={margem.left + plotW}
+              y1={escalaY(valor)}
+              y2={escalaY(valor)}
+              stroke="var(--border)"
+              opacity={0.55}
+              shapeRendering="crispEdges"
+            />
+            <text
+              x={margem.left - 8}
+              y={escalaY(valor)}
+              textAnchor="end"
+              dominantBaseline="middle"
+              fontSize={11}
+              fill={AXIS}
+            >
+              {rotularY(valor)}
+            </text>
+          </g>
+        ))}
+        {ticksX.map((i) => (
+          <text
+            key={`x-${i}`}
+            x={escalaX(i)}
+            y={height - 6}
+            textAnchor={i === 0 ? 'start' : i === n - 1 ? 'end' : 'middle'}
+            fontSize={11}
+            fill={AXIS}
+          >
+            {rotulosX[i]}
+          </text>
+        ))}
+        {min < 0 && max > 0 && (
+          <line
+            x1={margem.left}
+            x2={margem.left + plotW}
+            y1={zeroY}
+            y2={zeroY}
+            stroke="var(--border-strong)"
+            shapeRendering="crispEdges"
+          />
+        )}
+
+        {camadas.map(({ serie, caminhos }) =>
+          caminhos.map((c, j) => (
+            <g key={`${serie.nome}-${j}`}>
+              {c.preenchido && <path d={c.preenchido} fill={serie.cor} opacity={empilhado ? 0.55 : 0.22} />}
+              <path d={c.linha} fill="none" stroke={serie.cor} strokeWidth={empilhado ? 1.2 : 2} />
+              {c.unico && <circle cx={c.unico.x} cy={c.unico.y} r={3} fill={serie.cor} />}
+            </g>
+          )),
+        )}
+
+        {ativo !== null && (
+          <line
+            x1={escalaX(ativo)}
+            x2={escalaX(ativo)}
+            y1={margem.top}
+            y2={margem.top + plotH}
+            stroke="var(--border-strong)"
+          />
+        )}
+      </svg>
+
+      <div className="chart-legend">
+        {series.map((s) => (
+          <span key={s.nome} className="row-tight">
+            <span className="dot" style={{ background: s.cor }} />
+            {s.nome}
+          </span>
+        ))}
+      </div>
+
+      {ativo !== null && (
+        <div
+          className="chart-tooltip"
+          style={{
+            left: escalaX(ativo) < largura / 2 ? escalaX(ativo) + 12 : undefined,
+            right: escalaX(ativo) >= largura / 2 ? largura - escalaX(ativo) + 12 : undefined,
+            top: 6,
+          }}
+        >
+          <div className="chart-tooltip-label">{rotuloDoInstante(instantes[ativo]!)}</div>
+          {series.map((s) => (
+            <div key={s.nome} className="row-tight" style={{ gap: 6 }}>
+              <span className="dot" style={{ background: s.cor }} />
+              <span className="num">
+                {s.valores[ativo] === null || s.valores[ativo] === undefined
+                  ? '—'
+                  : formatValue(s.valores[ativo]!)}
+              </span>
+              <span className="faint">{s.nome}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/** Dia sem hora (série diária, `...T00:00:00Z`) mostra só a data; o resto, data e hora. */
+function rotuloDoInstante(instante: string): string {
+  const data = new Date(instante)
+  if (instante.endsWith('T00:00:00Z')) {
+    return data.toLocaleDateString('pt-BR', { timeZone: 'UTC' })
+  }
+  return data.toLocaleString('pt-BR')
+}
+
+// -------------------------------------------------------------------------
+// Barras
+// -------------------------------------------------------------------------
+
+export type Barra = { rotulo: string; valor: number; detalhe?: string }
+
+/**
+ * Barras verticais a partir do zero: verde acima, vermelho abaixo.
+ *
+ * O eixo Y sempre contém o zero — uma barra de retorno que começa em -0,3% e
+ * sobe até +0,1% leria como ganho grande. Os rótulos do eixo X saem da mesma
+ * grade de passo constante do gráfico de linha.
+ */
+export function BarChart({
+  itens,
+  height = 220,
+  formatValue,
+  formatY,
+  minTickGap = 34,
+}: {
+  itens: Barra[]
+  height?: number
+  formatValue: (value: number) => string
+  formatY?: (value: number) => string
+  minTickGap?: number
+}) {
+  const [ref, largura] = useLarguraMedida()
+  const [ativo, setAtivo] = useState<number | null>(null)
+  const n = itens.length
+
+  const margem = { top: 6, right: 6, bottom: 22, left: 62 }
+  const plotW = Math.max(0, largura - margem.left - margem.right)
+  const plotH = Math.max(0, height - margem.top - margem.bottom)
+
+  if (largura === 0 || n === 0) {
+    return <div ref={ref} style={{ width: '100%', height }} />
+  }
+
+  const { min, max } = limitesY(itens.map((i) => i.valor), true)
+  const escalaY = (v: number) => margem.top + plotH - ((v - min) / (max - min)) * plotH
+  const zeroY = escalaY(0)
+  const faixa = plotW / n
+  const larguraBarra = Math.max(1, Math.min(28, faixa * 0.7))
+  const centro = (i: number) => margem.left + faixa * (i + 0.5)
+
+  const ticksY = niceTicks(min, max, Math.min(5, Math.max(2, Math.floor(plotH / ALTURA_POR_ROTULO))))
+  const passoY = ticksY.length > 1 ? Math.abs(ticksY[1]! - ticksY[0]!) : Math.abs(max - min)
+  const casasY = casasParaPasso(passoY)
+  const rotularY = rotuladorDoEixo(formatY, casasY, passoY)
+  const ticksX = tickIndices(itens.map((i) => i.rotulo), plotW, minTickGap)
+
+  return (
+    <div ref={ref} style={{ position: 'relative', width: '100%' }}>
+      <svg width={largura} height={height} style={{ display: 'block', overflow: 'visible' }}>
+        {ticksY.map((valor) => (
+          <g key={`y-${valor}`}>
+            <line
+              x1={margem.left}
+              x2={margem.left + plotW}
+              y1={escalaY(valor)}
+              y2={escalaY(valor)}
+              stroke="var(--border)"
+              opacity={0.55}
+              shapeRendering="crispEdges"
+            />
+            <text
+              x={margem.left - 8}
+              y={escalaY(valor)}
+              textAnchor="end"
+              dominantBaseline="middle"
+              fontSize={11}
+              fill={AXIS}
+            >
+              {rotularY(valor)}
+            </text>
+          </g>
+        ))}
+        {ticksX.map((i) => (
+          <text key={`x-${i}`} x={centro(i)} y={height - 6} textAnchor="middle" fontSize={11} fill={AXIS}>
+            {itens[i]!.rotulo}
+          </text>
+        ))}
+        <line
+          x1={margem.left}
+          x2={margem.left + plotW}
+          y1={zeroY}
+          y2={zeroY}
+          stroke="var(--border-strong)"
+          shapeRendering="crispEdges"
+        />
+        {itens.map((item, i) => {
+          const y = escalaY(item.valor)
+          return (
+            <rect
+              key={`${item.rotulo}-${i}`}
+              x={centro(i) - larguraBarra / 2}
+              y={Math.min(y, zeroY)}
+              width={larguraBarra}
+              height={Math.max(1, Math.abs(zeroY - y))}
+              rx={2}
+              fill={item.valor >= 0 ? 'var(--positive)' : 'var(--negative)'}
+              opacity={ativo === null || ativo === i ? 0.9 : 0.45}
+              onMouseEnter={() => setAtivo(i)}
+              onMouseLeave={() => setAtivo(null)}
+            />
+          )
+        })}
+      </svg>
+      {ativo !== null && (
+        <div
+          className="chart-tooltip"
+          style={{
+            left: centro(ativo) < largura / 2 ? centro(ativo) + 12 : undefined,
+            right: centro(ativo) >= largura / 2 ? largura - centro(ativo) + 12 : undefined,
+            top: 6,
+          }}
+        >
+          <div className="chart-tooltip-label">{itens[ativo]!.rotulo}</div>
+          <div className="num">{formatValue(itens[ativo]!.valor)}</div>
+          {itens[ativo]!.detalhe && <div className="faint">{itens[ativo]!.detalhe}</div>}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/**
+ * Barras horizontais em HTML, para listas de categorias (pares, motivos): o texto
+ * longo do rótulo cabe inteiro, coisa que um eixo X de SVG cortaria.
+ */
+export function HorizontalBars({
+  itens,
+  formatValue,
+  corNeutra,
+  rotulosLongos = false,
+}: {
+  itens: Barra[]
+  formatValue: (value: number) => string
+  /** Com cor: todas as barras nela (contagens). Sem: verde/vermelho pelo sinal. */
+  corNeutra?: string
+  /** Rótulo numa linha própria, inteiro, acima da barra (frases, como motivos). */
+  rotulosLongos?: boolean
+}) {
+  const maior = Math.max(...itens.map((i) => Math.abs(i.valor)), 0)
+  return (
+    <div className={`hbars ${rotulosLongos ? 'hbars-longos' : ''}`}>
+      {itens.map((item) => (
+        <div key={item.rotulo} className="hbar-row" title={item.detalhe}>
+          <span className="hbar-label">{item.rotulo}</span>
+          <span className="hbar-track">
+            <span
+              className="hbar-fill"
+              style={{
+                width: `${maior > 0 ? (Math.abs(item.valor) / maior) * 100 : 0}%`,
+                background:
+                  corNeutra ?? (item.valor >= 0 ? 'var(--positive)' : 'var(--negative)'),
+              }}
+            />
+          </span>
+          <span className="hbar-value num">{formatValue(item.valor)}</span>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+// -------------------------------------------------------------------------
 // Rosca
 // -------------------------------------------------------------------------
 

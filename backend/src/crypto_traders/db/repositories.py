@@ -13,9 +13,10 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import Integer, cast, func, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from ..domain import models as dm
 from ..domain.enums import OrderStatus, RiskEventType, TradeOrigin
@@ -436,6 +437,45 @@ class PortfolioSnapshotRepository:
         stmt = stmt.order_by(orm.PortfolioSnapshot.timestamp.desc()).limit(limit)
         rows = list((await self._session.execute(stmt)).scalars().all())
         return list(reversed(rows))
+
+    async def amostrado(
+        self, inicio: datetime, fim: datetime, segundos_por_faixa: int
+    ) -> list[orm.PortfolioSnapshot]:
+        """O ULTIMO retrato de cada faixa de `segundos_por_faixa` em [inicio, fim].
+
+        Existe porque `history(limit=N)` devolve os N retratos MAIS RECENTES: com
+        um retrato por minuto, 5.000 cobriam ~3,5 dias, e os botoes 7d, 30d e 90d
+        do dashboard desenhavam a mesma curva. Aqui a janela inteira e coberta,
+        com no maximo `(fim - inicio) / segundos_por_faixa` pontos, e quem escolhe
+        o representante da faixa e o banco (o ultimo retrato dela, o "fechamento"),
+        sem trazer as centenas de milhares de linhas de um ano para o Python.
+
+        As faixas sao alinhadas no instante zero do Unix: com 86.400 s, cada faixa
+        e um dia UTC, o mesmo dia dos candles diarios da exchange.
+        """
+        coluna = orm.PortfolioSnapshot.timestamp
+        dialeto = self._session.bind.dialect.name if self._session.bind else ""
+        if dialeto == "postgresql":
+            faixa = func.floor(func.extract("epoch", coluna) / segundos_por_faixa)
+        else:
+            # SQLite: a data mora como texto; `strftime('%s')` da os segundos UTC.
+            # `//`, e nao `/`: no SQLAlchemy 2 o `/` entre inteiros vira divisao
+            # REAL (com CAST para NUMERIC), cada retrato caia numa faixa propria e
+            # a "amostra" devolvia todas as linhas.
+            faixa = cast(func.strftime("%s", coluna), Integer) // segundos_por_faixa
+        ordem = func.row_number().over(partition_by=faixa, order_by=coluna.desc())
+        interna = (
+            select(orm.PortfolioSnapshot, ordem.label("ordem_na_faixa"))
+            .where(coluna >= inicio, coluna <= fim)
+            .subquery()
+        )
+        retrato = aliased(orm.PortfolioSnapshot, interna)
+        stmt = (
+            select(retrato)
+            .where(interna.c.ordem_na_faixa == 1)
+            .order_by(interna.c.timestamp.asc())
+        )
+        return list((await self._session.execute(stmt)).scalars().all())
 
     async def value_at_or_before(self, moment: datetime) -> Decimal | None:
         """Patrimonio na virada do dia/semana, base do circuit breaker."""

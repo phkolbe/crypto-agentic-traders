@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import { NavLink, Navigate, Route, Routes } from 'react-router-dom'
 
 import { useLiveEvents } from './hooks/useLiveEvents'
@@ -7,6 +8,7 @@ import Configuration from './pages/Configuration'
 import Dashboard from './pages/Dashboard'
 import ManualTrade from './pages/ManualTrade'
 import Notifications from './pages/Notifications'
+import Portfolio from './pages/Portfolio'
 import RiskSettings from './pages/RiskSettings'
 import Trades from './pages/Trades'
 
@@ -38,6 +40,12 @@ const ICONS: Record<string, JSX.Element> = {
       <rect x="13.5" y="3" width="7.5" height="7.5" rx="1.5" {...traco} />
       <rect x="3" y="13.5" width="7.5" height="7.5" rx="1.5" {...traco} />
       <rect x="13.5" y="13.5" width="7.5" height="7.5" rx="1.5" {...traco} />
+    </>
+  ),
+  portfolio: (
+    <>
+      <path d="M12 3.5a8.5 8.5 0 108.5 8.5H12z" {...traco} />
+      <path d="M15 2.8A8.5 8.5 0 0121.2 9H15z" {...traco} />
     </>
   ),
   trades: <path d="M4 6.5h16M4 12h16M4 17.5h10" {...traco} />,
@@ -83,6 +91,7 @@ const ICONS: Record<string, JSX.Element> = {
 
 const NAV = [
   { to: '/dashboard', label: 'Dashboard', icon: 'dashboard' },
+  { to: '/portfolio', label: 'Portfólio', icon: 'portfolio' },
   { to: '/trades', label: 'Negociações', icon: 'trades' },
   { to: '/manual', label: 'Lançar manual', icon: 'manual' },
   { to: '/risk', label: 'Risco', icon: 'risk' },
@@ -92,11 +101,34 @@ const NAV = [
   { to: '/backtest', label: 'Backtest', icon: 'backtest' },
 ]
 
+/** Menu recolhido ou nao, lembrado no navegador entre uma visita e outra. */
+function useMenuRecolhido(): [boolean, () => void] {
+  const [recolhido, setRecolhido] = useState(() => {
+    try {
+      return localStorage.getItem('menuRecolhido') === '1'
+    } catch {
+      return false
+    }
+  })
+  const alternar = () =>
+    setRecolhido((atual) => {
+      try {
+        localStorage.setItem('menuRecolhido', atual ? '0' : '1')
+      } catch {
+        // Sem armazenamento local: vale so nesta visita.
+      }
+      return !atual
+    })
+  return [recolhido, alternar]
+}
+
 export default function App() {
   const { connected, feed } = useLiveEvents()
+  const [recolhido, alternarMenu] = useMenuRecolhido()
+  const estado = connected ? 'tempo real ativo' : 'reconectando…'
 
   return (
-    <div className="app">
+    <div className={`app ${recolhido ? 'menu-recolhido' : ''}`}>
       <aside className="sidebar">
         <div className="brand">
           <strong>Crypto Traders</strong>
@@ -107,20 +139,37 @@ export default function App() {
           <NavLink
             key={item.to}
             to={item.to}
+            // Recolhido, o nome sai da tela e fica no `title` (e no leitor de tela).
+            title={recolhido ? item.label : undefined}
+            aria-label={item.label}
             className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}
           >
             <svg className="nav-icon" viewBox="0 0 24 24" aria-hidden="true">
               {ICONS[item.icon]}
             </svg>
-            {item.label}
+            <span className="nav-label">{item.label}</span>
           </NavLink>
         ))}
 
-        <div style={{ marginTop: 'auto', padding: '14px 10px 0' }}>
-          <div className="row-tight" style={{ fontSize: 11, color: 'var(--text-faint)' }}>
+        <div className="sidebar-rodape">
+          <div className="row-tight sidebar-estado" title={estado}>
             <span className={`dot ${connected ? 'dot-live' : 'dot-off'}`} />
-            {connected ? 'tempo real ativo' : 'reconectando…'}
+            <span className="nav-label">{estado}</span>
           </div>
+          <button
+            className="nav-link menu-alternar"
+            onClick={alternarMenu}
+            title={recolhido ? 'Expandir menu' : 'Recolher menu'}
+            aria-label={recolhido ? 'Expandir menu' : 'Recolher menu'}
+            aria-expanded={!recolhido}
+          >
+            <svg className="nav-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <rect x="3.5" y="4" width="17" height="16" rx="2" {...traco} />
+              <path d="M9 4v16" {...traco} />
+              <path d={recolhido ? 'M13 9.5l2.5 2.5-2.5 2.5' : 'M15.5 9.5L13 12l2.5 2.5'} {...traco} />
+            </svg>
+            <span className="nav-label">Recolher menu</span>
+          </button>
         </div>
       </aside>
 
@@ -128,6 +177,7 @@ export default function App() {
         <Routes>
           <Route path="/" element={<Navigate to="/dashboard" replace />} />
           <Route path="/dashboard" element={<Dashboard feed={feed} />} />
+          <Route path="/portfolio" element={<Portfolio />} />
           <Route path="/trades" element={<Trades />} />
           <Route path="/manual" element={<ManualTrade />} />
           <Route path="/risk" element={<RiskSettings />} />

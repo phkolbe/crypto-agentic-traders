@@ -19,8 +19,8 @@ export type LiveEvent =
 /** Queries a revalidar por tipo de evento. */
 const INVALIDATES: Record<string, string[]> = {
   signal: ['signals'],
-  risk_assessment: ['riskEvents'],
-  order_result: ['trades', 'orders', 'portfolio'],
+  risk_assessment: ['riskEvents', 'portfolioAnalise'],
+  order_result: ['trades', 'orders', 'portfolio', 'portfolioAnalise'],
   portfolio: ['portfolio', 'portfolioHistory'],
   alert: ['health', 'riskConfig'],
 }

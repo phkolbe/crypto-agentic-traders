@@ -2,15 +2,30 @@
 
 from __future__ import annotations
 
+import math
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ...analise import resultado_por_par, resumo_de_risco
+from ...db import models as orm
 from ...db.repositories import PortfolioSnapshotRepository, TradeRepository
-from ..deps import db_session
-from ..schemas import EquityPoint, PortfolioOut, PortfolioSummary, PositionOut
+from ..deps import db_session, settings_dep
+from ..schemas import (
+    AnaliseOut,
+    BenchmarkOut,
+    EquityPoint,
+    FechamentoBenchmark,
+    MotivoOut,
+    PortfolioOut,
+    PortfolioSummary,
+    PositionOut,
+    ResultadoParOut,
+    RiscoOut,
+)
 
 router = APIRouter()
 
@@ -90,15 +105,152 @@ async def current_portfolio(session: AsyncSession = Depends(db_session)) -> Port
     )
 
 
+#: O seletor da tela vai ate 1 ano; o dia a mais cobre ano bissexto e o fuso de
+#: quem escolhe "de 25/10/2025 a 25/10/2026" nas datas.
+JANELA_MAXIMA = timedelta(days=366)
+
+#: Pontos por serie: mais do que isso a tela nao distingue (o grafico tem poucas
+#: centenas de pixels), e menos deixaria a curva de 1 ano em degraus.
+ALVO_DE_PONTOS = 500
+
+
+def _utc(valor: datetime) -> datetime:
+    return valor if valor.tzinfo else valor.replace(tzinfo=UTC)
+
+
+def periodo(days: int, start: datetime | None, end: datetime | None) -> tuple[datetime, datetime]:
+    """A janela pedida: `days` ate agora, ou `start`/`end` (no maximo 1 ano).
+
+    Data sem fuso e lida como UTC. Janela invertida ou maior que um ano e erro de
+    quem pediu (422), e nao um recorte silencioso: um grafico que mostra menos do
+    que o titulo diz e o tipo de numero que parece certo e nao e.
+    """
+    agora = datetime.now(UTC)
+    if start is None and end is None:
+        return agora - timedelta(days=days), agora
+    fim = _utc(end) if end is not None else agora
+    inicio = _utc(start) if start is not None else fim - timedelta(days=days)
+    if inicio >= fim:
+        raise HTTPException(status_code=422, detail="o inicio do periodo tem de ser antes do fim")
+    if fim - inicio > JANELA_MAXIMA:
+        raise HTTPException(status_code=422, detail="o periodo vai ate 1 ano")
+    return inicio, fim
+
+
+def segundos_por_faixa(inicio: datetime, fim: datetime) -> int:
+    """Faixa que cobre a janela com ate `ALVO_DE_PONTOS` pontos (no minimo 1 min).
+
+    Divide por `ALVO - 1` porque as faixas sao alinhadas no relogio, e a janela
+    quase nunca comeca no inicio de uma: as duas pontas parciais somam uma faixa.
+    """
+    return max(60, math.ceil((fim - inicio).total_seconds() / (ALVO_DE_PONTOS - 1)))
+
+
+def _ponto(row) -> EquityPoint:
+    return EquityPoint(
+        # O SQLite devolve a data sem fuso; sem ele o navegador le hora LOCAL.
+        timestamp=_utc(row.timestamp),
+        total_value=Decimal(str(row.total_value)),
+        cash_value=Decimal(str(row.cash_value)),
+        positions_value=Decimal(str(row.positions_value)),
+        realized_pnl=Decimal(str(row.realized_pnl or 0)),
+        unrealized_pnl=Decimal(str(row.unrealized_pnl or 0)),
+        allocations=row.allocations or {},
+    )
+
+
 @router.get("/portfolio/history", response_model=list[EquityPoint])
 async def portfolio_history(
     days: int = Query(default=30, ge=1, le=365),
+    start: datetime | None = Query(default=None, description="Inicio (ISO-8601); ate 1 ano"),
+    end: datetime | None = Query(default=None, description="Fim (ISO-8601); padrao agora"),
     session: AsyncSession = Depends(db_session),
 ) -> list[EquityPoint]:
-    """Serie temporal do patrimonio, para o grafico de evolucao."""
-    since = datetime.now(UTC) - timedelta(days=days)
-    rows = await PortfolioSnapshotRepository(session).history(since=since, limit=5000)
-    return [
-        EquityPoint(timestamp=row.timestamp, total_value=Decimal(str(row.total_value)))
-        for row in rows
-    ]
+    """Serie do patrimonio na janela INTEIRA, com ate 500 pontos.
+
+    Cada ponto e o ultimo retrato da sua faixa de tempo, com caixa, posicoes,
+    resultado e alocacao -- o que os graficos da tela Portfolio desenham.
+    """
+    inicio, fim = periodo(days, start, end)
+    rows = await PortfolioSnapshotRepository(session).amostrado(
+        inicio, fim, segundos_por_faixa(inicio, fim)
+    )
+    return [_ponto(row) for row in rows]
+
+
+@router.get("/portfolio/analise", response_model=AnaliseOut)
+async def portfolio_analise(
+    request: Request,
+    days: int = Query(default=30, ge=1, le=365),
+    start: datetime | None = Query(default=None),
+    end: datetime | None = Query(default=None),
+    session: AsyncSession = Depends(db_session),
+) -> AnaliseOut:
+    """Fechamentos diarios, o BTC no mesmo periodo, resultado por par e decisoes de risco."""
+    settings = settings_dep(request)
+    quote = settings.trading.quote_currency
+    modo = str(settings.trading_mode)
+    inicio, fim = periodo(days, start, end)
+    um_dia = timedelta(days=1)
+
+    diarios = await PortfolioSnapshotRepository(session).amostrado(
+        inicio - um_dia, fim, int(um_dia.total_seconds())
+    )
+
+    simbolo_btc = f"BTC/{quote}"
+    candles = (
+        await session.execute(
+            select(orm.Candle)
+            .where(
+                orm.Candle.symbol == simbolo_btc,
+                orm.Candle.timeframe == "1d",
+                orm.Candle.open_time >= inicio - um_dia,
+                orm.Candle.open_time <= fim,
+            )
+            .order_by(orm.Candle.open_time.asc())
+        )
+    ).scalars().all()
+    benchmark = (
+        BenchmarkOut(
+            simbolo=simbolo_btc,
+            fechamentos=[
+                FechamentoBenchmark(timestamp=_utc(c.open_time), close=Decimal(str(c.close)))
+                for c in candles
+            ],
+        )
+        if candles
+        else None
+    )
+
+    trades = await TradeRepository(session).for_cost_basis()
+    pares = resultado_por_par(trades, quote, modo, inicio, fim)
+
+    eventos = (
+        await session.execute(
+            select(orm.RiskEvent).where(
+                orm.RiskEvent.created_at >= inicio, orm.RiskEvent.created_at <= fim
+            )
+        )
+    ).scalars().all()
+    ativos = {s.partition("/")[0] for s in settings.trading.symbols}
+    ativos |= {t.symbol.partition("/")[0] for t in trades}
+    for evento in eventos:
+        simbolo = (evento.snapshot or {}).get("symbol")
+        if isinstance(simbolo, str):
+            ativos.add(simbolo.partition("/")[0])
+    risco = resumo_de_risco(eventos, ativos)
+
+    return AnaliseOut(
+        inicio=inicio,
+        fim=fim,
+        moeda=quote,
+        modo=modo,
+        fechamentos_diarios=[_ponto(row) for row in diarios],
+        benchmark=benchmark,
+        pares=[ResultadoParOut(**vars(par)) for par in pares],
+        risco=RiscoOut(
+            aprovadas=risco.aprovadas,
+            rejeitadas=risco.rejeitadas,
+            motivos=[MotivoOut(motivo=m, total=t, exemplo=e) for m, t, e in risco.motivos],
+        ),
+    )

@@ -1,6 +1,7 @@
 /** Cliente HTTP da API. */
 
 import type {
+  AnalisePortfolio,
   AuditEntry,
   BacktestResult,
   EquityPoint,
@@ -61,7 +62,10 @@ export const api = {
   health: () => request<Health>('/health'),
 
   portfolio: () => request<PortfolioSummary>('/portfolio'),
-  portfolioHistory: (days: number) => request<EquityPoint[]>(`/portfolio/history?days=${days}`),
+  portfolioHistory: (periodo: { start: string; end: string }) =>
+    request<EquityPoint[]>(`/portfolio/history?${new URLSearchParams(periodo)}`),
+  portfolioAnalise: (periodo: { start: string; end: string }) =>
+    request<AnalisePortfolio>(`/portfolio/analise?${new URLSearchParams(periodo)}`),
 
   trades: (params: Record<string, string | number | undefined>) => {
     const query = new URLSearchParams()
