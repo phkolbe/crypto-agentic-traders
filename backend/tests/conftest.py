@@ -7,6 +7,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from sqlalchemy.engine import make_url
 from helpers import make_candles
 
 from crypto_traders.config import DEFAULT_DB_PATH, RiskSettings, Settings, TradingSettings
@@ -37,11 +38,22 @@ def _e_o_banco_do_ensaio(alvo: object) -> bool:
     texto = alvo.decode("utf-8", "replace") if isinstance(alvo, bytes) else str(alvo)
     if not texto or texto == ":memory:":
         return False
-    # URL do SQLAlchemy: `sqlite+aiosqlite:///C:/.../crypto_traders.db`.
+    # URL do SQLAlchemy: `sqlite+aiosqlite:///C:/.../crypto_traders.db` no Windows,
+    # `sqlite+aiosqlite:////home/.../crypto_traders.db` no Linux. Era um
+    # `lstrip("/")` depois do `://`, que no Windows acerta e no Linux transforma o
+    # caminho ABSOLUTO em relativo -- a barreira deixava de reconhecer o banco do
+    # ensaio, ou seja, ficava inerte, e so apareceu quando o CI passou a rodar em
+    # Linux (24/10/2026). Quem sabe ler a URL e o proprio SQLAlchemy.
     if "://" in texto:
-        texto = texto.split("://", 1)[1].lstrip("/")
-        if not texto or texto.startswith(":memory:"):
+        try:
+            texto = make_url(texto.split("?", 1)[0]).database or ""
+        except Exception:
             return False
+        if not texto or texto.startswith(":memory:") or texto.startswith("file::memory:"):
+            return False
+        # URI do SQLite (`file:/caminho?mode=ro&uri=true`): tira o prefixo.
+        if texto.startswith("file:"):
+            texto = texto[len("file:") :]
     texto = texto.split("?", 1)[0]
     try:
         return Path(texto).expanduser().resolve() == BANCO_DO_ENSAIO.resolve()
