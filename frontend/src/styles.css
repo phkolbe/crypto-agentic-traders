@@ -536,6 +536,89 @@ button.small { padding: 4px 9px; font-size: 12px; }
 
 .loading { padding: 30px; text-align: center; color: var(--text-faint); }
 
+/* Menu lateral recolhivel ------------------------------------------------ */
+.nav-label { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sidebar-rodape {
+  margin-top: auto;
+  padding-top: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.sidebar-estado { font-size: 11px; color: var(--text-faint); padding: 0 10px 6px; }
+/* O botao veste o mesmo traje dos itens do menu: e mais um item, nao um botao solto. */
+.menu-alternar {
+  width: 100%;
+  background: transparent;
+  border: none;
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+.app { transition: grid-template-columns 0.15s; }
+.app.menu-recolhido { grid-template-columns: 60px 1fr; }
+.app.menu-recolhido .sidebar { padding-left: 8px; padding-right: 8px; }
+.app.menu-recolhido .brand,
+.app.menu-recolhido .nav-label { display: none; }
+.app.menu-recolhido .nav-link { justify-content: center; padding: 9px 0; }
+.app.menu-recolhido .sidebar-estado { justify-content: center; padding: 0 0 6px; }
+
+.nowrap { white-space: nowrap; }
+
+/* Resultado por par: as barras ao lado da tabela, que pede mais largura. */
+.pares-layout {
+  display: grid;
+  grid-template-columns: minmax(240px, 2fr) minmax(0, 3fr);
+  gap: 18px;
+  align-items: start;
+}
+@media (max-width: 1100px) { .pares-layout { grid-template-columns: 1fr; } }
+
+/* Graficos da tela Portfolio ---------------------------------------------- */
+.chart-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.hbars { display: flex; flex-direction: column; gap: 7px; }
+.hbar-row {
+  display: grid;
+  grid-template-columns: minmax(90px, 38%) 1fr auto;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+}
+.hbar-label { color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hbar-track { height: 10px; background: var(--bg-subtle); border-radius: 999px; overflow: hidden; }
+.hbar-fill { display: block; height: 100%; border-radius: 999px; min-width: 2px; }
+.hbar-value { min-width: 64px; text-align: right; }
+.hbars-longos .hbar-row { grid-template-columns: 1fr auto; row-gap: 4px; }
+.hbars-longos .hbar-label { grid-column: 1 / -1; white-space: normal; color: var(--text); }
+
+/* Seletor de periodo ------------------------------------------------------ */
+.periodo { display: flex; flex-direction: column; align-items: flex-end; gap: 8px; }
+.periodo > .row-tight { flex-wrap: wrap; justify-content: flex-end; }
+.periodo-datas {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.periodo-datas label {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.periodo-datas input { padding: 4px 8px; font-size: 12px; }
+.periodo-erro { flex-basis: 100%; text-align: right; font-size: 12px; color: var(--negative); }
+
 @media (max-width: 860px) {
   .app { grid-template-columns: 1fr; }
   .sidebar {
@@ -549,4 +632,9 @@ button.small { padding: 4px 9px; font-size: 12px; }
   }
   .brand { display: none; }
   .main { padding: 16px 14px 40px; }
+  /* No celular o menu ja e uma faixa horizontal: recolher nao tem o que fazer. */
+  .app.menu-recolhido { grid-template-columns: 1fr; }
+  .app.menu-recolhido .nav-label { display: inline; }
+  .sidebar-rodape { margin-top: 0; padding-top: 0; flex-direction: row; }
+  .menu-alternar { display: none; }
 }

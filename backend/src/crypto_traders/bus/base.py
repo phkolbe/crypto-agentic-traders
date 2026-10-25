@@ -7,6 +7,7 @@ Os agentes conversam exclusivamente por este contrato. Trocar o backend
 from __future__ import annotations
 
 import abc
+import contextlib
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
@@ -71,3 +72,22 @@ class EventBus(abc.ABC):
         metade dos eventos cada um.
         """
         ...
+
+    def observar(self, observador: Callable[[str, Any], None]) -> None:
+        """Registra quem quer ver cada publicacao, sem ser assinante.
+
+        Existe para a observabilidade contar eventos: uma assinatura de verdade
+        criaria mais uma fila no fan-out e mais um consumidor que pode ficar
+        lento. O observador e sincrono, roda dentro do `publish` e nao pode
+        levantar -- um erro nele e engolido, porque contar evento nunca pode
+        impedir uma ordem de seguir.
+        """
+        if not hasattr(self, "_observadores"):
+            self._observadores: list[Callable[[str, Any], None]] = []
+        self._observadores.append(observador)
+
+    def _notificar_observadores(self, topic: str, payload: Any) -> None:
+        for observador in getattr(self, "_observadores", ()):
+            # Defesa: metrica nao derruba o barramento.
+            with contextlib.suppress(Exception):
+                observador(topic, payload)

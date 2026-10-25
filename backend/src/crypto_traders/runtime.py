@@ -10,7 +10,9 @@ import asyncio
 import contextlib
 import signal
 
+from . import observabilidade
 from .agents.orchestrator import Orchestrator
+from .api.app import RAIZ
 from .config import get_settings
 from .logging_setup import get_logger
 
@@ -19,6 +21,9 @@ log = get_logger(__name__)
 
 async def run_system(with_api: bool = True) -> int:
     settings = get_settings()
+    # Antes do orquestrador: a instrumentacao do SQLAlchemy precisa do engine, e
+    # a subida em si ja tem linhas de log que valem estar no coletor.
+    observabilidade.instalar(settings)
     orchestrator = Orchestrator(settings)
 
     stop_signal = asyncio.Event()
@@ -46,11 +51,13 @@ async def run_system(with_api: bool = True) -> int:
         log.error("runtime.start_failed", error=str(exc))
         with contextlib.suppress(Exception):
             await orchestrator.stop()
+        observabilidade.desligar()
         return 1
 
     api_task: asyncio.Task[None] | None = None
     if with_api:
         api_task = asyncio.create_task(_serve_api(orchestrator, stop_signal), name="api")
+    telemetria = asyncio.create_task(observabilidade.acompanhar(orchestrator), name="telemetria")
 
     banner(settings, with_api)
 
@@ -59,11 +66,13 @@ async def run_system(with_api: bool = True) -> int:
     except KeyboardInterrupt:  # pragma: no cover - interativo
         pass
     finally:
+        telemetria.cancel()
         if api_task is not None:
             api_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await api_task
         await orchestrator.stop()
+        observabilidade.desligar()
 
     return 0
 
@@ -94,11 +103,15 @@ def _handle_break_on_windows(loop: asyncio.AbstractEventLoop, request_stop) -> N
 async def _serve_api(orchestrator: Orchestrator, stop_signal: asyncio.Event) -> None:
     import uvicorn
 
-    from .api.app import create_app
+    from .api.app import create_app, montar_na_raiz
 
     settings = orchestrator.settings
+    app = create_app(orchestrator)
+    # Instrumenta o app INTERNO: os spans levam a rota dele (`/api/...`), e a
+    # montagem em `/crypto-traders` fica de fora do nome.
+    observabilidade.instrumentar_api(app)
     config = uvicorn.Config(
-        create_app(orchestrator),
+        montar_na_raiz(app),
         host=settings.api_host,
         port=settings.api_port,
         log_level=settings.log_level.lower(),
@@ -129,7 +142,8 @@ def banner(settings, with_api: bool) -> None:
     print(f"  pares      : {', '.join(settings.trading.symbols)} ({settings.trading.timeframe})")
     print(f"  estrategias: {', '.join(settings.trading.strategies)}")
     if with_api:
-        print(f"  API        : http://{settings.api_host}:{settings.api_port}")
-        print(f"  docs       : http://{settings.api_host}:{settings.api_port}/docs")
+        endereco = f"http://{settings.api_host}:{settings.api_port}{RAIZ}"
+        print(f"  telas      : {endereco}/")
+        print(f"  docs       : {endereco}/docs")
     print("  Ctrl+C para encerrar.")
     print("=" * 66 + "\n")

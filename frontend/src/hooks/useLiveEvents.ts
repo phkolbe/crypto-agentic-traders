@@ -8,6 +8,7 @@
 
 import { useQueryClient } from '@tanstack/react-query'
 import { useEffect, useRef, useState } from 'react'
+import { RAIZ } from '../api/raiz'
 
 export type LiveEvent =
   | { event: 'signal'; data: Record<string, unknown> }
@@ -19,8 +20,8 @@ export type LiveEvent =
 /** Queries a revalidar por tipo de evento. */
 const INVALIDATES: Record<string, string[]> = {
   signal: ['signals'],
-  risk_assessment: ['riskEvents'],
-  order_result: ['trades', 'orders', 'portfolio'],
+  risk_assessment: ['riskEvents', 'portfolioAnalise'],
+  order_result: ['trades', 'orders', 'portfolio', 'portfolioAnalise'],
   portfolio: ['portfolio', 'portfolioHistory'],
   alert: ['health', 'riskConfig'],
 }
@@ -41,7 +42,7 @@ export function useLiveEvents() {
     const connect = () => {
       if (disposed) return
       const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws'
-      const socket = new WebSocket(`${protocol}://${window.location.host}/ws`)
+      const socket = new WebSocket(`${protocol}://${window.location.host}${RAIZ}/ws`)
       socketRef.current = socket
 
       socket.onopen = () => setConnected(true)

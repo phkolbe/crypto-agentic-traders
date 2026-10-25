@@ -1,5 +1,4 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useState } from 'react'
 import { api } from '../api/client'
 import {
   comparacaoAtravessaTroca,
@@ -17,8 +16,10 @@ import {
   toNumber,
   unidadeDoEvento,
 } from '../api/format'
+import { chaveDoPeriodo, parametrosDoPeriodo, rotuloDoPeriodo } from '../api/periodo'
 import type { AuditEntry, EquityPoint, PortfolioSummary, RiskEvent } from '../api/types'
 import { CompositionBar, DonutChart, TimeSeriesChart } from '../components/Charts'
+import { SeletorDePeriodo, usePeriodo } from '../components/Periodo'
 import {
   Card,
   CircuitBreakerBanner,
@@ -34,26 +35,22 @@ import {
 /** Paleta das fatias de alocacao; cores repetem se houver muitos ativos. */
 const SLICE_COLORS = ['#58a6ff', '#3fb950', '#d29922', '#bc8cff', '#f85149', '#39c5cf']
 
-const RANGES = [
-  { days: 1, label: '24h' },
-  { days: 7, label: '7d' },
-  { days: 30, label: '30d' },
-  { days: 90, label: '90d' },
-]
-
 /** Quantas entradas de auditoria pedir para localizar a troca de moeda. */
 const AUDIT_LIMITE = 50
 
 export default function Dashboard({ feed }: { feed: { event: string; data: any; at: string }[] }) {
-  const [days, setDays] = useState(30)
+  const [periodo, setPeriodo] = usePeriodo('dashboard', { tipo: 'atalho', dias: 30 })
   const queryClient = useQueryClient()
   const health = useHealth()
   const moeda = useQuoteCurrency()
 
   const portfolio = useQuery<PortfolioSummary>({ queryKey: ['portfolio'], queryFn: api.portfolio })
   const history = useQuery<EquityPoint[]>({
-    queryKey: ['portfolioHistory', days],
-    queryFn: () => api.portfolioHistory(days),
+    queryKey: ['portfolioHistory', chaveDoPeriodo(periodo)],
+    // A serie cobre a janela INTEIRA (ultimo retrato de cada faixa, ate 500
+    // pontos). Antes vinham os 5.000 retratos mais recentes -- ~3,5 dias --, e
+    // 7d, 30d e 90d desenhavam a mesma curva.
+    queryFn: () => api.portfolioHistory(parametrosDoPeriodo(periodo, new Date())),
   })
   const riskEvents = useQuery<RiskEvent[]>({
     queryKey: ['riskEvents'],
@@ -177,19 +174,8 @@ export default function Dashboard({ feed }: { feed: { event: string; data: any; 
       <div className="grid grid-2" style={{ marginBottom: 14 }}>
         <Card
           title="Evolução do patrimônio"
-          action={
-            <div className="row-tight">
-              {RANGES.map((range) => (
-                <button
-                  key={range.days}
-                  className={`small ${days === range.days ? 'primary' : ''}`}
-                  onClick={() => setDays(range.days)}
-                >
-                  {range.label}
-                </button>
-              ))}
-            </div>
-          }
+          subtitle={`Período: ${rotuloDoPeriodo(periodo)}`}
+          action={<SeletorDePeriodo periodo={periodo} onChange={setPeriodo} />}
         >
           {carregandoGrafico ? (
             <Loading />
@@ -397,7 +383,7 @@ export default function Dashboard({ feed }: { feed: { event: string; data: any; 
                     const decisao = rotuloDeDecisao(event)
                     return (
                       <tr key={event.id}>
-                        <td className="muted">{timeOnly(event.created_at)}</td>
+                        <td className="muted nowrap">{dateTime(event.created_at)}</td>
                         <td>{par || '—'}</td>
                         <td>
                           <span className={`badge ${decisao.classe}`}>{decisao.texto}</span>

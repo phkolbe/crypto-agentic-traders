@@ -1,0 +1,8 @@
+[Unit]
+Description=Backup do banco do Sistema Cripto (pg_dump + restic)
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/crypto/codigo/implantacao/producao/backup.sh

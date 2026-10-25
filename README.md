@@ -40,12 +40,17 @@ C4 — contexto, contêineres e componentes — em diagramas que o GitHub render
 
 - Roda em `dry_run`. **Nunca operou em `live`**: não há uma ordem de dinheiro real
   no histórico, e todo número de retorno neste repositório vem de backtest.
-- Suíte verde em **1118 passed, 6 skipped, 1 xfailed** — e o que os skips e o
-  xfail escondem está em [Os limites conhecidos](#os-limites-conhecidos-em-uma-tela).
-- O processo agora roda sob **supervisão do sistema operacional** (Tarefa Agendada,
-  que tenta subi-lo a cada 2 min). Medido: derrubado à força, volta sozinho em ~2
-  min. A supervisão cobre o **logon do operador**, não a máquina sem ninguém
-  conectado — essa opção exige guardar a senha no Agendador.
+- Suíte verde com Postgres em **1212 passed, 1 skipped, 1 xfailed** (24/10/2026) —
+  e o que o skip e o xfail escondem está em [Os limites conhecidos](#os-limites-conhecidos-em-uma-tela).
+- Desde 24/10/2026 roda em **Docker** (Postgres 16, `restart: unless-stopped`),
+  com traces, logs e métricas no Grafana da plataforma. As Tarefas Agendadas do
+  Windows ficaram desabilitadas. No notebook a supervisão ainda depende de alguém
+  abrir a sessão (o Docker Desktop só sobe no login); em produção, não.
+- **Produção** está preparada neste repositório
+  ([`implantacao/producao/`](implantacao/producao/README.md)): stack isolada com
+  Postgres, nó Tailscale e backup próprios; só o login Tailscale do administrador
+  passa pela API. Nasce em `dry_run` e vai a `live` trocando as duas travas do
+  `crypto.env` no servidor.
 
 ### Onde está o quê
 
@@ -78,9 +83,8 @@ Opera **somente na Binance**. A Coinbase está na fase 5 do roadmap — o adapte
 
 ## Requisitos
 
-- Python 3.13+ (testado em 3.14)
-- Node.js 20+ (para o dashboard)
-- Docker é **opcional** — veja [Persistência](#persistência)
+- Docker (o jeito de rodar: [Docker](#docker-desenvolvimento-com-observabilidade))
+- Para desenvolver fora do contêiner: Python 3.13+ (testado em 3.14) e Node.js 20+
 
 ## Instalação
 
@@ -96,7 +100,42 @@ Frontend:
 cd frontend && npm install
 ```
 
-## Como rodar
+## Docker: desenvolvimento com observabilidade
+
+```bash
+docker compose up -d --build
+```
+
+Sobe o Postgres 16, roda o `crypto-traders migrar` (schema e gatilhos, com o
+usuário **dono** do banco) e o sistema com o usuário da **aplicação**, que só lê e
+grava linhas — o servidor recusa que ele derrube a trilha append-only. Tudo mora em
+`http://127.0.0.1:8000/crypto-traders/` — telas, API em `/crypto-traders/api` e
+tempo real em `/crypto-traders/ws`; o endereço sem caminho redireciona para lá (a
+API serve as telas já montadas; nenhuma porta sai do `127.0.0.1`). O ambiente é o mesmo `.env` de sempre; banco, host da API e
+telemetria vêm do `docker-compose.yml` e vencem o `.env`.
+
+**Observabilidade:** traces, logs e métricas saem por OTLP para
+`OTEL_EXPORTER_OTLP_ENDPOINT` — no compose, `host.docker.internal:4318`, o coletor
+que estiver rodando na máquina (`OTEL_ENDPOINT` troca). Sem coletor o sistema roda
+igual. O painel **Sistema Cripto** e os alertas são deste repositório
+(`observabilidade/grafana/`) e entram em qualquer Grafana pela API:
+
+```bash
+GRAFANA_SENHA=... uv run python observabilidade/publicar_grafana.py --url http://localhost:8080/grafana
+```
+
+Detalhe em `backend/src/crypto_traders/observabilidade.py`.
+
+Histórico de um SQLite antigo para o Postgres (uma vez, banco recém-migrado e
+vazio; a cópia recusa destino com dados e confere tabela a tabela):
+
+```bash
+docker compose run --rm -v <pasta do .db>:/origem:ro migrar crypto-traders copiar-sqlite /origem/crypto_traders.db
+```
+
+Use uma cópia feita com a API de backup do SQLite (o arquivo em uso tem WAL).
+
+## Como rodar fora do Docker
 
 Backend (agentes + API):
 
@@ -110,8 +149,10 @@ Dashboard:
 cd frontend && npm run dev
 ```
 
-O dashboard sobe em `http://localhost:5173` e a API em `http://127.0.0.1:8000`
-(apenas localhost — a porta nunca é exposta na rede).
+O dashboard sobe em `http://localhost:5173/crypto-traders/` e a API em
+`http://127.0.0.1:8000/crypto-traders/api` (apenas localhost — a porta nunca é
+exposta na rede). A raiz `/crypto-traders` mora no `base` do `vite.config.ts` e em
+`RAIZ` no `api/app.py`: muda nos dois juntos.
 
 Outros comandos:
 
@@ -189,30 +230,16 @@ Um caractere trocado no `.env` não é suficiente para começar a gastar dinheir
 
 ## Persistência
 
-Por padrão o sistema usa **SQLite** (arquivo em `data/`) e um **event bus
-in-process**, sem exigir Docker — funciona em qualquer máquina com Python.
+No Docker: **PostgreSQL 16** e o event bus **in-process** (um processo só). O
+schema é do `crypto-traders migrar`, rodado com o usuário dono; o `run` só confere
+que schema e gatilhos estão lá (`DB_MIGRAR_NA_SUBIDA=false`) e recusa subir se
+faltar um. Fora do Docker, sem `DATABASE_URL`, continua o **SQLite** em `data/`,
+que cria o próprio schema na subida.
 
-Para migrar a PostgreSQL/TimescaleDB + Redis Streams, suba o compose e troque
-duas linhas no `.env` — nenhum código de agente muda:
-
-```bash
-docker compose up -d
-```
-
-```dotenv
-DATABASE_URL=postgresql+asyncpg://crypto:crypto@localhost:5432/crypto_traders
-EVENT_BUS=redis
-```
-
-```bash
-uv pip install -e ".[dev,postgres,redis]"
-```
-
-> ⚠️ **Essa migração nunca foi executada nesta máquina.** Não há Docker,
-> PostgreSQL nem Redis aqui, e os 6 testes de Postgres da suíte aparecem como
-> `skipped`. O schema, os gatilhos de append-only e as *hypertables* do Timescale
-> estão implementados e **não exercitados** — "trocar duas linhas" descreve o
-> desenho, não uma migração observada.
+> ⚠️ **TimescaleDB não é usado.** O Postgres da plataforma é o 16 puro; sem a
+> extensão, candles e snapshots ficam em tabela comum (`criar_hypertables` só
+> avisa). O teste de *hypertables* fica `skipped`. Redis Streams
+> (`EVENT_BUS=redis`) continua implementado e **não exercitado**.
 
 ## Segurança
 
@@ -242,9 +269,9 @@ Um engenheiro novo deve sair desta seção sabendo o que o sistema **não** gara
 | Limite | Onde está escrito |
 |---|---|
 | **Seis** situações em que uma posição aberta fica sem stop — inclusive posição sem preço médio e poeira abaixo do mínimo da exchange | [`SEGURANCA.md` §12](docs/SEGURANCA.md) |
-| PostgreSQL/TimescaleDB **nunca rodaram** aqui; os 6 testes deles são `skipped` | [`SEGURANCA.md` §17](docs/SEGURANCA.md) |
+| TimescaleDB e Redis Streams **nunca rodaram** (o PostgreSQL 16 roda desde 24/10/2026) | [`SEGURANCA.md` §17](docs/SEGURANCA.md) |
 | **Nunca houve teste de integração contra a testnet.** Nenhuma ordem deste sistema chegou a um servidor da Binance | [`SEGURANCA.md` §17](docs/SEGURANCA.md) |
-| A supervisão do SO cobre o **logon do operador**, não a máquina sem usuário conectado | [`SEGURANCA.md` §17](docs/SEGURANCA.md) |
+| No notebook, o Docker Desktop só sobe com o **logon do operador** (em produção, no boot) | [`SEGURANCA.md` §17](docs/SEGURANCA.md) |
 | Aporte menor que a perda ainda mascara parte dela no circuit breaker (`xfail` estrito) | [`SEGURANCA.md` §17](docs/SEGURANCA.md) |
 | A trilha append-only **não** resiste a código hostil dentro do próprio processo | [`SEGURANCA.md` §5](docs/SEGURANCA.md) |
 | Três filtros de regime medidos e desligados; nenhum replicou fora da janela | [`SEGURANCA.md` §11](docs/SEGURANCA.md) |
@@ -254,17 +281,21 @@ Um engenheiro novo deve sair desta seção sabendo o que o sistema **não** gara
 
 > ⚠️ **Rode de dentro de `backend/`.** Um teste do grupo de ataques lê arquivos
 > de `src/` por caminho relativo, então a suíte só passa com esse diretório de
-> trabalho. Da raiz do repositório, 1 dos 1.118 falha com `FileNotFoundError`.
+> trabalho. Da raiz do repositório, 1 deles falha com `FileNotFoundError`.
+
+Com o Postgres do compose de pé (e o database de teste criado uma vez:
+`docker exec crypto-postgres psql -U postgres -c "CREATE DATABASE crypto_teste"`):
 
 ```bash
-cd backend && uv run pytest -q
+cd backend && POSTGRES_TEST_URL=postgresql+asyncpg://postgres:postgres@127.0.0.1:5433/crypto_teste uv run pytest -q
 ```
 
-Verde hoje: **1118 passed, 6 skipped, 1 xfailed**. Os três números importam:
+Verde em 24/10/2026: **1212 passed, 1 skipped, 1 xfailed** (é também o que o CI
+roda). Os três números importam:
 
-- os **6 skips** são os testes de PostgreSQL/TimescaleDB, condicionados a
-  `POSTGRES_TEST_URL`. Não há servidor nesta máquina, então o schema de Postgres
-  está implementado e **não exercitado**;
+- o **1 skip** é o das *hypertables*: o Postgres da plataforma não tem a extensão
+  TimescaleDB, então essa otimização segue **não exercitada**. Sem
+  `POSTGRES_TEST_URL` (só SQLite) os testes de Postgres também viram skip;
 - o **1 xfail** é `strict=True` com motivo escrito. É limitação documentada, não
   teste adiado — o caso do aporte menor que a perda no circuit breaker
   ([`SEGURANCA.md` §17](docs/SEGURANCA.md)).
@@ -276,7 +307,7 @@ cd backend && uv run ruff check src tests
 cd frontend && npx tsc -b && npx vite build && npm run check
 ```
 
-`npm run check` roda 174 verificações de tela (`src/checks/telas.check.ts`) que
+`npm run check` roda 198 verificações de tela (`src/checks/telas.check.ts`) que
 chamam as funções puras de formatação com os dados reais do sistema — existem
 porque `tsc` passa limpo com a tela errada na frente do usuário.
 

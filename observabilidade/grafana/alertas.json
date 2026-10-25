@@ -1,0 +1,343 @@
+{
+  "grupo": "crypto",
+  "intervalo": "1m",
+  "regras": [
+    {
+      "uid": "crypto-sem-telemetria",
+      "title": "Crypto sem telemetria",
+      "condition": "C",
+      "data": [
+        {
+          "refId": "A",
+          "datasourceUid": "prometheus",
+          "relativeTimeRange": {
+            "from": 600,
+            "to": 0
+          },
+          "model": {
+            "refId": "A",
+            "instant": true,
+            "expr": "max(max_over_time(crypto_info{deployment_environment!=\"hml\"}[7d])) unless max(crypto_info{deployment_environment!=\"hml\"})"
+          }
+        },
+        {
+          "refId": "C",
+          "datasourceUid": "__expr__",
+          "model": {
+            "refId": "C",
+            "type": "threshold",
+            "expression": "A",
+            "conditions": [
+              {
+                "evaluator": {
+                  "type": "gt",
+                  "params": [
+                    0
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "for": "3m",
+      "noDataState": "OK",
+      "execErrState": "Error",
+      "labels": {
+        "severidade": "critica"
+      },
+      "annotations": {
+        "summary": "O Sistema Cripto parou de mandar telemetria: processo fora do ar ou coletor inacessivel",
+        "description": "Com dinheiro real, processo parado e stop-loss parado (o stop e executado pelo proprio sistema, nao pela exchange)."
+      }
+    },
+    {
+      "uid": "crypto-agente-com-problema",
+      "title": "Crypto — agente com problema",
+      "condition": "C",
+      "data": [
+        {
+          "refId": "A",
+          "datasourceUid": "prometheus",
+          "relativeTimeRange": {
+            "from": 300,
+            "to": 0
+          },
+          "model": {
+            "refId": "A",
+            "instant": true,
+            "expr": "max by (agente) (1 - crypto_agente_saudavel{deployment_environment!=\"hml\"})"
+          }
+        },
+        {
+          "refId": "C",
+          "datasourceUid": "__expr__",
+          "model": {
+            "refId": "C",
+            "type": "threshold",
+            "expression": "A",
+            "conditions": [
+              {
+                "evaluator": {
+                  "type": "gt",
+                  "params": [
+                    0
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "for": "5m",
+      "noDataState": "OK",
+      "execErrState": "Error",
+      "labels": {
+        "severidade": "critica"
+      },
+      "annotations": {
+        "summary": "Agente {{ $labels.agente }} do Crypto parado, atrasado ou abandonado pelo watchdog ha 5 minutos"
+      }
+    },
+    {
+      "uid": "crypto-tarefa-morta",
+      "title": "Crypto — tarefa do orquestrador morta",
+      "condition": "C",
+      "data": [
+        {
+          "refId": "A",
+          "datasourceUid": "prometheus",
+          "relativeTimeRange": {
+            "from": 300,
+            "to": 0
+          },
+          "model": {
+            "refId": "A",
+            "instant": true,
+            "expr": "max by (tarefa) (1 - crypto_tarefa_viva{deployment_environment!=\"hml\"})"
+          }
+        },
+        {
+          "refId": "C",
+          "datasourceUid": "__expr__",
+          "model": {
+            "refId": "C",
+            "type": "threshold",
+            "expression": "A",
+            "conditions": [
+              {
+                "evaluator": {
+                  "type": "gt",
+                  "params": [
+                    0
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "for": "5m",
+      "noDataState": "OK",
+      "execErrState": "Error",
+      "labels": {
+        "severidade": "critica"
+      },
+      "annotations": {
+        "summary": "Tarefa {{ $labels.tarefa }} do orquestrador do Crypto morta ha 5 minutos (a de alertas apaga as notificacoes)"
+      }
+    },
+    {
+      "uid": "crypto-snapshot-parado",
+      "title": "Crypto — carteira sem snapshot",
+      "condition": "C",
+      "data": [
+        {
+          "refId": "A",
+          "datasourceUid": "prometheus",
+          "relativeTimeRange": {
+            "from": 300,
+            "to": 0
+          },
+          "model": {
+            "refId": "A",
+            "instant": true,
+            "expr": "max(crypto_snapshot_idade_seconds{deployment_environment!=\"hml\"})"
+          }
+        },
+        {
+          "refId": "C",
+          "datasourceUid": "__expr__",
+          "model": {
+            "refId": "C",
+            "type": "threshold",
+            "expression": "A",
+            "conditions": [
+              {
+                "evaluator": {
+                  "type": "gt",
+                  "params": [
+                    300
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "for": "5m",
+      "noDataState": "OK",
+      "execErrState": "Error",
+      "labels": {
+        "severidade": "critica"
+      },
+      "annotations": {
+        "summary": "Ultimo snapshot da carteira do Crypto ha {{ printf \"%.0f\" $values.A.Value }} s: o stop-loss nao esta sendo avaliado"
+      }
+    },
+    {
+      "uid": "crypto-circuit-breaker",
+      "title": "Crypto — circuit breaker armado",
+      "condition": "C",
+      "data": [
+        {
+          "refId": "A",
+          "datasourceUid": "prometheus",
+          "relativeTimeRange": {
+            "from": 300,
+            "to": 0
+          },
+          "model": {
+            "refId": "A",
+            "instant": true,
+            "expr": "max(crypto_circuit_breaker_ativo{deployment_environment!=\"hml\"})"
+          }
+        },
+        {
+          "refId": "C",
+          "datasourceUid": "__expr__",
+          "model": {
+            "refId": "C",
+            "type": "threshold",
+            "expression": "A",
+            "conditions": [
+              {
+                "evaluator": {
+                  "type": "gt",
+                  "params": [
+                    0
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "for": "0m",
+      "noDataState": "OK",
+      "execErrState": "Error",
+      "labels": {
+        "severidade": "aviso"
+      },
+      "annotations": {
+        "summary": "Circuit breaker do Crypto armado: nenhuma abertura ate o rearme manual na tela Risco"
+      }
+    },
+    {
+      "uid": "crypto-aberturas-bloqueadas",
+      "title": "Crypto — aberturas bloqueadas",
+      "condition": "C",
+      "data": [
+        {
+          "refId": "A",
+          "datasourceUid": "prometheus",
+          "relativeTimeRange": {
+            "from": 300,
+            "to": 0
+          },
+          "model": {
+            "refId": "A",
+            "instant": true,
+            "expr": "max(crypto_aberturas_bloqueadas{deployment_environment!=\"hml\"})"
+          }
+        },
+        {
+          "refId": "C",
+          "datasourceUid": "__expr__",
+          "model": {
+            "refId": "C",
+            "type": "threshold",
+            "expression": "A",
+            "conditions": [
+              {
+                "evaluator": {
+                  "type": "gt",
+                  "params": [
+                    0
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "for": "10m",
+      "noDataState": "OK",
+      "execErrState": "Error",
+      "labels": {
+        "severidade": "aviso"
+      },
+      "annotations": {
+        "summary": "A execucao do Crypto esta barrando novas compras ha 10 minutos"
+      }
+    },
+    {
+      "uid": "crypto-ordens-falhando",
+      "title": "Crypto — ordens falhando",
+      "condition": "C",
+      "data": [
+        {
+          "refId": "A",
+          "datasourceUid": "prometheus",
+          "relativeTimeRange": {
+            "from": 900,
+            "to": 0
+          },
+          "model": {
+            "refId": "A",
+            "instant": true,
+            "expr": "sum(increase(crypto_ordens_total{status=~\"failed|rejected\", deployment_environment!=\"hml\"}[15m]))"
+          }
+        },
+        {
+          "refId": "C",
+          "datasourceUid": "__expr__",
+          "model": {
+            "refId": "C",
+            "type": "threshold",
+            "expression": "A",
+            "conditions": [
+              {
+                "evaluator": {
+                  "type": "gt",
+                  "params": [
+                    0
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "for": "0m",
+      "noDataState": "OK",
+      "execErrState": "Error",
+      "labels": {
+        "severidade": "aviso"
+      },
+      "annotations": {
+        "summary": "{{ printf \"%.0f\" $values.A.Value }} ordem(ns) do Crypto falharam ou foram rejeitadas pela exchange em 15 minutos"
+      }
+    }
+  ]
+}
