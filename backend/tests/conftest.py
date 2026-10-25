@@ -7,8 +7,8 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
-from sqlalchemy.engine import make_url
 from helpers import make_candles
+from sqlalchemy.engine import make_url
 
 from crypto_traders.config import DEFAULT_DB_PATH, RiskSettings, Settings, TradingSettings
 from crypto_traders.db import session as db_session
