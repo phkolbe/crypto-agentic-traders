@@ -22,6 +22,7 @@ Depender de alguem chamar um setter na subida e depender de nada.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from decimal import Decimal
 from typing import Any
 
@@ -82,6 +83,18 @@ class PaperBroker(Broker):
 
     def set_prices(self, prices: dict[str, Decimal]) -> None:
         self._last_prices.update(prices)
+
+    def set_price_source(self, fonte: Callable[[], dict[str, Decimal]]) -> None:
+        """De onde ler o preco NO MOMENTO de executar uma ordem a mercado.
+
+        Antes so havia `set_prices`, chamado pelo orquestrador a cada snapshot
+        (60 s) -- e com o fechamento do candle. A ordem do sinal das 00:00 UTC
+        executava antes da sincronizacao seguinte, ao preco da vespera: medido no
+        dry_run, compra do XRP a 1,2957 com o mercado a 1,3962 e um "take profit"
+        de +7,7% em 38 s. Com a fonte, a ordem le o preco corrente daquele
+        instante, como a exchange faria.
+        """
+        self._fonte_de_preco = fonte
 
     @property
     def balances(self) -> dict[str, Decimal]:
@@ -268,6 +281,15 @@ class PaperBroker(Broker):
     def _reference_price(self, request: OrderRequest, base: str) -> Decimal | None:
         if request.order_type is OrderType.LIMIT and request.price is not None:
             return request.price
+        fonte = getattr(self, "_fonte_de_preco", None)
+        if fonte is not None:
+            try:
+                atual = fonte().get(base)
+            except Exception:  # pragma: no cover - fonte com defeito: cai no ultimo conhecido
+                atual = None
+            if atual is not None and atual > 0:
+                self._last_prices[base] = atual
+                return atual
         return self._last_prices.get(base)
 
     def snapshot(self) -> dict[str, Any]:

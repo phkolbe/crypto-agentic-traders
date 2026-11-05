@@ -242,6 +242,24 @@ class CcxtExchange(MarketDataSource, Broker):
         price = raw.get("last") or raw.get("close") or raw.get("bid")
         return Ticker(exchange=self._exchange_enum(), symbol=symbol, price=_dec(price))
 
+    async def fetch_tickers(self, symbols: list[str]) -> dict[str, Ticker]:
+        """Preco corrente de varios pares numa chamada so (o ciclo do Market Data).
+
+        Par sem preco na resposta fica de fora, e nao com zero: zero seria lido
+        como "o ativo nao vale nada" e dispararia stop.
+        """
+        raw = await self._with_retry("fetch_tickers", self._client.fetch_tickers, symbols)
+        tickers: dict[str, Ticker] = {}
+        for symbol in symbols:
+            item = raw.get(symbol) or {}
+            price = item.get("last") or item.get("close") or item.get("bid")
+            if price is None:
+                continue
+            tickers[symbol] = Ticker(
+                exchange=self._exchange_enum(), symbol=symbol, price=_dec(price)
+            )
+        return tickers
+
     # ------------------------------------------------------------------
     # Broker
     # ------------------------------------------------------------------

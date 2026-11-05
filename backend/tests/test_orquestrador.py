@@ -261,7 +261,11 @@ class TestPerdaDeMensagem:
             await subida_original()
 
         agente.start = sobe_publicando_no_meio
+        # Travado ha uma hora: sem batida E sem subida recente. Recuar so a batida
+        # deixava um agente que acabou de subir parecer travado -- a regra que
+        # reiniciava em laco o agente recem-reiniciado (corrigida em 04/11/2026).
         agente.last_beat = datetime.now(UTC) - timedelta(hours=1)
+        agente.started_at = datetime.now(UTC) - timedelta(hours=1)
 
         await orquestrador._check_health_once()
         await asyncio.sleep(0.2)
@@ -579,6 +583,9 @@ class _FalsoMarketData:
     def __init__(self) -> None:
         self.active_symbols = ["BTC/USDT"]
         self.latest_prices: dict = {}
+
+    def precos_para_avaliacao(self) -> dict:
+        return dict(self.latest_prices)
 
 
 class _FalsaStrategy:

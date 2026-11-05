@@ -10,6 +10,7 @@ D32–D39); roteiro completo, inclusive ligar o `live`, em `acessos-e-operacao.m
 | `serve.json` | HTTPS do nó → `http://crypto-prd:8000` |
 | `preparar.sh` | cria `/opt/crypto/.env` (senhas novas) e `/opt/crypto/crypto.env` (nasce em `dry_run`), modo 600 |
 | `implantar.sh` | imagens → Postgres → backup → `migrar` → sistema saudável → confere a trava → nó Tailscale |
+| `diagnostico.sh` | `crypto-traders check` num contêiner próprio e descartável — **nunca** `docker exec crypto-prd crypto-traders check` (o diagnóstico divide os 512 MB do sistema e o kernel mata o contêiner, com o stop junto; o comando recusa rodar ali) |
 | `backup.sh`, `systemd/` | `pg_dump` diário (14 locais) e restic opcional; timer 03:30 |
 | `env.exemplo`, `crypto.env.exemplo` | o que cada arquivo da pasta leva |
 

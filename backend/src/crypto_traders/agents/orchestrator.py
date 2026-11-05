@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -50,6 +51,21 @@ HEARTBEAT_TIMEOUT = timedelta(minutes=10)
 
 #: Intervalo da vigilancia de saude.
 WATCHDOG_INTERVAL_SECONDS = 60
+
+#: Quanto o proprio watchdog pode se ATRASAR antes de concluir que a maquina inteira
+#: parou (suspensao do notebook, VM pausada). Um `sleep(60)` que volta horas depois
+#: nao e agente travado: e o processo inteiro congelado. Medido em 28/10/2026: o
+#: notebook suspendeu, na volta os cinco agentes estavam "sem sinal de vida" no mesmo
+#: instante, sem erro nenhum, e o watchdog desistiu da execucao e pausou o sistema --
+#: que ficou parado sete dias.
+SUSPENSAO_MINIMA = timedelta(minutes=3)
+
+#: Uma carencia por hora, no maximo. O detector mede relogio de parede em volta do
+#: `sleep` e nao distingue maquina suspensa de processo engasgado (swap, CPU
+#: estrangulada, `docker pause`): sem este teto, engasgos de 4 min em serie
+#: renovavam a carencia para sempre e um agente travado DE VERDADE nunca era
+#: reiniciado (medido pelo critico: 60 engasgos, 0 reinicios, 60 alertas).
+CARENCIA_INTERVALO_MINIMO = timedelta(hours=1)
 
 #: Quantos reinicios DENTRO DA JANELA antes de desistir de um agente.
 #:
@@ -107,10 +123,26 @@ _OWN_TASK_CONSEQUENCE = {
 class Orchestrator:
     """Dono do ciclo de vida de todos os agentes."""
 
-    def __init__(self, settings: Settings | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        *,
+        fonte_de_mercado: MarketDataSource | None = None,
+        onchain: OnChainProvider | None = None,
+    ) -> None:
         self.settings = settings or get_settings()
         self.bus: EventBus = build_event_bus(self.settings)
         self.notifier: Notifier = build_notifier(self.settings)
+
+        self._fonte_injetada = fonte_de_mercado
+        self._onchain_injetado = onchain
+        """Fonte de mercado e provedor on-chain no lugar dos de rede.
+
+        Existem para o simulador de cenarios (`crypto_traders.simulacao`) subir
+        o sistema REAL contra um mercado roteirizado. Em producao ficam vazios e
+        `start()` monta os de sempre; a fonte injetada continua sendo uma
+        `MarketDataSource`, que nao tem metodo nenhum que gaste dinheiro.
+        """
 
         self._source: MarketDataSource | None = None
         self._broker: Broker | None = None
@@ -124,6 +156,15 @@ class Orchestrator:
 
         self._restart_history: dict[str, list[datetime]] = {}
         """Quando cada agente foi reiniciado, dentro da janela corrente."""
+
+        self._carencia_ate: float | None = None
+        """Ate quando (em `time.monotonic()`) nenhum agente e julgado por falta de
+        sinal de vida: a janela que a maquina recem-acordada tem para os agentes
+        voltarem a bater. Monotonico de proposito: um passo do relogio de parede
+        (NTP) nao pode esticar a carencia."""
+
+        self._carencia_concedida_em: float | None = None
+        """Quando a ultima carencia foi concedida (monotonico), para o teto por hora."""
 
         self._restart_alerted: set[str] = set()
         """Agentes que ja avisaram neste episodio -- um alerta por episodio (D19)."""
@@ -192,25 +233,35 @@ class Orchestrator:
 
         await self.bus.start()
 
-        self._source = build_market_data_source(
-            self.settings.exchange, testnet=self.settings.trading_mode is TradingMode.TESTNET
-        )
+        if self._fonte_injetada is not None:
+            self._source = self._fonte_injetada
+        else:
+            self._source = build_market_data_source(
+                self.settings.exchange, testnet=self.settings.trading_mode is TradingMode.TESTNET
+            )
         self._broker = build_broker(self.settings)
 
         self.market_data = MarketDataAgent(
             self.bus, self._source, self.settings, on_universe_change=self._on_universe_change
         )
+        definir_fonte = getattr(self._broker, "set_price_source", None)
+        if definir_fonte is not None:
+            # Broker de papel: a ordem le o preco corrente no instante em que sai.
+            definir_fonte(self.market_data.precos_para_avaliacao)
         self.strategy = StrategyAgent(
             self.bus, build_strategies(self.settings.trading.strategies), self.settings
         )
-        self.onchain = OnChainProvider(self.settings)
+        self.onchain = self._onchain_injetado or OnChainProvider(self.settings)
         self.risk_manager = RiskManagerAgent(self.bus, self.settings, onchain=self.onchain)
+        self.risk_manager.definir_precos_de_mercado(self.market_data.precos_de_mercado)
         self.execution = ExecutionAgent(self.bus, self._broker, self.settings)
         self.portfolio = PortfolioAgent(
             self.bus,
             self._broker,
             self.settings,
-            price_source=lambda: dict(self.market_data.latest_prices),
+            # Preco CORRENTE (ticker), nao o fechamento do candle: e com ele que o
+            # stop e o alvo sao comparados (ver `MarketDataAgent.precos_correntes`).
+            price_source=lambda: self.market_data.precos_para_avaliacao(),
             on_snapshot=self._on_snapshot,
         )
 
@@ -259,6 +310,9 @@ class Orchestrator:
                     # Universo real, ja resolvido pela descoberta: registrar a
                     # config estatica gravaria uma lista vazia em "mar aberto".
                     "symbols": self.market_data.active_symbols,
+            # Ativos cujo stop e alvo NAO estao sendo avaliados agora (sem preco
+            # corrente recente). Lista vazia e o normal.
+            "sem_preco_corrente": list(self.market_data.pares_sem_preco_corrente),
                     "symbols_source": (
                         "descoberta" if self.settings.trading.discovery_enabled else "configurado"
                     ),
@@ -1041,7 +1095,7 @@ class Orchestrator:
         """
         setter = getattr(self._broker, "set_prices", None)
         if setter is not None:
-            setter(dict(self.market_data.latest_prices))
+            setter(self.market_data.precos_para_avaliacao())
 
     async def _listen_alerts(self) -> None:
         """Caminho único de notificação: tudo que é crítico passa por aqui.
@@ -1140,13 +1194,72 @@ class Orchestrator:
         enquanto uma etapa da cadeia deixou de existir.
         """
         while True:
+            antes = datetime.now(UTC)
             await asyncio.sleep(WATCHDOG_INTERVAL_SECONDS)
             try:
+                await self._observar_relogio(
+                    antes, datetime.now(UTC), timedelta(seconds=WATCHDOG_INTERVAL_SECONDS)
+                )
                 await self._check_health_once()
             except Exception as exc:
                 # A vigilancia nunca pode morrer por um erro dela mesma: sem
                 # watchdog, um agente travado deixa de ser detectado.
                 log.error("orchestrator.watchdog_cycle_failed", error=str(exc))
+
+    async def _observar_relogio(
+        self, antes: datetime, depois: datetime, esperado: timedelta
+    ) -> bool:
+        """Reconhece a maquina parada pelo atraso do proprio watchdog.
+
+        Se o `sleep` voltou muito depois do pedido, o processo inteiro ficou
+        congelado -- e a falta de batida dos agentes nesse intervalo nao diz nada
+        sobre eles. Em vez de reiniciar (e, em tres ciclos, desistir e pausar tudo),
+        os agentes ganham um timeout inteiro de carencia. Travamento DE VERDADE
+        continua sendo pego: passada a carencia, quem nao bateu e reiniciado.
+
+        A deteccao usa relogio de parede (no Linux o `sleep` corre no monotonico,
+        que PARA durante a suspensao), mas o prazo da carencia corre no
+        monotonico. No maximo uma carencia por `CARENCIA_INTERVALO_MINIMO`, e o
+        historico de reinicios NAO e zerado: um falso positivo (processo
+        engasgado) nao pode apagar a contagem de um agente em laco de queda.
+        Devolve True quando concedeu a carencia.
+        """
+        atraso = (depois - antes) - esperado
+        if atraso < SUSPENSAO_MINIMA:
+            return False
+        minutos = round(atraso.total_seconds() / 60)
+        agora = time.monotonic()
+        teto = CARENCIA_INTERVALO_MINIMO.total_seconds()
+        if self._carencia_concedida_em is not None and agora - self._carencia_concedida_em < teto:
+            log.warning(
+                "orchestrator.parada_repetida",
+                parada_minutos=minutos,
+                detail="nova parada dentro da hora: sem nova carencia, o watchdog segue julgando",
+            )
+            return False
+        self._carencia_concedida_em = agora
+        self._carencia_ate = agora + HEARTBEAT_TIMEOUT.total_seconds()
+        carencia_min = round(HEARTBEAT_TIMEOUT.total_seconds() / 60)
+        log.warning(
+            "orchestrator.maquina_suspensa",
+            parada_minutos=minutos,
+            carencia_minutos=carencia_min,
+            detail="o processo ficou congelado; agentes nao sao julgados ate a carencia acabar",
+        )
+        await self.bus.publish(
+            Topics.ALERTS,
+            {
+                "type": "host_suspended",
+                "title": f"Maquina parada por ~{minutos} min",
+                "message": (
+                    f"O sistema ficou congelado por cerca de {minutos} minutos (suspensao da "
+                    "maquina ou VM pausada). Nesse intervalo nenhum preco foi lido e nenhum "
+                    f"stop foi avaliado. Os agentes tem {carencia_min} min para voltar a "
+                    "dar sinal de vida antes de qualquer reinicio."
+                ),
+            },
+        )
+        return True
 
     def _is_stale(self, agent: BaseAgent, now: datetime) -> bool:
         """Ha quanto tempo o agente nao da sinal de vida.
@@ -1158,10 +1271,17 @@ class Orchestrator:
         """
         if agent.is_paused:
             return False
-        reference = agent.last_beat or agent.started_at
-        if reference is None:
+        # A referencia mais RECENTE entre a batida e a (re)subida. Era
+        # `last_beat or started_at`: com batida antiga, o agente recem-reiniciado
+        # continuava medido pela batida de antes do reinicio, nascia "sem sinal de
+        # vida" e era reiniciado de novo no ciclo seguinte -- tres reinicios em tres
+        # minutos e a desistencia, sem dar a ele o prazo que o timeout promete.
+        referencias = [r for r in (agent.last_beat, agent.started_at) if r is not None]
+        if not referencias:
             return False
-        return (now - reference) > HEARTBEAT_TIMEOUT
+        if self._carencia_ate is not None and time.monotonic() < self._carencia_ate:
+            return False
+        return (now - max(referencias)) > HEARTBEAT_TIMEOUT
 
     async def _check_health_once(self) -> None:
         """Um ciclo de vigilancia.

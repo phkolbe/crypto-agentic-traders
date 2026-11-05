@@ -38,14 +38,15 @@ def build_broker(settings: Settings) -> Broker:
             slippage_pct=settings.trading.paper_slippage_pct,
         )
 
-    credentials = settings.credentials_for(settings.exchange)
+    testnet = settings.trading_mode is TradingMode.TESTNET
+    credentials = settings.credentials_for(settings.exchange, testnet=testnet)
     if not credentials.configured:
+        variavel = f"{settings.exchange.upper()}{'_TESTNET' if testnet else ''}__API_KEY"
         raise ExchangeError(
             f"TRADING_MODE={settings.trading_mode} exige credenciais da exchange "
-            f"'{settings.exchange}' no .env."
+            f"'{settings.exchange}' no .env ({variavel} e o segredo)."
         )
 
-    testnet = settings.trading_mode is TradingMode.TESTNET
     log.warning(
         "broker.real_orders_enabled",
         exchange=settings.exchange,

@@ -835,6 +835,37 @@ nenhum registro de risco.
 inteiramente do lado do sistema. Não há trava impedindo o LIVE — a decisão de
 subir com as limitações abaixo é do operador, e este é o registro dela.
 
+#### Contra qual preço o stop é comparado (corrigido em 04/11/2026)
+
+**Até 04/11/2026 o "a cada 60s" acima era falso.** O preço comparado com o stop
+era o fechamento do último candle **fechado** do timeframe da estratégia — com
+`1d`, ele andava uma vez por dia. O stop de 3% só podia agir no fechamento
+diário, e o broker de papel executava no mesmo preço velho: o dry_run comprou XRP
+a 1,2957 (fechamento da véspera) com o mercado a 1,3962 e registrou um "take
+profit" de +7,7% 38 segundos depois, que nunca existiu. O histórico do dry_run até
+essa data foi arquivado por isso (`data/arquivo/`, ver `andamento` no cofre).
+
+Como funciona agora:
+
+- O Market Data lê o **ticker** de todos os pares a cada ciclo (60s), numa chamada
+  só; se o lote falhar (um par deslistado derruba o lote inteiro no ccxt), lê par a
+  par, para um símbolo ruim não cegar os outros.
+- **Stop, alvo e dimensionamento da ordem** usam só o preço corrente **recente**
+  (até 3 ciclos, mínimo 3 min). Sem ele, o par fica **sem avaliação** e o operador
+  recebe o alerta *"Sem preço corrente"*. Nunca se volta ao fechamento do candle:
+  o preço médio veio de uma execução no mercado, e comparar com o fechamento diário
+  vendia por engano (o crítico mediu: médio 1,3969, fechamento 1,2957 abaixo do
+  stop 1,3550, venda fantasma após 4 min sem ticker).
+- Salto de mais de 3× numa leitura só fica **suspeito** e só vale se a leitura
+  seguinte confirmar o mesmo lado: um decimal trocado não dispara stop, e um colapso
+  de verdade (que persiste) entra um ciclo depois em vez de ser mascarado.
+- A valorização da carteira e o broker de papel usam o último preço de mercado
+  aceito (mesmo velho); o fechamento do candle só quando nunca houve ticker.
+- O candle continua sendo o que a **estratégia** lê.
+
+Provas: `tests/test_preco_corrente.py` (cada defeito, com contraprova) e
+`tests/test_cenarios.py` (o sistema inteiro contra um mercado simulado).
+
 #### As limitações, conferidas uma por uma
 
 | Cenário | Stop em software | OCO na exchange | Estado |
@@ -847,9 +878,10 @@ subir com as limitações abaixo é do operador, e este é o registro dela.
 | Posição sem preço médio | ✘ | ✘ | limitação nova nesta lista (não é nova no sistema) |
 | Poeira abaixo do mínimo da exchange | ✘ | ✘ | limitação nova nesta lista |
 | Ordem de proteção emitida e sem desfecho | ✘ | — | limitação nova nesta lista |
+| Exchange sem preço corrente do par por mais de 3 min | ✘ | ✔ | sem avaliação **e com alerta** (antes: comparava com o fechamento diário) |
 
-**Contagem, para não haver dúvida: seis limitações valem hoje** (linhas 2 a 4 e 6
-a 8). A primeira linha é o que o stop cobre; a quinta é a que foi fechada.
+**Contagem, para não haver dúvida: sete limitações valem hoje** (linhas 2 a 4 e 6
+a 9). A primeira linha é o que o stop cobre; a quinta é a que foi fechada.
 
 Uma que **deixou** de ser limitação e vale registrar, porque o botão continua na
 tela: **pausar o agente de execução pela interface** não desliga mais o stop.
@@ -1149,7 +1181,19 @@ Uma sequência, não uma escolha:
 
 1. Backtest da estratégia com dados históricos.
 2. `dry_run` por **semanas**, com o dashboard acompanhado de perto.
-3. `testnet`, para validar a integração real com a API da exchange.
+3. `testnet`, para validar a integração real com a API da exchange. Primeiro o
+   ensaio automático, que envia compra, venda, `clientOrderId` repetido e ordem
+   abaixo do mínimo e confere cada resposta (chave **separada** da real,
+   `BINANCE_TESTNET__API_KEY`/`_SECRET`, criada em testnet.binance.vision):
+
+   ```bash
+   docker compose run --rm --no-deps crypto crypto-traders ensaio-testnet --par BTC/USDT --valor 20
+   ```
+
+   Depois o sistema inteiro em `TRADING_MODE=testnet` por alguns dias. O mesmo
+   caminho de ponta a ponta já roda contra um mercado simulado na suíte
+   (`tests/test_cenarios.py`: stop intradiário, alvo, circuit breaker, stop durante
+   a trava, queda do ticker) — a testnet acrescenta o que só a exchange responde.
 4. **Teste deliberado do circuit breaker** — force o cenário de perda e confirme
    que a paralisação acontece de verdade.
 5. **Teste deliberado do stop-loss** — abra uma posição em `testnet` e confirme
@@ -1260,7 +1304,11 @@ classe, que nunca tinha rodado, falhou na primeira vez por ler "a última trade"
 num banco compartilhado; foi corrigido para ler a própria.
 
 **2. Não houve teste de integração contra a testnet.** Nenhuma ordem deste
-sistema jamais chegou a um servidor da Binance. Tudo o que a suíte prova sobre
+sistema jamais chegou a um servidor da Binance. *(04/11/2026: o ensaio existe —
+`crypto-traders ensaio-testnet` — e espera a chave da testnet do operador. Ele
+mede, entre outras coisas, se a Binance recusa um `clientOrderId` repetido de uma
+ordem já executada: se aceitar, o retry de rede de `_with_retry` pode comprar duas
+vezes, e isso vira defeito a corrigir antes do live.)* Tudo o que a suíte prova sobre
 execução, idempotência, reconciliação e stop-loss foi provado com `PaperBroker`
 em processo único. Os filtros reais de cada par são consultados pelo
 `crypto-traders check` (que fala com a exchange), mas isso é leitura de metadados

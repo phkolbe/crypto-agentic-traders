@@ -56,6 +56,9 @@ testpaths = ["backend/tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 filterwarnings = ["ignore::DeprecationWarning"]
+markers = [
+    "cenario: sistema real contra o mercado simulado (crypto_traders.simulacao); roda na suite padrao",
+]
 
 [tool.coverage.run]
 source = ["backend/src/crypto_traders"]

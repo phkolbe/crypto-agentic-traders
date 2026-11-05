@@ -813,7 +813,9 @@ class TestSoOQueORiskManagerAprovou:
         """`place_order` fora do Execution Agent e uma ordem sem guardiao.
 
         O backtest e a excecao consciente (D3): ele reutiliza o `PaperBroker`
-        de producao, e por definicao nenhuma ordem dele sai da maquina.
+        de producao, e por definicao nenhuma ordem dele sai da maquina. O
+        `ensaio_testnet` e a outra (D41): so constroi cliente com a chave da
+        testnet e recusa enviar qualquer ordem se o cliente nao apontar para ela.
         """
         src = Path(__file__).resolve().parents[1] / "src" / "crypto_traders"
         chamadores = sorted(
@@ -825,6 +827,7 @@ class TestSoOQueORiskManagerAprovou:
             "agents/execution.py",
             "backtest/engine.py",
             "backtest/portfolio.py",
+            "ensaio_testnet.py",
         ], f"novo chamador de place_order fora do Execution Agent: {chamadores}"
 
 

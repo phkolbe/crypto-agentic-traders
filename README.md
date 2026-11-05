@@ -164,6 +164,19 @@ uv run crypto-traders check
 uv run crypto-traders backtest --symbol BTC/USDT --strategy ma_crossover --days 90
 ```
 
+```bash
+uv run crypto-traders ensaio-testnet --par BTC/USDT --valor 20
+```
+
+No Docker, esses comandos rodam num contêiner **próprio** — nunca com
+`docker exec` no contêiner do sistema: eles carregam o catálogo da exchange
+(~200 MB) e o kernel mataria o contêiner inteiro, com o stop junto (medido em
+04/11/2026). O próprio comando recusa rodar ali.
+
+```bash
+docker compose run --rm --no-deps crypto crypto-traders check
+```
+
 ## Configuração: ambiente e negócio moram em lugares diferentes
 
 Esta separação é uma regra do projeto, não uma preferência de organização.
@@ -268,9 +281,9 @@ Um engenheiro novo deve sair desta seção sabendo o que o sistema **não** gara
 
 | Limite | Onde está escrito |
 |---|---|
-| **Seis** situações em que uma posição aberta fica sem stop — inclusive posição sem preço médio e poeira abaixo do mínimo da exchange | [`SEGURANCA.md` §12](docs/SEGURANCA.md) |
+| **Sete** situações em que uma posição aberta fica sem stop — inclusive posição sem preço médio, poeira abaixo do mínimo da exchange e exchange sem preço corrente do par (com alerta) | [`SEGURANCA.md` §12](docs/SEGURANCA.md) |
 | TimescaleDB e Redis Streams **nunca rodaram** (o PostgreSQL 16 roda desde 24/10/2026) | [`SEGURANCA.md` §17](docs/SEGURANCA.md) |
-| **Nunca houve teste de integração contra a testnet.** Nenhuma ordem deste sistema chegou a um servidor da Binance | [`SEGURANCA.md` §17](docs/SEGURANCA.md) |
+| **Nunca houve teste de integração contra a testnet.** Nenhuma ordem deste sistema chegou a um servidor da Binance; o ensaio (`crypto-traders ensaio-testnet`) está pronto e espera a chave da testnet | [`SEGURANCA.md` §17](docs/SEGURANCA.md) |
 | No notebook, o Docker Desktop só sobe com o **logon do operador** (em produção, no boot) | [`SEGURANCA.md` §17](docs/SEGURANCA.md) |
 | Aporte menor que a perda ainda mascara parte dela no circuit breaker (`xfail` estrito) | [`SEGURANCA.md` §17](docs/SEGURANCA.md) |
 | A trilha append-only **não** resiste a código hostil dentro do próprio processo | [`SEGURANCA.md` §5](docs/SEGURANCA.md) |

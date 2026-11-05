@@ -460,6 +460,10 @@ class Settings(BaseSettings):
     whatsapp_template_language: str = "pt_BR"
 
     binance: ExchangeCredentials = Field(default_factory=ExchangeCredentials)
+    binance_testnet: ExchangeCredentials = Field(default_factory=ExchangeCredentials)
+    """Chave da Binance Spot Testnet (`BINANCE_TESTNET__API_KEY`). Separada da real
+    de proposito: a chave de dinheiro real nunca viaja para a testnet, e a da
+    testnet nunca e usada em `live` -- trocar o modo nao troca a conta por engano."""
 
     # --- Negocio (preenchido pelo banco na subida) ------------------------
     trading: TradingSettings = Field(default_factory=TradingSettings)
@@ -545,13 +549,19 @@ class Settings(BaseSettings):
         """True quando ordens saem da maquina (LIVE ou TESTNET)."""
         return self.trading_mode in (TradingMode.LIVE, TradingMode.TESTNET)
 
-    def credentials_for(self, exchange: str) -> ExchangeCredentials:
+    def credentials_for(self, exchange: str, *, testnet: bool | None = None) -> ExchangeCredentials:
         """Credenciais da exchange, ou vazias se ela nao for suportada.
 
         Devolver vazio (em vez de falhar) mantem o caminho seguro: sem
-        credencial, `build_broker` recusa sair do modo simulado.
+        credencial, `build_broker` recusa sair do modo simulado. `testnet`
+        (padrao: o modo corrente) escolhe a chave da testnet -- nunca a real.
         """
-        return {"binance": self.binance}.get(exchange.lower(), ExchangeCredentials())
+        if testnet is None:
+            testnet = self.trading_mode is TradingMode.TESTNET
+        tabela = (
+            {"binance": self.binance_testnet} if testnet else {"binance": self.binance}
+        )
+        return tabela.get(exchange.lower(), ExchangeCredentials())
 
     def with_business_config(
         self, trading: TradingSettings, risk: RiskSettings

@@ -55,6 +55,28 @@ CLOCK_SKEW_MAX_FRACTION = 10
 #: registra -- nao muda decisao nenhuma, entao nao e parametro de negocio.
 STALE_PERIODS_WARNING = 3
 
+#: Teto de tempo para ler o preco corrente (ticker) de TODOS os pares numa chamada.
+TICKER_FETCH_TIMEOUT_SECONDS = 30.0
+
+#: Teto por par quando o lote falha e a leitura cai para um par de cada vez.
+TICKER_PAR_TIMEOUT_SECONDS = 10.0
+
+#: Idade maxima do preco corrente para ele valer na avaliacao de stop e alvo,
+#: em ciclos de coleta (com piso de 3 minutos). Mais velho que isso, o preco ja
+#: nao e "corrente": stop e alvo do par ficam SEM avaliacao (com alerta) ate ele
+#: voltar. Nunca se compara stop com o fechamento do candle -- o preco medio veio
+#: de uma execucao no preco de mercado, e o fechamento diario pode estar abaixo
+#: do stop com o mercado acima dele (venda fantasma, medida pelo critico).
+TICKER_MAX_AGE_CYCLES = 3
+TICKER_MAX_AGE_MIN = timedelta(minutes=3)
+
+#: Salto, contra o ultimo preco valido, a partir do qual UMA leitura nao basta
+#: (fator multiplicativo, nos dois sentidos). Fica guardada como suspeita e so
+#: vale se a leitura seguinte confirmar o mesmo lado. Assim um numero corrompido
+#: (decimal trocado, preco de outro par) nao dispara stop, e um colapso de
+#: verdade -- que persiste -- e aceito um ciclo depois, em vez de ser mascarado.
+TICKER_SALTO_SUSPEITO = Decimal(3)
+
 
 class MarketDataAgent(BaseAgent):
     name = "market_data"
@@ -87,6 +109,33 @@ class MarketDataAgent(BaseAgent):
         `_chave_de_preco`, que explica por que uma chave por ativo base sozinha
         misturava dois mercados num numero so.
         """
+
+        self.precos_correntes: dict[str, Decimal] = {}
+        """Preco CORRENTE (ticker) do par, lido a cada ciclo -- mesma chave de
+        `latest_prices`.
+
+        `latest_prices` e o fechamento do ultimo candle FECHADO do timeframe da
+        estrategia: com `1d`, ele anda uma vez por dia. Era esse o preco com que o
+        Risk Manager comparava stop e alvo "a cada 60s" -- e com que o broker de
+        papel executava. Medido no dry_run (04/11/2026): o stop de 3% so podia agir
+        no fechamento diario, e o papel comprou o XRP a 1,2957 (fechamento da
+        vespera) com o mercado a 1,3962, gerando um "take profit" de +7,7% em 38 s
+        que nao existiu. O candle continua sendo o que a ESTRATEGIA le; quem avalia
+        posicao e executa le `precos_para_avaliacao`.
+        """
+
+        self._precos_correntes_em: dict[str, datetime] = {}
+        self.pares_sem_preco_corrente: list[str] = []
+        """Pares ativos sem preco corrente recente: stop e alvo deles nao sao avaliados."""
+
+        self._suspeitos: dict[str, Decimal] = {}
+        """Leitura com salto grande, a espera da confirmacao do ciclo seguinte."""
+
+        self._pendentes: dict[str, tuple[str, Decimal, datetime]] = {}
+        """Ticker sem referencia nenhuma ainda (primeira leitura do processo): julgado
+        contra o fechamento do candle quando os candles do ciclo chegarem."""
+
+        self._alertados_sem_preco: frozenset[str] = frozenset()
 
         self._condicao: dict[str, str] = {}
         """Condicao anormal de coleta vigente por simbolo, para logar a MUDANCA.
@@ -180,7 +229,18 @@ class MarketDataAgent(BaseAgent):
                 return
 
     async def refresh(self) -> None:
-        """Um ciclo de coleta. Publico para o orquestrador poder aquecer o sistema."""
+        """Um ciclo de coleta. Publico para o orquestrador poder aquecer o sistema.
+
+        O preco corrente vem ANTES dos candles: o candle publicado aqui dispara
+        estrategia -> risco -> execucao, e a ordem que sai desse caminho tem de
+        encontrar o preco deste ciclo, nao o do anterior.
+        """
+        await self._atualizar_precos_correntes()
+        await self._coletar_candles()
+        self._julgar_pendentes()
+        await self._avisar_frescor()
+
+    async def _coletar_candles(self) -> None:
         for symbol in self.active_symbols:
             try:
                 # Teto de tempo por par: sem ele, uma conexao pendurada em um
@@ -219,6 +279,210 @@ class MarketDataAgent(BaseAgent):
                     "market_data.symbol_failed",
                     error=str(exc),
                 )
+
+    # ------------------------------------------------------------------
+    # Preco corrente
+    # ------------------------------------------------------------------
+    def idade_maxima_do_preco(self) -> timedelta:
+        ciclo = timedelta(seconds=self._settings.trading.market_data_interval_seconds)
+        return max(TICKER_MAX_AGE_MIN, ciclo * TICKER_MAX_AGE_CYCLES)
+
+    async def _atualizar_precos_correntes(self) -> None:
+        """Le o ticker de todos os pares ativos, numa chamada so quando a fonte deixa.
+
+        Falha aqui nao interrompe o ciclo: os candles ainda chegam. O par sem
+        preco corrente fica sem avaliacao de stop e alvo (com alerta) ate voltar.
+        """
+        symbols = self.active_symbols
+        if not symbols:
+            return
+        varios = getattr(self._source, "fetch_tickers", None)
+        if varios is not None:
+            try:
+                async with asyncio.timeout(TICKER_FETCH_TIMEOUT_SECONDS):
+                    tickers = await varios(symbols)
+            except Exception as exc:
+                # Um simbolo desconhecido (typo, par deslistado) derruba o lote
+                # inteiro no ccxt (`BadSymbol`). Sem a leitura par a par abaixo,
+                # um par ruim cegava o stop de TODOS, ciclo apos ciclo.
+                self._log_de_estado(
+                    "*",
+                    "preco_corrente",
+                    f"falha:{type(exc).__name__}",
+                    "warning",
+                    "market_data.ticker_lote_falhou",
+                    error=str(exc),
+                    detail="lendo o preco corrente par a par neste ciclo",
+                )
+            else:
+                self._condicao.pop("*|preco_corrente", None)
+                agora = datetime.now(UTC)
+                for symbol, ticker in tickers.items():
+                    self._receber_ticker(symbol, ticker.price, agora)
+                return
+        for symbol in symbols:
+            try:
+                async with asyncio.timeout(TICKER_PAR_TIMEOUT_SECONDS):
+                    ticker = await self._source.fetch_ticker(symbol)
+            except Exception as exc:
+                self._log_de_estado(
+                    symbol,
+                    "ticker_par",
+                    f"falha:{type(exc).__name__}",
+                    "warning",
+                    "market_data.ticker_falhou",
+                    error=str(exc),
+                )
+                continue
+            self._condicao.pop(f"{symbol}|ticker_par", None)
+            self._receber_ticker(symbol, ticker.price, datetime.now(UTC))
+
+    def _receber_ticker(self, symbol: str, preco: Decimal, agora: datetime) -> None:
+        chave = self._chave_de_preco(symbol)
+        if not preco.is_finite() or preco <= 0:
+            self._log_de_estado(
+                symbol,
+                "ticker",
+                f"recusado:{preco}",
+                "warning",
+                "market_data.ticker_recusado",
+                preco=str(preco),
+                detail="preco corrente invalido; ignorado",
+            )
+            return
+        referencia = self.precos_correntes.get(chave) or self.latest_prices.get(chave)
+        if referencia is None or referencia <= 0:
+            self._pendentes[chave] = (symbol, preco, agora)
+            return
+        self._julgar(chave, symbol, preco, referencia, agora)
+
+    def _julgar(
+        self, chave: str, symbol: str, preco: Decimal, referencia: Decimal | None, agora: datetime
+    ) -> None:
+        """Aceita o preco, ou o guarda como suspeito ate a proxima leitura confirmar."""
+        dentro = referencia is not None and (
+            referencia / TICKER_SALTO_SUSPEITO <= preco <= referencia * TICKER_SALTO_SUSPEITO
+        )
+        if not dentro:
+            anterior = self._suspeitos.get(chave)
+            mesmo_lado = (
+                anterior is not None
+                and referencia is not None
+                and (anterior > referencia) == (preco > referencia)
+            ) or (anterior is not None and referencia is None)
+            if not mesmo_lado:
+                self._suspeitos[chave] = preco
+                self._log_de_estado(
+                    symbol,
+                    "ticker",
+                    f"suspeito:{preco}",
+                    "warning",
+                    "market_data.ticker_suspeito",
+                    preco=str(preco),
+                    referencia=str(referencia),
+                    detail="salto grande demais para uma leitura so; vale se a proxima confirmar",
+                )
+                return
+            self.log.warning(
+                "market_data.salto_confirmado",
+                symbol=symbol,
+                preco=str(preco),
+                referencia=str(referencia),
+                detail="duas leituras seguidas confirmam o movimento extremo",
+            )
+        self._suspeitos.pop(chave, None)
+        self._condicao.pop(f"{symbol}|ticker", None)
+        self.precos_correntes[chave] = preco
+        self._precos_correntes_em[chave] = agora
+
+    def _julgar_pendentes(self) -> None:
+        """Primeira leitura do processo: julgada contra o fechamento recem-coletado."""
+        pendentes, self._pendentes = self._pendentes, {}
+        for chave, (symbol, preco, em) in pendentes.items():
+            self._julgar(chave, symbol, preco, self.latest_prices.get(chave), em)
+
+    def _chaves_ativas(self) -> set[str]:
+        return {self._chave_de_preco(s) for s in self.active_symbols}
+
+    def precos_de_mercado(self) -> dict[str, Decimal]:
+        """So o preco corrente RECENTE (`idade_maxima_do_preco`), por ativo.
+
+        E com este que o Risk Manager compara stop e alvo e dimensiona a ordem.
+        Par ausente aqui fica sem avaliacao de protecao -- nunca com o fechamento
+        do candle, que nao e o mercado.
+        """
+        agora = datetime.now(UTC)
+        limite = self.idade_maxima_do_preco()
+        return {
+            chave: preco
+            for chave, preco in self.precos_correntes.items()
+            if agora - self._precos_correntes_em[chave] <= limite
+        }
+
+    def precos_para_avaliacao(self) -> dict[str, Decimal]:
+        """O melhor preco conhecido de cada ativo: valorizacao da carteira e papel.
+
+        O ultimo preco corrente aceito (mesmo velho: foi o mercado de verdade);
+        sem nenhum, o fechamento do candle. Serve para dizer quanto a carteira vale
+        e a que preco o broker de papel executa -- nao para disparar stop
+        (`precos_de_mercado`). Nunca inventa preco: par sem nada fica ausente.
+        """
+        precos = dict(self.latest_prices)
+        precos.update(self.precos_correntes)
+        frescos = self.precos_de_mercado()
+        self.pares_sem_preco_corrente = sorted(self._chaves_ativas() - set(frescos))
+        return precos
+
+    async def _avisar_frescor(self) -> None:
+        """Alerta (nao so log) quando pares ativos ficam sem preco corrente."""
+        sem = frozenset(self._chaves_ativas() - set(self.precos_de_mercado()))
+        self.pares_sem_preco_corrente = sorted(sem)
+        anteriores = self._alertados_sem_preco
+        novos = sorted(sem - anteriores)
+        try:
+            await self._publicar_frescor(sem, anteriores, novos)
+        except Exception as exc:
+            # O alerta nunca derruba a coleta; sem registrar o estado, ele e
+            # tentado de novo no proximo ciclo.
+            self.log.error("market_data.alerta_de_preco_falhou", error=str(exc))
+            return
+        self._alertados_sem_preco = sem
+
+    async def _publicar_frescor(
+        self, sem: frozenset[str], anteriores: frozenset[str], novos: list[str]
+    ) -> None:
+        if novos:
+            self.log.warning(
+                "market_data.sem_preco_corrente",
+                pares=novos,
+                detail="stop e alvo destes pares nao sao avaliados ate o preco voltar",
+            )
+            await self.bus.publish(
+                Topics.ALERTS,
+                {
+                    "type": "preco_corrente_ausente",
+                    "title": f"Sem preco corrente: {', '.join(novos)}",
+                    "message": (
+                        "A exchange nao entregou preco corrente valido para "
+                        f"{', '.join(novos)} nos ultimos {self.idade_maxima_do_preco()}. "
+                        "Enquanto isso, stop-loss e take-profit destes ativos NAO estao "
+                        "sendo avaliados (comparar com o fechamento do candle venderia "
+                        "por engano)."
+                    ),
+                },
+            )
+        elif anteriores and not sem:
+            self.log.info("market_data.preco_corrente_restabelecido", pares=sorted(anteriores))
+            await self.bus.publish(
+                Topics.ALERTS,
+                {
+                    "type": "preco_corrente_restabelecido",
+                    "title": "Preco corrente restabelecido",
+                    "message": (
+                        f"{', '.join(sorted(anteriores))}: stop e alvo voltaram a ser avaliados."
+                    ),
+                },
+            )
 
     def _log_de_estado(
         self, symbol: str, familia: str, condicao: str, nivel: str, evento: str, **campos

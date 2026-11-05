@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -110,6 +111,14 @@ class RiskManagerAgent(BaseAgent):
         self._circuit_breaker_reason: str | None = None
         self._capital_alerted = False
         """Aviso de saldo nao autorizado sai uma vez por transicao."""
+
+        self._precos_de_mercado: Callable[[], dict[str, Decimal]] | None = None
+        """Preco corrente recente por ativo (o orquestrador liga ao Market Data).
+
+        Quando ligado, stop e alvo so sao avaliados para ativo com preco aqui, e a
+        ordem e dimensionada nele. Desligado (testes de unidade), vale o preco do
+        snapshot e o do sinal, como antes.
+        """
 
         self._exiting: set[str] = set()
         """Ativos com ordem de protecao em voo.
@@ -265,6 +274,10 @@ class RiskManagerAgent(BaseAgent):
 
     async def _on_batch(self, batch: list[Signal]) -> None:
         """Decide o lote inteiro de uma vez, por confianca."""
+        # O motor dimensiona a quantidade e ancora stop e alvo no preco do sinal;
+        # o sinal sai com o fechamento do candle. O mesmo sinal (mesmo id), com o
+        # preco do mercado de agora, e o que segue daqui em diante.
+        batch = [self._no_preco_corrente(signal) for signal in batch]
         if self._snapshot is None:
             for signal in batch:
                 await self._persist_and_publish(
@@ -283,7 +296,7 @@ class RiskManagerAgent(BaseAgent):
             base = symbol.partition("/")[0]
             for signal in batch:
                 if signal.symbol == symbol:
-                    state.prices[base] = signal.reference_price
+                    state.prices[base] = self._preco_de_dimensionamento(signal)
                     break
 
         decisoes = self._engine.evaluate_batch(batch, state)
@@ -483,6 +496,7 @@ class RiskManagerAgent(BaseAgent):
         await self._reconcile_exits(snapshot)
 
         sem_base: set[str] = set()
+        mercado = self._precos_de_mercado() if self._precos_de_mercado is not None else None
         for position in snapshot.positions:
             if position.asset == self._settings.trading.quote_currency:
                 continue
@@ -498,6 +512,14 @@ class RiskManagerAgent(BaseAgent):
                 # airdrop, sem nenhuma compra correspondente.
                 sem_base.add(position.asset)
                 continue
+            if mercado is not None:
+                # So o preco corrente recente decide stop e alvo. Ativo sem ele
+                # fica sem avaliacao neste snapshot (o Market Data ja alertou);
+                # comparar com o fechamento do candle venderia por engano.
+                corrente = mercado.get(position.asset)
+                if corrente is None:
+                    continue
+                position = position.model_copy(update={"current_price": corrente})
             if position.current_price is None:
                 continue
             if position.asset in self._exiting:
@@ -887,6 +909,35 @@ class RiskManagerAgent(BaseAgent):
         """
         await self._on_batch([signal])
 
+    def definir_precos_de_mercado(self, fonte: Callable[[], dict[str, Decimal]]) -> None:
+        self._precos_de_mercado = fonte
+
+    def _no_preco_corrente(self, signal: Signal) -> Signal:
+        preco = self._preco_de_dimensionamento(signal)
+        if preco == signal.reference_price:
+            return signal
+        self.log.info(
+            "risk.preco_corrente_no_lugar_do_fechamento",
+            symbol=signal.symbol,
+            fechamento=str(signal.reference_price),
+            corrente=str(preco),
+        )
+        return signal.model_copy(update={"reference_price": preco})
+
+    def _preco_de_dimensionamento(self, signal: Signal) -> Decimal:
+        """O preco corrente do par; sem ele, o de referencia do sinal.
+
+        O sinal carrega o fechamento do candle (com `1d`, o de ontem). A ordem
+        executa no mercado de agora: dimensionar no fechamento deixava a compra
+        passar do teto por ordem e de exposicao na mesma proporcao da distancia
+        (medido pelo critico: 20,00 aprovados, 21,58 gastos, +7,9%).
+        """
+        if self._precos_de_mercado is not None:
+            corrente = self._precos_de_mercado().get(signal.symbol.partition("/")[0])
+            if corrente is not None and corrente > 0:
+                return corrente
+        return signal.reference_price
+
     async def _build_state(self, signal: Signal) -> PortfolioState:
         snapshot = self._snapshot
         assert snapshot is not None
@@ -895,9 +946,8 @@ class RiskManagerAgent(BaseAgent):
         prices = {
             p.asset: p.current_price for p in snapshot.positions if p.current_price is not None
         }
-        # O preco do par avaliado vem do sinal, que e mais recente que o snapshot.
         base = signal.symbol.partition("/")[0]
-        prices[base] = signal.reference_price
+        prices[base] = self._preco_de_dimensionamento(signal)
 
         async with session_scope(self._settings) as session:
             last_order = await OrderRepository(session).last_order_time(signal.symbol)

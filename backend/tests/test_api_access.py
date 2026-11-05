@@ -303,7 +303,7 @@ class TestCheckCommand:
         configured = settings.model_copy(
             update={
                 "trading_mode": TradingMode.TESTNET,
-                "binance": ExchangeCredentials(api_key="k", api_secret="s"),
+                "binance_testnet": ExchangeCredentials(api_key="k", api_secret="s"),
             }
         )
 
@@ -336,7 +336,7 @@ class TestCheckCommand:
         configured = settings.model_copy(
             update={
                 "trading_mode": TradingMode.TESTNET,
-                "binance": ExchangeCredentials(api_key="k", api_secret="s"),
+                "binance_testnet": ExchangeCredentials(api_key="k", api_secret="s"),
             }
         )
 

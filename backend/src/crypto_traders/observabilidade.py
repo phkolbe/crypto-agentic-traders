@@ -351,6 +351,16 @@ def _registrar_metricas(meter: Any) -> None:
         ),
     )
     gauge(
+        "crypto_pares_sem_preco_corrente",
+        "Ativos sem preco corrente recente: stop e alvo deles nao sao avaliados",
+        "{pares}",
+        lambda: (
+            [(len(_estado.get("saude", {}).get("sem_preco_corrente") or []), {})]
+            if "saude" in _estado
+            else []
+        ),
+    )
+    gauge(
         "crypto_estado_idade",
         "Tempo desde a ultima leitura do estado do orquestrador",
         "s",

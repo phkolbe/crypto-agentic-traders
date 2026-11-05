@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 from decimal import Decimal
 from pathlib import Path
@@ -67,7 +68,24 @@ def main(argv: list[str] | None = None) -> int:
     )
     copiar.add_argument("arquivo", type=Path, help="Arquivo .db de origem (aberto so leitura)")
 
+    ensaio = subparsers.add_parser(
+        "ensaio-testnet",
+        help="Compra, venda e recusa reais na Binance Spot Testnet (chave BINANCE_TESTNET__*)",
+    )
+    ensaio.add_argument("--par", default="BTC/USDT", help="Par da testnet, ex.: BTC/USDT")
+    ensaio.add_argument(
+        "--valor", type=Decimal, default=Decimal(20), help="Valor da compra na moeda de cotacao"
+    )
+
     args = parser.parse_args(argv)
+    try:
+        cmdline = Path("/proc/1/cmdline").read_bytes()
+    except OSError:
+        cmdline = None
+    recusa = recusa_no_conteiner_do_sistema(args.command, cmdline, os.getpid())
+    if recusa:
+        print(recusa, file=sys.stderr)
+        return 2
     settings = get_settings()
     configure_logging(settings.log_level, settings.log_json)
 
@@ -83,6 +101,12 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(_migrar(settings, args.usuario_aplicacao))
     if args.command == "copiar-sqlite":
         return asyncio.run(_copiar_sqlite(settings, args.arquivo))
+    if args.command == "ensaio-testnet":
+        from .ensaio_testnet import ensaiar, imprimir
+
+        relatorio = asyncio.run(ensaiar(settings, args.par, args.valor))
+        imprimir(relatorio)
+        return 0 if relatorio.ok else 1
     return 1
 
 
@@ -128,6 +152,44 @@ async def _copiar_sqlite(settings, arquivo: Path) -> int:
 
 
 # ---------------------------------------------------------------------------
+def dividindo_conteiner_com_o_sistema(cmdline_pid1: bytes | None, meu_pid: int) -> bool:
+    """Este processo esta DENTRO do conteiner em que o sistema opera?
+
+    O `check` carrega o catalogo inteiro de mercados da exchange (~200 MB). Rodado
+    com `docker exec` no conteiner do sistema, ele divide os 512 MB do conteiner e
+    o kernel mata o conteiner INTEIRO -- medido em 04/11/2026: o sistema caiu e
+    reiniciou. Em producao, isso e o processo que executa o stop caindo. A pista e
+    o PID 1: no conteiner do sistema ele e o `crypto-traders run`.
+    """
+    if not cmdline_pid1 or meu_pid == 1:
+        return False
+    partes = [p for p in cmdline_pid1.split(b"\x00") if p]
+    return b"crypto-traders" in b" ".join(partes) and b"run" in partes
+
+
+#: Comandos que carregam o catalogo da exchange ou copiam o banco inteiro: nunca
+#: dentro do conteiner do sistema. `run` e o proprio sistema; `migrar` roda no
+#: conteiner dele, antes do sistema subir.
+COMANDOS_PESADOS = frozenset({"check", "backtest", "ensaio-testnet", "copiar-sqlite"})
+
+
+def recusa_no_conteiner_do_sistema(
+    comando: str, cmdline_pid1: bytes | None, meu_pid: int
+) -> str | None:
+    """Mensagem de recusa, ou None quando o comando pode rodar aqui."""
+    if comando not in COMANDOS_PESADOS:
+        return None
+    if not dividindo_conteiner_com_o_sistema(cmdline_pid1, meu_pid):
+        return None
+    return (
+        f"{comando} recusado: este conteiner e o do sistema em operacao, e o comando\n"
+        "dividiria a memoria dele (o conteiner inteiro ja foi morto assim pelo check).\n"
+        "Rode num conteiner proprio:\n"
+        f"  desenvolvimento: docker compose run --rm --no-deps crypto crypto-traders {comando}\n"
+        "  producao (check): implantacao/producao/diagnostico.sh"
+    )
+
+
 async def _check(settings) -> int:
     """Diagnostico: o que esta configurado, e o que ainda falta."""
     print("=" * 68)
