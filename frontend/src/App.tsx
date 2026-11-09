@@ -131,8 +131,11 @@ export default function App() {
     <div className={`app ${recolhido ? 'menu-recolhido' : ''}`}>
       <aside className="sidebar">
         <div className="brand">
-          <strong>Crypto Traders</strong>
-          <span>agentes autônomos</span>
+          <img src={`${import.meta.env.BASE_URL}favicon.svg`} alt="" width={30} height={30} />
+          <div>
+            <strong>Crypto Traders</strong>
+            <span>agentes autônomos</span>
+          </div>
         </div>
 
         {NAV.map((item) => (

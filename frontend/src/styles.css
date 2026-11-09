@@ -110,9 +110,11 @@ a:hover { text-decoration: underline; }
 .brand {
   padding: 0 10px 18px;
   display: flex;
-  flex-direction: column;
-  gap: 2px;
+  align-items: center;
+  gap: 10px;
 }
+.brand img { flex: none; border-radius: 7px; }
+.brand div { display: flex; flex-direction: column; gap: 2px; }
 .brand strong { font-size: 15px; letter-spacing: -0.02em; }
 .brand span { font-size: 11px; color: var(--text-faint); }
 
