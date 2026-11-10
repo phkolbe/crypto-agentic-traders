@@ -308,6 +308,112 @@ class TestWorkflows:
         assert "actions/workflows/ci.yml/runs" in texto
         assert "merge-base --is-ancestor" in texto
 
+    def test_a_ci_constroi_a_imagem_sem_publicar(self):
+        """Antes o Dockerfile so era construido na tag: a quebra aparecia ao publicar."""
+        texto = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
+        job = texto[texto.index("\n  imagem:") :]
+        assert "docker/build-push-action@" in job
+        assert re.search(r"^\s+push:\s*false\s*$", job, re.M)
+        assert re.search(r"^\s+platforms:\s*linux/arm64\s*$", job, re.M)
+        # Nada de login no registro nem permissao de escrita no job da CI.
+        assert "login-action" not in job and "packages: write" not in job
+
+
+# ---------------------------------------------------------------------------
+# Imagens de terceiros fixadas por digest, com a versao no comentario de cima
+# ---------------------------------------------------------------------------
+DIGEST = re.compile(r"@sha256:[0-9a-f]{64}\b")
+VERSAO_NO_COMENTARIO = re.compile(r"^\s*#.*\b\d+\.\d+(\.\d+)?\b")
+
+
+def _linhas_com_imagem(caminho: Path, padrao: str) -> list[tuple[str, str]]:
+    """(linha, comentario logo acima) de cada linha que referencia uma imagem."""
+    linhas = caminho.read_text(encoding="utf-8").splitlines()
+    return [
+        (linha, linhas[i - 1] if i else "")
+        for i, linha in enumerate(linhas)
+        if re.search(padrao, linha) and not linha.lstrip().startswith("#")
+    ]
+
+
+class TestImagensFixadas:
+    def test_dockerfile(self):
+        achadas = _linhas_com_imagem(
+            RAIZ / "Dockerfile", r"^(FROM|ARG PYTHON_IMAGE=)|COPY --from=[^ ]*[:/]"
+        )
+        assert len(achadas) >= 4
+        for linha, acima in achadas:
+            if linha.startswith("FROM ${PYTHON_IMAGE}"):
+                continue  # o digest esta no ARG
+            assert DIGEST.search(linha), linha
+            assert VERSAO_NO_COMENTARIO.match(acima), f"sem a versao em comentario: {linha}"
+
+    @pytest.mark.parametrize(
+        "arquivo",
+        [
+            "implantacao/producao/compose.yml",
+            "docker-compose.yml",
+            ".github/workflows/ci.yml",
+        ],
+    )
+    def test_compose_e_ci(self, arquivo):
+        achadas = [
+            (linha, acima)
+            for linha, acima in _linhas_com_imagem(RAIZ / arquivo, r"^\s+image:")
+            # A imagem do proprio sistema e a VERSAO_CRYPTO (que aceita vX.Y.Z@sha256:...).
+            if "phkolbe/crypto" not in linha
+        ]
+        assert achadas, arquivo
+        for linha, acima in achadas:
+            assert DIGEST.search(linha), linha
+            assert VERSAO_NO_COMENTARIO.match(acima) or re.search(
+                r"#.*\d+\.\d+", acima
+            ), f"sem a versao em comentario: {linha}"
+
+    def test_o_postgres_e_o_mesmo_em_producao_dev_e_ci(self):
+        digests = {
+            arquivo: DIGEST.search(
+                next(
+                    linha
+                    for linha, _ in _linhas_com_imagem(RAIZ / arquivo, r"image:\s*postgres:")
+                )
+            ).group(0)
+            for arquivo in (
+                "implantacao/producao/compose.yml",
+                "docker-compose.yml",
+                ".github/workflows/ci.yml",
+            )
+        }
+        assert len(set(digests.values())) == 1, digests
+
+    def test_restic_do_backup(self):
+        texto = (PRODUCAO / "backup.sh").read_text(encoding="utf-8")
+        assert re.search(r"restic/restic:0\.18\.0@sha256:[0-9a-f]{64}", texto)
+
+    def test_tailscale_sem_versao_por_variavel(self):
+        """Com o digest fixo, uma VERSAO_TAILSCALE seria ignorada em silencio."""
+        compose = (PRODUCAO / "compose.yml").read_text(encoding="utf-8")
+        assert "${VERSAO_TAILSCALE" not in compose
+
+
+# ---------------------------------------------------------------------------
+# Compose de producao: o migrar com limite e rotacao de log
+# ---------------------------------------------------------------------------
+class TestMigrarNoCompose:
+    def test_migrar_tem_limite_de_memoria_e_rotacao_de_log(self):
+        compose = (PRODUCAO / "compose.yml").read_text(encoding="utf-8")
+        bloco = compose[compose.index("  migrar:") : compose.index("  crypto:")]
+        assert re.search(r"<<: \[\*imagem, \*logs\]", bloco)
+        assert re.search(r"limits: \{memory: \d+M", bloco)
+
+
+class TestDockerignore:
+    def test_env_de_qualquer_pasta_fica_fora_da_imagem(self):
+        """`.env.*` so casa na raiz: frontend/.env.local (VITE_*) ia para o bundle."""
+        regras = (RAIZ / ".dockerignore").read_text(encoding="utf-8").splitlines()
+        for padrao in ("**/.env", "**/.env.*", "**/crypto.env", "**/backup.env"):
+            assert padrao in regras, padrao
+
 
 # ---------------------------------------------------------------------------
 # Grafana: "sem telemetria" por ambiente
