@@ -435,7 +435,18 @@ class Settings(BaseSettings):
     """Producao: o unico login Tailscale (e-mail) que passa pela API e pelas telas.
 
     Vazio desliga a trava (desenvolvimento, so 127.0.0.1). Preenchido, todo pedido
-    sem `Tailscale-User-Login` igual a este recebe 403 (`api.app.PortaoTailscale`).
+    sem `Tailscale-User-Login` igual a este, vindo de `acesso_proxy_tailscale`,
+    recebe 403 (`api.app.PortaoTailscale`), e a trava de origem passa a aceitar so
+    `cors_origins` (`api.deps.origem_confiavel`).
+    """
+
+    acesso_proxy_tailscale: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["127.0.0.1", "::1"]
+    )
+    """De onde o `tailscale serve` conecta: IPs ou nomes (CSV). So deles o
+    `Tailscale-User-Login` vale. Padrao: a propria maquina (serve no host). Em
+    producao, o conteiner `crypto-prd-tailscale` -- sem isto, o host e qualquer
+    conteiner da rede `crypto-prd` forjavam o cabecalho do dono.
     """
 
     # --- Exchange ---------------------------------------------------------
@@ -459,6 +470,13 @@ class Settings(BaseSettings):
     whatsapp_template_name: str = ""
     whatsapp_template_language: str = "pt_BR"
 
+    alerta_email_reserva: str = ""
+    alerta_whatsapp_reserva: str = ""
+    """Destinatarios de RESERVA, usados so quando o banco nao responde e o
+    processo ainda nao leu a configuracao da tela nenhuma vez (subiu com o
+    Postgres ja fora). Com o banco no ar, quem manda e a tela Notificacoes.
+    """
+
     binance: ExchangeCredentials = Field(default_factory=ExchangeCredentials)
     binance_testnet: ExchangeCredentials = Field(default_factory=ExchangeCredentials)
     """Chave da Binance Spot Testnet (`BINANCE_TESTNET__API_KEY`). Separada da real
@@ -469,7 +487,7 @@ class Settings(BaseSettings):
     trading: TradingSettings = Field(default_factory=TradingSettings)
     risk: RiskSettings = Field(default_factory=RiskSettings)
 
-    @field_validator("cors_origins", mode="before")
+    @field_validator("cors_origins", "acesso_proxy_tailscale", mode="before")
     @classmethod
     def _split_csv(cls, value: object) -> object:
         return _split_csv_value(value)

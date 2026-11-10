@@ -17,7 +17,7 @@
           "model": {
             "refId": "A",
             "instant": true,
-            "expr": "max(max_over_time(crypto_info{deployment_environment!=\"hml\"}[7d])) unless max(crypto_info{deployment_environment!=\"hml\"})"
+            "expr": "max by (deployment_environment) (max_over_time(crypto_info{deployment_environment!=\"hml\"}[7d])) unless max by (deployment_environment) (crypto_info{deployment_environment!=\"hml\"})"
           }
         },
         {
@@ -47,7 +47,7 @@
         "severidade": "critica"
       },
       "annotations": {
-        "summary": "O Sistema Cripto parou de mandar telemetria: processo fora do ar ou coletor inacessivel",
+        "summary": "[{{ $labels.deployment_environment }}] O Sistema Cripto parou de mandar telemetria: processo fora do ar ou coletor inacessivel",
         "description": "Com dinheiro real, processo parado e stop-loss parado (o stop e executado pelo proprio sistema, nao pela exchange)."
       }
     },
@@ -66,7 +66,7 @@
           "model": {
             "refId": "A",
             "instant": true,
-            "expr": "max by (agente) (1 - crypto_agente_saudavel{deployment_environment!=\"hml\"})"
+            "expr": "max by (deployment_environment, agente) (1 - crypto_agente_saudavel{deployment_environment!=\"hml\"})"
           }
         },
         {
@@ -96,7 +96,7 @@
         "severidade": "critica"
       },
       "annotations": {
-        "summary": "Agente {{ $labels.agente }} do Crypto parado, atrasado ou abandonado pelo watchdog ha 5 minutos"
+        "summary": "[{{ $labels.deployment_environment }}] Agente {{ $labels.agente }} do Crypto parado, atrasado ou abandonado pelo watchdog ha 5 minutos"
       }
     },
     {
@@ -114,7 +114,7 @@
           "model": {
             "refId": "A",
             "instant": true,
-            "expr": "max by (tarefa) (1 - crypto_tarefa_viva{deployment_environment!=\"hml\"})"
+            "expr": "max by (deployment_environment, tarefa) (1 - crypto_tarefa_viva{deployment_environment!=\"hml\"})"
           }
         },
         {
@@ -144,7 +144,7 @@
         "severidade": "critica"
       },
       "annotations": {
-        "summary": "Tarefa {{ $labels.tarefa }} do orquestrador do Crypto morta ha 5 minutos (a de alertas apaga as notificacoes)"
+        "summary": "[{{ $labels.deployment_environment }}] Tarefa {{ $labels.tarefa }} do orquestrador do Crypto morta ha 5 minutos (a de alertas apaga as notificacoes)"
       }
     },
     {
@@ -162,7 +162,7 @@
           "model": {
             "refId": "A",
             "instant": true,
-            "expr": "max(crypto_snapshot_idade_seconds{deployment_environment!=\"hml\"})"
+            "expr": "max by (deployment_environment) (crypto_snapshot_idade_seconds{deployment_environment!=\"hml\"})"
           }
         },
         {
@@ -192,7 +192,7 @@
         "severidade": "critica"
       },
       "annotations": {
-        "summary": "Ultimo snapshot da carteira do Crypto ha {{ printf \"%.0f\" $values.A.Value }} s: o stop-loss nao esta sendo avaliado"
+        "summary": "[{{ $labels.deployment_environment }}] Ultimo snapshot da carteira do Crypto ha {{ printf \"%.0f\" $values.A.Value }} s: o stop-loss nao esta sendo avaliado"
       }
     },
     {
@@ -210,7 +210,7 @@
           "model": {
             "refId": "A",
             "instant": true,
-            "expr": "max(crypto_circuit_breaker_ativo{deployment_environment!=\"hml\"})"
+            "expr": "max by (deployment_environment) (crypto_circuit_breaker_ativo{deployment_environment!=\"hml\"})"
           }
         },
         {
@@ -240,7 +240,7 @@
         "severidade": "aviso"
       },
       "annotations": {
-        "summary": "Circuit breaker do Crypto armado: nenhuma abertura ate o rearme manual na tela Risco"
+        "summary": "[{{ $labels.deployment_environment }}] Circuit breaker do Crypto armado: nenhuma abertura ate o rearme manual na tela Risco"
       }
     },
     {
@@ -258,7 +258,7 @@
           "model": {
             "refId": "A",
             "instant": true,
-            "expr": "max(crypto_aberturas_bloqueadas{deployment_environment!=\"hml\"})"
+            "expr": "max by (deployment_environment) (crypto_aberturas_bloqueadas{deployment_environment!=\"hml\"})"
           }
         },
         {
@@ -288,7 +288,7 @@
         "severidade": "aviso"
       },
       "annotations": {
-        "summary": "A execucao do Crypto esta barrando novas compras ha 10 minutos"
+        "summary": "[{{ $labels.deployment_environment }}] A execucao do Crypto esta barrando novas compras ha 10 minutos"
       }
     },
     {
@@ -306,7 +306,7 @@
           "model": {
             "refId": "A",
             "instant": true,
-            "expr": "sum(increase(crypto_ordens_total{status=~\"failed|rejected\", deployment_environment!=\"hml\"}[15m]))"
+            "expr": "sum by (deployment_environment) (increase(crypto_ordens_total{status=~\"failed|rejected\", deployment_environment!=\"hml\"}[15m]))"
           }
         },
         {
@@ -336,7 +336,7 @@
         "severidade": "aviso"
       },
       "annotations": {
-        "summary": "{{ printf \"%.0f\" $values.A.Value }} ordem(ns) do Crypto falharam ou foram rejeitadas pela exchange em 15 minutos"
+        "summary": "[{{ $labels.deployment_environment }}] {{ printf \"%.0f\" $values.A.Value }} ordem(ns) do Crypto falharam ou foram rejeitadas pela exchange em 15 minutos"
       }
     }
   ]

@@ -76,14 +76,26 @@ def origem_confiavel(origem: str, settings: Settings) -> bool:
     falsifica-lo. Sem `Origin` (curl, script, a propria CLI) o pedido passa:
     quem nao e navegador nao e o vetor que isto fecha.
 
-    Loopback em qualquer porta e aceito de proposito. O dashboard e servido pelo
-    Vite em `localhost:5173`, mas o dono pode abri-lo por `127.0.0.1:5173` --
-    hoje isso funciona (o proxy do Vite faz tudo virar same-origin) e recusar
-    ali seria quebrar o sistema em producao para fechar um ataque que exigiria
-    um servidor malicioso ja rodando na maquina.
+    Loopback em qualquer porta e aceito de proposito NO DESENVOLVIMENTO. O
+    dashboard e servido pelo Vite em `localhost:5173`, mas o dono pode abri-lo
+    por `127.0.0.1:5173` -- isso funciona (o proxy do Vite faz tudo virar
+    same-origin) e recusar ali seria quebrar o uso local para fechar um ataque
+    que exigiria um servidor malicioso ja rodando na maquina.
+
+    Em PRODUCAO (`acesso_login_tailscale` definido) so vale `cors_origins`. La a
+    identidade e ambiente, como um cookie: o `tailscale serve` poe o login do
+    dono em todo pedido que sai do aparelho dele. Uma pagina qualquer em
+    `http://localhost:XXXX` nesse aparelho (um app de desenvolvimento, uma
+    dependencia npm maliciosa) fazia `fetch(".../agents/resume-all",
+    {method: "POST", mode: "no-cors"})` -- POST sem corpo nao tem preflight --,
+    passava no portao com o login do dono e aqui pelo loopback: 200, e o sistema
+    voltava a abrir posicoes depois de uma parada manual (auditoria 09/11/2026).
+    As telas de producao sao servidas pela propria API, na origem do ts.net.
     """
     if "*" in settings.cors_origins or origem in settings.cors_origins:
         return True
+    if settings.acesso_login_tailscale:
+        return False
     try:
         partes = urlsplit(origem)
     except ValueError:

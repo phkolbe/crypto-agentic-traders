@@ -4,6 +4,15 @@
 # Tag `vX.Y.Z` no main -> ghcr.io/phkolbe/crypto:vX.Y.Z (e :sha-<curto>); a versao que
 # roda em producao e a VERSAO_CRYPTO do /opt/crypto/.env. `workflow_dispatch` monta so
 # a :sha-<curto>. Nenhum secret no build.
+#
+# Portao (auditoria 09/11/2026): antes, QUALQUER tag `v*` publicava a imagem, mesmo num
+# commit de branch com testes vermelhos (o CI nem roda em tag), e o `live` rodava codigo
+# nao testado. Agora o build so sai se o commit esta na main E o CI desse SHA (push na
+# main) terminou verde; o portao espera o CI em andamento ate ~25 min. Uma tag ja
+# publicada no GHCR nao e sobrescrita: a mesma versao nunca muda de conteudo.
+#
+# Actions fixadas por SHA do commit (versao no comentario), como no ci.yml: esta imagem
+# roda com as chaves da Binance, e uma tag de action pode ser movida.
 name: Imagem
 
 on:
@@ -17,28 +26,74 @@ concurrency:
 
 permissions:
   contents: read
-  packages: write
 
 jobs:
+  portao:
+    name: Commit na main com CI verde
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: O commit esta na main
+        run: |
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$GITHUB_SHA nao esta na main: imagem de producao so sai da main."
+            exit 1
+          fi
+      - name: O CI deste commit passou
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          url="repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$GITHUB_SHA&branch=main&event=push&per_page=1"
+          for _ in $(seq 1 50); do
+            estado="$(gh api "$url" --jq '.workflow_runs[0] | "\(.status) \(.conclusion)"')"
+            case "$estado" in
+              "completed success") echo "CI verde para $GITHUB_SHA."; exit 0 ;;
+              completed\ *) echo "::error::CI de $GITHUB_SHA terminou como '${estado#completed }'."; exit 1 ;;
+            esac
+            echo "CI de $GITHUB_SHA: ${estado:-sem execucao}; esperando..."
+            sleep 30
+          done
+          echo "::error::Nenhum CI verde de push na main para $GITHUB_SHA (commit que nao foi a ponta de um push?)."
+          exit 1
+
   imagem:
     name: Build linux/arm64 e push no GHCR
+    needs: [portao]
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
         with:
           platforms: arm64
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: A versao ainda nao foi publicada
+        if: github.ref_type == 'tag'
+        run: |
+          if docker buildx imagetools inspect "ghcr.io/phkolbe/crypto:$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "::error::ghcr.io/phkolbe/crypto:$GITHUB_REF_NAME ja existe; versao publicada nao e sobrescrita (use outra tag)."
+            exit 1
+          fi
       - id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
           images: ghcr.io/phkolbe/crypto
           tags: |
@@ -47,7 +102,7 @@ jobs:
           labels: |
             org.opencontainers.image.title=crypto
             org.opencontainers.image.vendor=Grupo SR
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           platforms: linux/arm64

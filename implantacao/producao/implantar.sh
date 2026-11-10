@@ -36,6 +36,9 @@ VERSAO="$(valor VERSAO_CRYPTO "$PASTA/.env")"
 C=(docker compose -p crypto-prd --env-file "$PASTA/.env" -f "$RAIZ/compose.yml")
 
 passo "Sistema Cripto $VERSAO, modo $(valor TRADING_MODE "$PASTA/crypto.env")"
+if [ "$(valor TRADING_MODE "$PASTA/crypto.env")" = live ] && [ -z "$(valor RESTIC_REPOSITORY "$PASTA/.env")" ]; then
+  echo "AVISO: live SEM copia do banco fora do servidor (RESTIC_REPOSITORY vazio; README, Backup e restauracao)." >&2
+fi
 
 if [ "$LOCAL" = 0 ] && [ "$VERSAO" != local ]; then
   passo "Imagens"
@@ -68,17 +71,28 @@ if [ "$estado" != healthy ]; then
 fi
 
 passo "Trava de acesso"
-# De dentro do conteiner, sem o cabecalho do Tailscale: so a sonda de saude passa.
-codigo="$(docker exec crypto-prd python -c "
-import urllib.error, urllib.request
+# De dentro do conteiner, fora do serve: so a sonda de saude passa. Sem o cabecalho e
+# COM o login do dono forjado (o que o host ou outro conteiner da rede conseguem
+# mandar): os dois tem de dar 403.
+trava() {
+  docker exec -e LOGIN_FORJADO="${1:-}" crypto-prd python -c "
+import os, urllib.error, urllib.request
+pedido = urllib.request.Request('http://127.0.0.1:8000/crypto-traders/api/portfolio')
+if os.environ['LOGIN_FORJADO']:
+    pedido.add_header('Tailscale-User-Login', os.environ['LOGIN_FORJADO'])
 try:
-    urllib.request.urlopen('http://127.0.0.1:8000/crypto-traders/api/portfolio', timeout=5)
+    urllib.request.urlopen(pedido, timeout=5)
     print(200)
 except urllib.error.HTTPError as erro:
     print(erro.code)
-")"
+"
+}
+codigo="$(trava)"
 [ "$codigo" = 403 ] || { echo "A API NAO recusa quem nao tem o login ($codigo)." >&2; exit 1; }
 echo "  sem o login: 403"
+codigo="$(trava "$(valor CRYPTO_LOGIN "$PASTA/.env")")"
+[ "$codigo" = 403 ] || { echo "A API aceita o login do Tailscale vindo de fora do serve ($codigo)." >&2; exit 1; }
+echo "  login forjado fora do serve: 403"
 
 if [ "$LOCAL" = 0 ]; then
   passo "No Tailscale"

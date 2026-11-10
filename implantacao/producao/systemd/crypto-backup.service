@@ -2,7 +2,12 @@
 Description=Backup do banco do Sistema Cripto (pg_dump + restic)
 Requires=docker.service
 After=docker.service
+# Backup que falha nao pode falhar em silencio: journal com prioridade de erro e ping em
+# VIGIA_URL/fail (avisar-falha.sh). Antes o erro ficava so no journal deste servico.
+OnFailure=crypto-falha@%n.service
 
 [Service]
 Type=oneshot
 ExecStart=/opt/crypto/codigo/implantacao/producao/backup.sh
+# pg_dump + restic de um banco pequeno; folga para o upload. Estourar conta como falha.
+TimeoutStartSec=30min

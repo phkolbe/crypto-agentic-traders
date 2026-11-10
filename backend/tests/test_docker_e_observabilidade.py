@@ -201,7 +201,9 @@ class TestPortaoTailscale:
             await ws.send_text("oi")
             await ws.close()
 
-        app.add_middleware(PortaoTailscale, login=self.LOGIN)
+        # "testclient" e o par que o TestClient anuncia: aqui ele faz o papel do
+        # serve. O cabecalho vindo de outro par e recusado (test_portao_acesso.py).
+        app.add_middleware(PortaoTailscale, login=self.LOGIN, proxies=["testclient"])
         return app
 
     def test_sem_login_e_recusado_e_a_rota_nao_roda(self, app):
@@ -649,7 +651,9 @@ class TestRaizDoProduto:
 
     def test_a_trava_reconhece_a_sonda_debaixo_da_raiz(self, montado):
         _, interno, externo, _, Cliente = montado
-        interno.add_middleware(PortaoTailscale, login="paulo@exemplo.com")
+        interno.add_middleware(
+            PortaoTailscale, login="paulo@exemplo.com", proxies=["testclient"]
+        )
         local = Cliente(externo, client=("127.0.0.1", 50000))
         assert local.get("/crypto-traders/api/health").status_code == 200
         assert local.get("/crypto-traders/api/portfolio").status_code == 403
