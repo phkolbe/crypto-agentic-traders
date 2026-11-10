@@ -19,6 +19,7 @@ from decimal import Decimal
 import pytest
 
 from crypto_traders.backtest.portfolio import PortfolioBacktestEngine
+from crypto_traders.backtest.protecao import SEM_FOLGA
 from crypto_traders.config import RiskSettings
 from crypto_traders.domain.enums import ExchangeName, SignalDirection
 from crypto_traders.domain.models import Candle, Signal
@@ -90,6 +91,11 @@ def limites(stop: float, alvo: float) -> RiskSettings:
 
 
 def motor(stop: float = 0.05, alvo: float = 0.10) -> PortfolioBacktestEngine:
+    # Sem as folgas da leitura de 60 s: estes testes isolam as convencoes (stop
+    # vence empate, gap conta contra, alvo sem credito) e os precos exatos. O
+    # padrao do motor vende ALEM do stop desde 09/11/2026 -- preencher no nivel
+    # exato era otimista contra a producao; ver `test_backtest_fiel.py` e
+    # `backtest/protecao.py`.
     return PortfolioBacktestEngine(
         [CompraUmaVez()],
         limites(stop, alvo),
@@ -98,6 +104,7 @@ def motor(stop: float = 0.05, alvo: float = 0.10) -> PortfolioBacktestEngine:
         fee_pct=Decimal("0"),
         slippage_pct=Decimal("0"),
         lookback=50,
+        folgas=SEM_FOLGA,
     )
 
 

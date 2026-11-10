@@ -13,29 +13,59 @@ Somar 16 execucoes independentes daria a resposta errada, e para cima:
 
 Aqui existe **um** `PaperBroker` e **um** `RiskEngine` para todos os pares. Os
 candles sao percorridos em ordem cronologica global, e cada sinal disputa o mesmo
-caixa com os demais -- que e exatamente o que acontece em producao.
+caixa com os demais.
+
+Para medir o sistema que RODA, e nao outro, o motor segue a configuracao de
+producao em cada ponto em que ela decide algo (auditoria de 09/11/2026):
+
+- **Selecao de sinais.** `signal_batch_window_seconds` espelha o campo de mesmo
+  nome de `TradingSettings`, com o mesmo padrao (0). Com 0, cada sinal e decidido
+  sozinho, na ordem de chegada, contra o estado ja atualizado pelos anteriores --
+  o motor decidia sempre o instante inteiro por confianca, o mecanismo que a
+  producao desligou em `0844d41` (SEGURANCA §9). "Ordem de chegada", aqui, e a
+  ordem em que o Market Data publica os candles: a ordem dos pares no dicionario
+  recebido (a de `SYMBOLS`, ou a da descoberta, que o Market Data percorre em
+  sequencia) e, dentro do par, a ordem das estrategias, que e como o Strategy
+  Agent publica. Quem monta `candles_by_symbol` precisa respeitar essa ordem.
+- **Stop e alvo** pela leitura de 60 s, com as folgas de `protecao.py`.
+- **Cooldown e "agora" do risco** no fechamento do candle, quando a producao
+  decide; a saida de protecao fica carimbada na abertura (aconteceu durante o
+  candle).
+- **Periodo e comprar-e-segurar** a partir do primeiro instante operavel.
+
+O que ele NAO sabe: quais pares existiam em cada data. Ele recebe o universo de
+quem chama (hoje, os pares liquidos de HOJE) -- par deslistado ou que perdeu
+liquidez no periodo nao entra, e isso e vies de sobrevivencia. Par que comeca
+depois entra quando completa o aquecimento e sai declarado em `pares_tardios`.
 """
 
 from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 import pandas as pd
 
-from ..config import RiskSettings
+from ..config import RiskSettings, TradingSettings
 from ..domain.enums import ExchangeName, OrderStatus, OrderType, RiskDecision, Side, SignalDirection
 from ..domain.models import Candle, OrderRequest
+from ..exchanges.base import timeframe_seconds
 from ..exchanges.paper import PaperBroker
 from ..logging_setup import get_logger
 from ..onchain import reading_from_series
 from ..risk.rules import PortfolioState, RiskEngine
 from ..strategies import MarketFrame, Strategy
 from .engine import liquido_e_taxa, preenchimento
+from .protecao import FOLGAS_PADRAO, FolgasDeProtecao, saida_de_protecao
 
 log = get_logger(__name__)
+
+#: Padrao da producao para a janela de lote (0 = cada sinal sozinho, por chegada).
+JANELA_DE_LOTE_DA_PRODUCAO: float = TradingSettings.model_fields[
+    "signal_batch_window_seconds"
+].default
 
 
 @dataclass
@@ -92,8 +122,21 @@ class PortfolioBacktestResult:
     """Contagem de saidas por motivo: `stop`, `alvo`, `estrategia`."""
 
     #: Preco no inicio e no fim da janela, por par. Base do comprar-e-segurar.
+    #: `first_prices` e o fechamento em `start`, a mesma data para todos; par que
+    #: so entrou depois (`pares_tardios`) nao tem preco ali e fica de fora.
     first_prices: dict[str, Decimal] = field(default_factory=dict)
     last_prices: dict[str, Decimal] = field(default_factory=dict)
+
+    pares_descartados: dict[str, str] = field(default_factory=dict)
+    """Par recebido que nao entrou, com o motivo (historico curto demais)."""
+
+    pares_tardios: dict[str, datetime] = field(default_factory=dict)
+    """Par que so passou a operar depois de `start`, com o instante em que entrou.
+
+    O motor nao sabe que pares existiam em cada data; isto so declara quais
+    comecaram depois dos outros, para o leitor saber que nao operaram o periodo
+    inteiro e nao entram no comprar-e-segurar.
+    """
 
     @property
     def buy_and_hold_pct(self) -> float:
@@ -192,8 +235,18 @@ class PortfolioBacktestEngine:
         lookback: int = 500,
         min_warmup: int = 0,
         mvrv_series: list[tuple[date, float]] | None = None,
+        signal_batch_window_seconds: float = JANELA_DE_LOTE_DA_PRODUCAO,
+        folgas: FolgasDeProtecao = FOLGAS_PADRAO,
     ) -> None:
         self.strategies = strategies
+        # Espelha `TradingSettings.signal_batch_window_seconds`: 0 decide cada
+        # sinal sozinho, por ordem de chegada (o padrao de producao); acima de 0,
+        # o instante inteiro vira um lote decidido por confianca. Passe o valor
+        # da configuracao que se quer medir.
+        if signal_batch_window_seconds < 0:
+            raise ValueError("signal_batch_window_seconds nao pode ser negativo")
+        self.signal_batch_window_seconds = signal_batch_window_seconds
+        self.folgas = folgas
         self.limits = risk_limits
         self.engine = RiskEngine(risk_limits, quote_currency)
         self.quote_currency = quote_currency
@@ -247,18 +300,59 @@ class PortfolioBacktestEngine:
     async def run(
         self, candles_by_symbol: dict[str, list[Candle]]
     ) -> PortfolioBacktestResult:
-        frames = {
-            symbol: _to_frame(candles)
-            for symbol, candles in candles_by_symbol.items()
-            if len([c for c in candles if c.closed]) > self._warmup + 2
-        }
+        # A ordem de `candles_by_symbol` e a ordem de chegada dos sinais (ver o
+        # docstring do modulo); `frames` a preserva.
+        frames: dict[str, pd.DataFrame] = {}
+        referencias: dict[str, Candle] = {}
+        descartados: dict[str, str] = {}
+        minimo = self._warmup + 2
+        for symbol, candles in candles_by_symbol.items():
+            fechados = [c for c in candles if c.closed]
+            if len(fechados) <= minimo:
+                # Antes saia em silencio: o leitor via 15 pares no resultado e
+                # nao sabia que tinha pedido 16.
+                descartados[symbol] = (
+                    f"historico curto: {len(fechados)} candles fechados, "
+                    f"o aquecimento pede mais de {minimo}"
+                )
+                continue
+            frames[symbol] = _to_frame(fechados)
+            # Por par, e nao "o primeiro candle do primeiro par": esse levantava
+            # IndexError com a primeira lista vazia e emprestava exchange e
+            # timeframe de um par que podia ter sido descartado.
+            referencias[symbol] = fechados[0]
+        if descartados:
+            log.warning("portfolio_backtest.pares_descartados", pares=descartados)
         if not frames:
             raise ValueError("historico insuficiente em todos os pares")
 
         # Linha do tempo unica: os pares compartilham a carteira, entao precisam
         # ser avaliados na ordem em que os candles realmente fecharam.
         timeline = sorted({ts for frame in frames.values() for ts in frame.index})
-        reference = next(iter(candles_by_symbol.values()))[0]
+        duracao = timedelta(
+            seconds=timeframe_seconds(next(iter(referencias.values())).timeframe)
+        )
+
+        # Primeiro instante em que cada par pode operar: o candle de indice
+        # `warmup` DELE. O periodo medido comeca no primeiro desses instantes --
+        # contar o aquecimento em `days` subestimava taxa/mes e operacoes/mes
+        # (66 dias de janela + 26 de aquecimento = 28% a menos). Par cujo
+        # primeiro instante vem depois entrou tarde: opera a partir dali, mas
+        # fica declarado e fora do comprar-e-segurar.
+        entrada = {symbol: frame.index[self._warmup] for symbol, frame in frames.items()}
+        inicio = min(entrada.values())
+        tardios = {
+            symbol: momento.to_pydatetime()
+            for symbol, momento in entrada.items()
+            if momento > inicio
+        }
+        if tardios:
+            log.warning(
+                "portfolio_backtest.pares_tardios",
+                pares={s: m.isoformat() for s, m in tardios.items()},
+                detail="entraram depois do inicio; fora do comprar-e-segurar",
+            )
+
         broker = PaperBroker(
             quote_currency=self.quote_currency,
             initial_balance=self.initial_balance,
@@ -268,20 +362,23 @@ class PortfolioBacktestEngine:
 
         result = PortfolioBacktestResult(
             quote_currency=self.quote_currency,
-            start=timeline[0],
+            start=inicio,
             end=timeline[-1],
             initial_balance=self.initial_balance,
             final_value=self.initial_balance,
             symbols=sorted(frames),
+            pares_descartados=descartados,
+            pares_tardios=tardios,
         )
 
-        # Preco de referencia do comprar-e-segurar: primeiro candle apos o
-        # aquecimento, que e quando a estrategia poderia ter operado pela
-        # primeira vez -- usar o inicio da serie daria vantagem artificial.
+        # Comprar-e-segurar numa data COMUM: o fechamento em `inicio`, o mesmo
+        # instante em que a estrategia pode operar pela primeira vez. Antes cada
+        # par usava o proprio indice `warmup`, e um par listado no meio da janela
+        # entrava na media com outro periodo (12 meses somados a 5).
         for symbol, frame in frames.items():
-            if len(frame) > self._warmup:
-                result.first_prices[symbol] = Decimal(str(frame["close"].iloc[self._warmup]))
-                result.last_prices[symbol] = Decimal(str(frame["close"].iloc[-1]))
+            if symbol not in tardios:
+                result.first_prices[symbol] = Decimal(str(frame.at[inicio, "close"]))
+            result.last_prices[symbol] = Decimal(str(frame["close"].iloc[-1]))
 
         prices: dict[str, Decimal] = {}
         cost_basis: dict[str, Decimal] = {}
@@ -289,7 +386,7 @@ class PortfolioBacktestEngine:
         protection: dict[str, tuple[Decimal, Decimal]] = {}
         order_seq = 0
 
-        for step, now in enumerate(timeline):
+        for now in timeline:
             # 1) Atualiza precos de tudo que fechou candle neste instante.
             for symbol, frame in frames.items():
                 if now not in frame.index:
@@ -298,6 +395,12 @@ class PortfolioBacktestEngine:
                 price = Decimal(str(frame.at[now, "close"]))
                 prices[base] = price
                 broker.set_price(base, price)
+            if now < inicio:
+                # Aquecimento: nenhum par pode operar, nao ha posicao a proteger
+                # e o patrimonio e o inicial. Nada a medir.
+                continue
+            # A producao decide sobre o candle no FECHAMENTO dele.
+            fechamento = now + duracao
 
             # 2) Protecao ANTES de qualquer decisao nova.
             #    Um stop que disparou libera caixa e encerra a exposicao; avaliar
@@ -307,10 +410,9 @@ class PortfolioBacktestEngine:
                 frames, now, broker, cost_basis, protection, last_order_at, result, order_seq
             )
 
-            # 3) Coleta TODOS os sinais deste instante antes de decidir.
-            #    Avaliar par a par atenderia quem aparece primeiro na iteracao
-            #    dos dicionarios -- ordem arbitraria, nao qualidade.
-            batch = []
+            # 3) Sinais deste instante, na ordem de chegada da producao: pares
+            #    na ordem recebida, estrategias na ordem configurada.
+            sinais = []
             for symbol, frame in frames.items():
                 if now not in frame.index:
                     continue
@@ -319,35 +421,46 @@ class PortfolioBacktestEngine:
                     continue
 
                 window = frame.iloc[max(0, position + 1 - self.lookback) : position + 1]
+                referencia = referencias[symbol]
                 market = MarketFrame(
-                    exchange=reference.exchange,
+                    exchange=referencia.exchange,
                     symbol=symbol,
-                    timeframe=reference.timeframe,
+                    timeframe=referencia.timeframe,
                     frame=window,
                 )
                 for strategy in self.strategies:
                     signal = strategy.evaluate(market)
                     if signal is not None:
-                        batch.append(signal)
+                        sinais.append(signal)
 
-            # 4) Decide o lote inteiro por confianca, e executa os aprovados.
-            if batch:
-                result.signals_generated += len(batch)
-                for signal, assessment in await self._decide_batch(
-                    batch, broker, prices, last_order_at, result, now
-                ):
-                    order_seq += 1
-                    await self._execute(
-                        signal, assessment, broker, prices, cost_basis,
-                        protection, last_order_at, result, now, order_seq,
-                    )
+            # 4) Decide e executa. Janela 0 (producao): cada sinal e um lote de
+            #    um, decidido contra o estado que ja inclui as ordens dos
+            #    anteriores. Janela > 0: o instante inteiro num lote, aberturas
+            #    por confianca (`RiskEngine.evaluate_batch`).
+            if sinais:
+                result.signals_generated += len(sinais)
+                if self.signal_batch_window_seconds > 0:
+                    lotes = [sinais]
+                else:
+                    lotes = [[signal] for signal in sinais]
+                for lote in lotes:
+                    for signal, assessment in await self._decide_batch(
+                        lote, broker, prices, last_order_at, result, now, fechamento
+                    ):
+                        order_seq += 1
+                        await self._execute(
+                            signal, assessment, broker, prices, cost_basis,
+                            protection, last_order_at, result, now, order_seq,
+                            fechamento,
+                        )
 
-            # 5) Patrimonio ao fim do instante. Amostrado, nao a cada passo:
-            #    16 pares x milhares de candles produziriam uma curva gigante
-            #    sem ganho de informacao.
-            if step % 4 == 0 or now == timeline[-1]:
-                equity = await _equity(broker, prices, self.quote_currency)
-                result.equity_curve.append((now, equity))
+            # 5) Patrimonio ao fim de TODO instante. A curva era amostrada 1 em
+            #    4 ("16 pares x milhares de candles"), mas a linha do tempo e a
+            #    uniao dos instantes, nao pares x candles: 365 pontos por ano em
+            #    1d. A queda maxima e calculada sobre esta curva, e tres stops
+            #    seguidos entre duas amostras sumiam dela.
+            equity = await _equity(broker, prices, self.quote_currency)
+            result.equity_curve.append((now, equity))
 
         result.final_value = await _equity(broker, prices, self.quote_currency)
         log.info(
@@ -370,18 +483,13 @@ class PortfolioBacktestEngine:
         um sistema **sem** stop -- justamente o numero que o stop existe para
         limitar.
 
-        Tres convencoes, todas escolhidas para o lado pessimista, porque um
-        backtest de risco que erra para o otimista nao serve para nada:
-
-        1. **Stop e alvo no mesmo candle: o stop vence.** O OHLC nao diz qual
-           preco veio primeiro. Supor o alvo seria escolher o desfecho bom com
-           base em informacao que nao existe.
-        2. **Gap conta contra.** Se o candle abriu abaixo do stop, a execucao sai
-           na abertura, nao no nivel do stop -- e exatamente assim que stops
-           machucam na vida real. O alvo, ao contrario, executa no nivel, sem
-           credito pelo gap favoravel.
-        3. **Deslizamento se aplica.** A ordem sai como LIMIT no preco calculado
-           e o `PaperBroker` aplica o deslizamento contra o operador.
+        A regra de disparo e preco e `protecao.saida_de_protecao`, a mesma do
+        motor de um par: stop vence empate, gap conta contra, e as folgas que
+        reproduzem a leitura de 60 s da producao. O "todas pessimistas" que este
+        docstring afirmava nao valia: stop no nivel exato e alvo no pavio eram
+        otimistas contra o ticker (ver o docstring de `protecao.py`, com a
+        medicao). O deslizamento do `PaperBroker` vem por cima: a ordem sai como
+        LIMIT no preco calculado e ele aplica o deslizamento contra o operador.
         """
         balances = await broker.fetch_balances()
         for symbol, frame in frames.items():
@@ -394,16 +502,17 @@ class PortfolioBacktestEngine:
                 continue
 
             stop, alvo = niveis
-            baixa = Decimal(str(frame.at[now, "low"]))
-            alta = Decimal(str(frame.at[now, "high"]))
-            abertura = Decimal(str(frame.at[now, "open"]))
-
-            if baixa <= stop:
-                motivo, fill = "stop", min(abertura, stop)
-            elif alta >= alvo:
-                motivo, fill = "alvo", alvo
-            else:
+            disparo = saida_de_protecao(
+                Decimal(str(frame.at[now, "open"])),
+                Decimal(str(frame.at[now, "high"])),
+                Decimal(str(frame.at[now, "low"])),
+                stop,
+                alvo,
+                self.folgas,
+            )
+            if disparo is None:
                 continue
+            motivo, fill = disparo
 
             order_seq += 1
             pedido = OrderRequest(
@@ -434,7 +543,11 @@ class PortfolioBacktestEngine:
             cost_basis[base] = sobra * medio
             protection.pop(base, None)
             # O cooldown vale para a reentrada: um stop que dispara e o momento
-            # em que menos se quer recomprar no candle seguinte.
+            # em que menos se quer recomprar no candle seguinte. Carimbo na
+            # ABERTURA, o instante mais cedo em que a saida pode ter ocorrido:
+            # com o mesmo carimbo do sinal do fechamento, uma reentrada no mesmo
+            # candle era recusada por cooldown (elapsed 0), e em producao o stop
+            # vem horas antes do fechamento em 1d.
             last_order_at[symbol] = now
             balances[base] = sobra
 
@@ -457,9 +570,13 @@ class PortfolioBacktestEngine:
         return order_seq
 
     async def _decide_batch(
-        self, batch, broker, prices, last_order_at, result, now
+        self, batch, broker, prices, last_order_at, result, now, fechamento
     ) -> list:
-        """Aplica as regras de risco ao lote e devolve so os aprovados."""
+        """Aplica as regras de risco ao lote e devolve so os aprovados.
+
+        `now` (abertura do candle) so serve a leitura do MVRV, como antes;
+        `fechamento` e o "agora" do risco -- cooldown incluido.
+        """
         balances = await broker.fetch_balances()
         cash = balances.get(self.quote_currency, Decimal(0))
         positions = {
@@ -482,7 +599,7 @@ class PortfolioBacktestEngine:
         )
 
         aprovados = []
-        for signal, assessment in self.engine.evaluate_batch(batch, state, now=now):
+        for signal, assessment in self.engine.evaluate_batch(batch, state, now=fechamento):
             if assessment.decision is RiskDecision.REJECTED:
                 result.signals_rejected += 1
                 for reason in assessment.reasons:
@@ -493,8 +610,11 @@ class PortfolioBacktestEngine:
 
     async def _execute(
         self, signal, assessment, broker, prices, cost_basis, protection,
-        last_order_at, result, now, order_seq,
+        last_order_at, result, now, order_seq, fechamento=None,
     ) -> None:
+        # `fechamento`: carimbo do cooldown (ver `run`). Sem ele, `now` -- quem
+        # dita uma sequencia de ordens a mao (teste de PnL) nao tem candle.
+        fechamento = fechamento or now
         base = self._chave_de_ativo(signal.symbol)
         side = Side.BUY if signal.direction is SignalDirection.LONG else Side.SELL
         request = OrderRequest(
@@ -518,7 +638,7 @@ class PortfolioBacktestEngine:
         fill = order.average_price or signal.reference_price
         quantity = order.filled_quantity
         no_saldo, taxa = liquido_e_taxa(order, side, base, fill)
-        last_order_at[signal.symbol] = now
+        last_order_at[signal.symbol] = fechamento
 
         realized: Decimal | None = None
         held = (await broker.fetch_balances()).get(base, Decimal(0))
