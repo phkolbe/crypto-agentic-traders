@@ -13,6 +13,7 @@ import math
 import time
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -93,7 +94,7 @@ class TestPortfolio:
             json={
                 "executed_at": datetime.now(UTC).isoformat(),
                 "exchange": "binance", "symbol": "ETH/USDT", "side": "buy",
-                "quantity": "0.4", "price": "2410.10",
+                "quantity": "0.4", "price": "2410.10", "confirm": True,
             },
         )
         item = (await client.get("/api/trades")).json()["items"][0]
@@ -133,6 +134,9 @@ class TestTrades:
             "fee": "0.30",
             "fee_currency": "USDT",
             "notes": "comprado pelo app",
+            # Desde 09/11 (P0 #12) o lancamento exige confirmacao: ele entra no
+            # preco medio e, portanto, move o stop.
+            "confirm": True,
         }
         response = await client.post("/api/trades/manual", json=payload)
         assert response.status_code == 201
@@ -165,13 +169,14 @@ class TestTrades:
 
     async def test_manual_trade_can_be_deleted(self, client, seeded):
         manual = (await client.get("/api/trades?origin=manual")).json()["items"][0]
-        assert (await client.delete(f"/api/trades/{manual['id']}")).status_code == 204
+        resposta = await client.delete(f"/api/trades/{manual['id']}?confirm=true")
+        assert resposta.status_code == 204
         assert (await client.get("/api/trades?origin=manual")).json()["total"] == 0
 
     async def test_agent_trade_cannot_be_deleted(self, client, seeded):
         """Apagar o que o sistema fez destruiria a auditoria."""
         agent_trade = (await client.get("/api/trades?origin=agent")).json()["items"][0]
-        response = await client.delete(f"/api/trades/{agent_trade['id']}")
+        response = await client.delete(f"/api/trades/{agent_trade['id']}?confirm=true")
         assert response.status_code == 409
         assert "auditoria" in response.json()["detail"]
 
@@ -187,6 +192,150 @@ class TestTrades:
         """Simulacao nunca pode ser confundida com dinheiro real no CSV."""
         text = (await client.get("/api/trades/export")).text
         assert "dry_run" in text
+
+
+def _lancamento(**campos) -> dict:
+    """Compra manual de BTC/USDT feita agora, como a tela envia."""
+    return {
+        "executed_at": datetime.now(UTC).isoformat(),
+        "exchange": "binance",
+        "symbol": "BTC/USDT",
+        "side": "buy",
+        "quantity": "0.01",
+        "price": "95000",
+        "confirm": True,
+        **campos,
+    }
+
+
+class TestLancamentoManualMexeNoStop:
+    """P0 #12: o lancamento manual entra no preco medio, que define o stop.
+
+    Cenario da auditoria: posicao em BTC com preco medio 95.000; o operador
+    lanca uma compra digitada com um zero a menos (9.500) e o stop de 3% cai de
+    ~92.150 para ~50.680 -- sem confirmacao, sem checagem e sem aviso. E o
+    DELETE desfazia um lancamento sem guardar o que foi apagado.
+    """
+
+    @staticmethod
+    def _com_preco(orchestrator, preco: str) -> None:
+        # Ultimo preco conhecido do BTC na moeda de cotacao (USDT nos testes).
+        orchestrator.market_data.latest_prices["BTC"] = Decimal(preco)
+
+    async def _manuais(self, http) -> int:
+        return (await http.get("/api/trades?origin=manual")).json()["total"]
+
+    async def test_sem_confirmacao_nada_e_gravado(self, client):
+        resposta = await client.post(
+            "/api/trades/manual", json=_lancamento(confirm=False)
+        )
+        assert resposta.status_code == 400, resposta.text
+        assert "confirm=true" in resposta.json()["detail"]
+        assert await self._manuais(client) == 0
+
+    async def test_um_zero_a_menos_e_recusado_com_409(self, orquestrado):
+        http, orchestrator, _ = orquestrado
+        self._com_preco(orchestrator, "95000")
+
+        resposta = await http.post("/api/trades/manual", json=_lancamento(price="9500"))
+
+        assert resposta.status_code == 409, resposta.text
+        detalhe = resposta.json()["detail"]
+        assert "9500" in detalhe and "95000" in detalhe
+        assert "aceitar_preco_fora_do_mercado" in detalhe
+        assert await self._manuais(http) == 0
+
+    async def test_preco_alto_demais_tambem(self, orquestrado):
+        """O inverso dispararia venda de protecao falsa (alvo atingido no papel)."""
+        http, orchestrator, _ = orquestrado
+        self._com_preco(orchestrator, "95000")
+
+        resposta = await http.post("/api/trades/manual", json=_lancamento(price="950000"))
+
+        assert resposta.status_code == 409, resposta.text
+
+    async def test_o_operador_pode_confirmar_o_preco_mesmo_assim(self, orquestrado):
+        """Operacao antiga, de outra epoca de preco, e legitima -- com gesto proprio."""
+        http, orchestrator, _ = orquestrado
+        self._com_preco(orchestrator, "95000")
+
+        resposta = await http.post(
+            "/api/trades/manual",
+            json=_lancamento(price="60000", aceitar_preco_fora_do_mercado=True),
+        )
+
+        assert resposta.status_code == 201, resposta.text
+        auditoria = (await http.get("/api/audit")).json()
+        registro = next(e for e in auditoria if e["action"] == "manual_trade_recorded")
+        assert registro["after"]["preco_de_referencia"] == "95000"
+        assert registro["after"]["aceitar_preco_fora_do_mercado"] is True
+
+    async def test_preco_dentro_da_faixa_passa(self, orquestrado):
+        http, orchestrator, _ = orquestrado
+        self._com_preco(orchestrator, "95000")
+
+        resposta = await http.post("/api/trades/manual", json=_lancamento(price="93000"))
+
+        assert resposta.status_code == 201, resposta.text
+
+    async def test_sem_preco_conhecido_passa_e_registra_que_nao_conferiu(self, client):
+        """Sem o orquestrador (ou par fora do universo) nao ha referencia."""
+        resposta = await client.post("/api/trades/manual", json=_lancamento())
+        assert resposta.status_code == 201, resposta.text
+        auditoria = (await client.get("/api/audit")).json()
+        registro = next(e for e in auditoria if e["action"] == "manual_trade_recorded")
+        assert registro["after"]["preco_de_referencia"] is None
+
+    async def test_data_sem_fuso_e_recusada(self, client):
+        """Sem fuso, 15h de Brasilia viraria 15h UTC: 3 h fora da ordem do custo medio."""
+        resposta = await client.post(
+            "/api/trades/manual",
+            json=_lancamento(executed_at=datetime.now().replace(microsecond=0).isoformat()),
+        )
+        assert resposta.status_code == 422, resposta.text
+        assert await self._manuais(client) == 0
+
+    async def test_data_no_futuro_e_recusada(self, client):
+        amanha = (datetime.now(UTC) + timedelta(days=1)).isoformat()
+        resposta = await client.post(
+            "/api/trades/manual", json=_lancamento(executed_at=amanha)
+        )
+        assert resposta.status_code == 422, resposta.text
+        assert await self._manuais(client) == 0
+
+    async def test_campo_desconhecido_e_recusado(self, client):
+        """Typo em `aceitar_preco_fora_do_mercado` nao pode virar "nao enviei"."""
+        resposta = await client.post(
+            "/api/trades/manual", json=_lancamento(aceitar_preco=True)
+        )
+        assert resposta.status_code == 422, resposta.text
+
+    async def test_excluir_sem_confirmacao_nao_apaga(self, client, seeded):
+        manual = (await client.get("/api/trades?origin=manual")).json()["items"][0]
+
+        resposta = await client.delete(f"/api/trades/{manual['id']}")
+
+        assert resposta.status_code == 400, resposta.text
+        assert "confirm=true" in resposta.json()["detail"]
+        assert await self._manuais(client) == 1
+
+    async def test_excluir_guarda_o_lancamento_inteiro_na_auditoria(self, client, seeded):
+        """Sem o "antes" nao da para saber o que foi apagado nem o efeito no stop."""
+        manual = (await client.get("/api/trades?origin=manual")).json()["items"][0]
+
+        resposta = await client.delete(f"/api/trades/{manual['id']}?confirm=true")
+
+        assert resposta.status_code == 204, resposta.text
+        auditoria = (await client.get("/api/audit")).json()
+        registro = next(e for e in auditoria if e["action"] == "manual_trade_deleted")
+        antes = registro["before"]
+        assert antes["id"] == manual["id"]
+        assert antes["symbol"] == "ETH/USDT"
+        assert antes["side"] == "sell"
+        assert Decimal(antes["quantity"]) == Decimal("0.5")
+        assert Decimal(antes["price"]) == Decimal("2500")
+        assert antes["executed_at"]
+        assert antes["origin"] == "manual"
 
 
 class TestControlWithoutAgents:
@@ -373,6 +522,32 @@ class TestTradingConfigRoutes:
         http, _ = controlled
         response = await http.put("/api/trading/config", json={"confirm": True})
         assert response.status_code == 400
+
+    async def test_timeframe_the_system_cannot_fetch_is_refused(self, controlled):
+        """Antes: 200, a tela "verde" e a coleta de candles falhando a cada ciclo."""
+        http, orchestrator = controlled
+        response = await http.put(
+            "/api/trading/config", json={"timeframe": "1x", "confirm": True}
+        )
+        assert response.status_code == 422, response.text
+        assert "timeframe" in response.json()["detail"]
+        assert orchestrator.settings.trading.timeframe != "1x"
+
+    @pytest.mark.parametrize(
+        "corpo",
+        [
+            {"symbols": ["BTC/USDC"]},
+            {"quote_currency": "USDC"},
+            {"symbols": ["btc/usdt"]},
+        ],
+    )
+    async def test_pairs_outside_the_quote_currency_are_refused(self, controlled, corpo):
+        """Par fora da cotacao: caixa numa moeda, par em outra, stop sem preco."""
+        http, orchestrator = controlled
+        response = await http.put("/api/trading/config", json={**corpo, "confirm": True})
+        assert response.status_code == 422, response.text
+        assert orchestrator.settings.trading.symbols == ["BTC/USDT"]
+        assert orchestrator.settings.trading.quote_currency == "USDT"
 
 
 class TestMvrvIsEditable:
@@ -1313,6 +1488,72 @@ class TestResettingTheBreakerIsNotOneClick:
         assert orchestrator.risk_manager.circuit_breaker_active is False
 
 
+CONTRATO_DAS_TELAS = (
+    Path(__file__).resolve().parents[2] / "frontend" / "src" / "checks" / "contrato-mutacoes.json"
+)
+
+
+def _pedidos_das_telas() -> list[dict]:
+    return json.loads(CONTRATO_DAS_TELAS.read_text(encoding="utf-8"))["pedidos"]
+
+
+class TestContratoDasTelas:
+    """P0 #13: o corpo que a tela envia, repetido contra a API.
+
+    "Rearmar" e "Autorizar capital" mandavam POST sem corpo desde que a API
+    passou a exigir `confirm` (3885f7d, 10/09/2026): 400 sempre, por dois meses,
+    e nenhum teste cruzava tela e API. O `contrato-mutacoes.json` e a ponte: o
+    `npm run check` confere que `frontend/src/api/mutacoes.ts` monta exatamente
+    aqueles pedidos, e este teste os envia aqui. Um lado muda sem o outro, um
+    dos dois reprova.
+    """
+
+    @pytest.fixture
+    async def pronto(self, orquestrado, settings):
+        """Estado em que cada pedido da tela faz sentido: o que o operador ve."""
+        http, orchestrator, _ = orquestrado
+        await orchestrator.risk_manager._trip("perda diaria de teste")
+        orchestrator.risk_manager.observe_snapshot(_snapshot("5000"))
+        orchestrator.market_data.latest_prices["BTC"] = Decimal("95000")
+        async with session_scope(settings) as session:
+            lancamento = await TradeRepository(session).record(
+                executed_at=datetime.now(UTC) - timedelta(hours=1),
+                exchange="binance", symbol="ETH/USDT", side=str(Side.BUY),
+                quantity=Decimal("0.5"), price=Decimal("2500"),
+                origin=TradeOrigin.MANUAL, mode="manual",
+            )
+            id_lancamento = lancamento.id
+        return http, id_lancamento
+
+    def test_o_contrato_cobre_as_mutacoes_que_estavam_quebradas(self):
+        nomes = {pedido["nome"] for pedido in _pedidos_das_telas()}
+        assert {"rearmar_circuit_breaker", "autorizar_capital"} <= nomes
+        assert {"lancar_manual", "excluir_lancamento"} <= nomes
+
+    @pytest.mark.parametrize(
+        "pedido", _pedidos_das_telas(), ids=lambda pedido: pedido["nome"]
+    )
+    async def test_a_api_aceita_o_que_a_tela_envia(self, pronto, pedido):
+        http, id_lancamento = pronto
+        # A tela prefixa com `RAIZ/api`; o app de teste e o interno, montado em `/api`.
+        url = "/api" + pedido["caminho"].replace("ID_DO_LANCAMENTO", id_lancamento)
+        argumentos = {"json": pedido["corpo"]} if "corpo" in pedido else {}
+
+        resposta = await http.request(pedido["metodo"], url, **argumentos)
+
+        assert resposta.status_code == pedido["status_esperado"], (
+            f"{pedido['nome']}: a tela envia {pedido.get('corpo')} e a API respondeu "
+            f"{resposta.status_code} {resposta.text}"
+        )
+
+    async def test_o_defeito_existe_o_post_sem_corpo_da_400(self, pronto):
+        """O par do conserto: o pedido que a tela mandava ate 09/11."""
+        http, _ = pronto
+        for caminho in ("/api/risk/circuit-breaker/reset", "/api/risk/capital/authorize"):
+            resposta = await http.post(caminho)
+            assert resposta.status_code == 400, f"{caminho}: {resposta.status_code}"
+
+
 class TestAnotherPageCannotDriveThisApi:
     """A API nao tem autenticacao -- e nao ter e uma decisao: ela escuta so em
     `127.0.0.1`. Isso deixa de valer dentro do navegador.
@@ -1472,14 +1713,20 @@ class TestTwoSimultaneousRequestsLoseNothing:
         """
         http, orchestrator, _ = orquestrado
 
+        # Moeda e pares iam em dois PUT separados. Desde a auditoria de 09/11
+        # (M5) cada um sozinho e recusado com 422: o estado intermediario (USDC
+        # com pares em USDT) e justamente o que nao pode existir. A corrida que
+        # sobra e a do par moeda+pares contra outra edicao concorrente.
         respostas = await asyncio.gather(
             http.put(
-                "/api/trading/config", json={"quote_currency": "USDC", "confirm": True}
-            ),
-            http.put(
                 "/api/trading/config",
-                json={"symbols": ["BTC/USDC", "ETH/USDC"], "confirm": True},
+                json={
+                    "quote_currency": "USDC",
+                    "symbols": ["BTC/USDC", "ETH/USDC"],
+                    "confirm": True,
+                },
             ),
+            http.put("/api/trading/config", json={"timeframe": "4h", "confirm": True}),
         )
 
         assert [r.status_code for r in respostas] == [200, 200], [
@@ -1488,6 +1735,7 @@ class TestTwoSimultaneousRequestsLoseNothing:
         trading = orchestrator.settings.trading
         assert trading.quote_currency == "USDC", trading.quote_currency
         assert trading.symbols == ["BTC/USDC", "ETH/USDC"], trading.symbols
+        assert trading.timeframe == "4h", trading.timeframe
         assert all(par.endswith("/USDC") for par in trading.symbols), (
             "sobrou par que nao liquida na moeda de cotacao configurada: "
             f"{trading.quote_currency} com {trading.symbols}"

@@ -10,7 +10,9 @@ import {
   Card,
   CircuitBreakerBanner,
   Empty,
+  ErroDeCarga,
   Loading,
+  mensagemDeErro,
   useQuoteCurrency,
 } from '../components/Shared'
 
@@ -125,10 +127,43 @@ const FIELDS: {
   },
 ]
 
+/** Os valores do servidor como o formulário os mostra (texto, `null` = vazio). */
+function rascunhoDe(config: RiskConfig): Record<string, string> {
+  const rascunho: Record<string, string> = {}
+  for (const field of FIELDS) {
+    const valor = config[field.key]
+    // `null` significa "sem limite": mostrar a palavra "null" num campo
+    // numérico convidaria a digitar por cima sem entender o que havia ali.
+    rascunho[field.key] = valor === null || valor === undefined ? '' : String(valor)
+  }
+  rascunho.asset_whitelist = config.asset_whitelist.join(', ')
+  rascunho.symbol_whitelist = config.symbol_whitelist.join(', ')
+  return rascunho
+}
+
+function mesmoRascunho(a: Record<string, string>, b: Record<string, string>): boolean {
+  const chaves = new Set([...Object.keys(a), ...Object.keys(b)])
+  return [...chaves].every((chave) => (a[chave] ?? '') === (b[chave] ?? ''))
+}
+
 export default function RiskSettings() {
   const queryClient = useQueryClient()
   const moeda = useQuoteCurrency()
   const [draft, setDraft] = useState<Record<string, string>>({})
+  /**
+   * Os valores do servidor de que o rascunho partiu.
+   *
+   * O rascunho era recopiado da query a CADA refetch — e o `alert` do tempo
+   * real e o "Autorizar" recarregam a query. Medido: mudar o stop e, antes de
+   * salvar, autorizar capital apagava a edição em silêncio; e com "Sim,
+   * aplicar" já na tela, um refetch esvaziava o pedido e a tela dizia "Limites
+   * atualizados" sem nada ter mudado. Agora o rascunho só segue o servidor
+   * enquanto não há edição, e o pedido leva só o que o operador mudou em
+   * relação a esta base — nunca um valor velho por cima de um novo.
+   */
+  const [base, setBase] = useState<Record<string, string> | null>(null)
+  /** Campos editados aqui que o servidor também mudou durante a edição. */
+  const [conflitos, setConflitos] = useState<string[]>([])
   const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null)
   const [confirming, setConfirming] = useState(false)
 
@@ -157,31 +192,48 @@ export default function RiskSettings() {
       queryClient.invalidateQueries({ queryKey: ['riskConfig'] })
       queryClient.invalidateQueries({ queryKey: ['audit'] })
     },
-    onError: (error) =>
-      setMessage({ ok: false, text: error instanceof ApiError ? error.message : String(error) }),
+    onError: (error) => setMessage({ ok: false, text: mensagemDeErro(error) }),
   })
+
+  const editando = base !== null && !mesmoRascunho(draft, base)
 
   useEffect(() => {
     if (!config.data) return
-    const initial: Record<string, string> = {}
-    for (const field of FIELDS) {
-      const valor = config.data[field.key]
-      // `null` significa "sem limite": mostrar a palavra "null" num campo
-      // numérico convidaria a digitar por cima sem entender o que havia ali.
-      initial[field.key] = valor === null || valor === undefined ? '' : String(valor)
+    const novo = rascunhoDe(config.data)
+    if (base === null) {
+      setDraft(novo)
+      setBase(novo)
+      return
     }
-    initial.asset_whitelist = config.data.asset_whitelist.join(', ')
-    initial.symbol_whitelist = config.data.symbol_whitelist.join(', ')
-    setDraft(initial)
+    // Dado novo do servidor no meio da edição: o que o operador NÃO tocou passa
+    // ao valor novo; o que ele tocou fica como digitou. Se o servidor mudou
+    // justamente um campo tocado, o aviso abaixo diz qual.
+    const tocados = Object.keys(draft).filter((k) => (draft[k] ?? '') !== (base[k] ?? ''))
+    const rebaseado = { ...novo }
+    for (const chave of tocados) rebaseado[chave] = draft[chave] ?? ''
+    const novos = tocados.filter((k) => (novo[k] ?? '') !== (base[k] ?? ''))
+    setConflitos((antes) => [...new Set([...antes, ...novos])])
+    setDraft(rebaseado)
+    setBase(novo)
+    // `draft` e `base` ficam fora das dependências de propósito: só a chegada
+    // de dados novos do servidor decide.
   }, [config.data])
 
   const save = useMutation({
     mutationFn: api.updateRiskConfig,
-    onSuccess: () => {
+    onSuccess: (atualizado) => {
       setMessage({ ok: true, text: 'Limites atualizados e registrados no log de auditoria.' })
       setConfirming(false)
+      const novo = rascunhoDe(atualizado)
+      setDraft(novo)
+      setBase(novo)
+      setConflitos([])
       queryClient.invalidateQueries({ queryKey: ['riskConfig'] })
       queryClient.invalidateQueries({ queryKey: ['audit'] })
+      // O capital autorizado tambem e um limite: o banner do portao e o
+      // `sizing_feasible` do health mudam com ele.
+      queryClient.invalidateQueries({ queryKey: ['capital'] })
+      queryClient.invalidateQueries({ queryKey: ['health'] })
     },
     onError: (error) =>
       setMessage({ ok: false, text: error instanceof ApiError ? error.message : String(error) }),
@@ -201,25 +253,27 @@ export default function RiskSettings() {
   if (config.isError) {
     const error = config.error
     if (error instanceof ApiError && error.agentsAreDown) return <AgentsOffline />
+    // Qualquer outra falha era um formulário vazio e nenhum banner: parecia que
+    // não havia trava acionada nem limite configurado.
+    if (!config.data) return <ErroDeCarga error={error} oQue="os limites de risco" />
   }
   if (config.isLoading) return <Loading />
 
-  const atual = (field: (typeof FIELDS)[number]) => {
-    const valor = config.data?.[field.key]
-    return valor === null || valor === undefined ? '' : String(valor)
-  }
-
-  const changed = FIELDS.some(
-    (field) => draft[field.key] !== undefined && draft[field.key] !== atual(field),
-  ) ||
-    draft.asset_whitelist !== config.data?.asset_whitelist.join(', ') ||
-    draft.symbol_whitelist !== config.data?.symbol_whitelist.join(', ')
+  const anterior = (chave: string) => base?.[chave] ?? ''
+  const changed = editando
+  const conflitosVigentes = conflitos.filter((k) => (draft[k] ?? '') !== anterior(k))
+  const rotuloDoCampo = (chave: string) =>
+    FIELDS.find((field) => field.key === chave)?.label ??
+    (chave === 'asset_whitelist' ? 'Ativos permitidos' : 'Pares permitidos')
 
   const submit = () => {
     const payload: Record<string, unknown> = {}
     for (const field of FIELDS) {
       const value = draft[field.key]
-      if (value === undefined || value === atual(field)) continue
+      // Só o que o operador mudou em relação à base: um campo que mudou no
+      // servidor enquanto ele editava (o capital, depois de "Autorizar") não
+      // pode voltar ao valor velho por estar no rascunho.
+      if (value === undefined || value === anterior(field.key)) continue
       if (value === '' && field.nullable) {
         // Num PUT parcial `null` significa "não enviei", então apagar um limite
         // precisa de um gesto próprio no contrato da API.
@@ -231,10 +285,18 @@ export default function RiskSettings() {
     }
     const assets = splitList(draft.asset_whitelist)
     const symbols = splitList(draft.symbol_whitelist)
-    if (assets.join(',') !== config.data?.asset_whitelist.join(',')) payload.asset_whitelist = assets
-    if (symbols.join(',') !== config.data?.symbol_whitelist.join(','))
+    if (assets.join(',') !== splitList(anterior('asset_whitelist')).join(','))
+      payload.asset_whitelist = assets
+    if (symbols.join(',') !== splitList(anterior('symbol_whitelist')).join(','))
       payload.symbol_whitelist = symbols
 
+    if (Object.keys(payload).length === 0) {
+      // Antes isto ia para a API como `{confirm: true}` e a tela dizia
+      // "Limites atualizados" sem nada ter mudado.
+      setConfirming(false)
+      setMessage({ ok: false, text: 'Nada a aplicar: nenhum campo difere do que está valendo.' })
+      return
+    }
     setMessage(null)
     save.mutate(payload)
   }
@@ -253,7 +315,7 @@ export default function RiskSettings() {
 
       <CapitalGateBanner
         status={capital.data}
-        onAuthorize={() => authorize.mutate()}
+        onAuthorize={(patrimonioVisto) => authorize.mutate(patrimonioVisto)}
         authorizing={authorize.isPending}
       />
 
@@ -264,9 +326,28 @@ export default function RiskSettings() {
         resetting={reset.isPending}
       />
 
+      {config.isError && <ErroDeCarga error={config.error} oQue="a versão mais nova dos limites" />}
+
       {message && (
         <div className={`form-message ${message.ok ? 'ok' : 'err'}`} style={{ marginBottom: 14 }}>
           {message.text}
+        </div>
+      )}
+
+      {conflitosVigentes.length > 0 && base && (
+        <div className="form-message err" style={{ marginBottom: 14 }}>
+          Enquanto você editava, o servidor também mudou:{' '}
+          {conflitosVigentes.map(rotuloDoCampo).join(', ')}. Se aplicar, vale o que você digitou.{' '}
+          <button
+            className="small"
+            onClick={() => {
+              setDraft(base)
+              setConflitos([])
+              setConfirming(false)
+            }}
+          >
+            Descartar minhas edições
+          </button>
         </div>
       )}
 
@@ -336,7 +417,8 @@ export default function RiskSettings() {
 
       <div style={{ marginTop: 14 }}>
         <Card title="Log de auditoria">
-          {(audit.data ?? []).length === 0 ? (
+          {audit.isError && <ErroDeCarga error={audit.error} oQue="o log de auditoria" />}
+          {audit.isError && !audit.data ? null : (audit.data ?? []).length === 0 ? (
             <Empty>Nenhuma ação administrativa registrada.</Empty>
           ) : (
             <div className="table-wrap">
