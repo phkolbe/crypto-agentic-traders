@@ -47,7 +47,8 @@ from ..domain.enums import (
     Side,
     SignalDirection,
 )
-from ..domain.models import OrderRequest, PortfolioSnapshot, RiskAssessment, Signal
+from ..domain.models import OrderRequest, PortfolioSnapshot, Position, RiskAssessment, Signal
+from ..exchanges.filters import MarketFilter
 from ..onchain import OnChainProvider
 from ..risk.rules import PortfolioState, RiskEngine
 from .base import BaseAgent
@@ -211,11 +212,16 @@ class RiskManagerAgent(BaseAgent):
         """Posicoes sem preco corrente recente, ja avisadas (uma vez por transicao)."""
 
         self._poeira: dict[str, Decimal] = {}
-        """Ativo -> quantidade de poeira deixada por uma saida de protecao.
+        """Ativo -> quantidade de poeira que nao recebe stop.
 
-        Ver `_reconcile_exits`: o resto abaixo do minimo negociavel nao recebe
-        stop (a exchange recusaria a venda), ate a posicao crescer acima dele.
+        Entra aqui o resto de uma saida de protecao abaixo do minimo negociavel
+        (ver `_reconcile_exits`) e, quando o filtro do par e conhecido, qualquer
+        sobra que a exchange nao aceitaria vender (ver `_e_poeira_invendavel`).
+        O stop volta a valer quando a posicao cresce acima dela.
         """
+
+        self._filtro_de_mercado: Callable[[str], MarketFilter | None] | None = None
+        """De onde ler o passo e o minimo do par (o broker), para reconhecer poeira."""
 
         self._abaixo_do_minimo_ao_desistir: set[str] = set()
         """Ativos abandonados que valiam menos que o minimo da exchange na desistencia.
@@ -646,6 +652,8 @@ class RiskManagerAgent(BaseAgent):
                     continue
                 position = position.model_copy(update={"current_price": corrente})
             if position.current_price is None:
+                continue
+            if self._e_poeira_invendavel(position):
                 continue
             if position.asset in self._exiting:
                 # Ordem de protecao ja em voo: reemitir a cada snapshot venderia
@@ -1186,6 +1194,48 @@ class RiskManagerAgent(BaseAgent):
 
     def definir_precos_de_mercado(self, fonte: Callable[[], dict[str, Decimal]]) -> None:
         self._precos_de_mercado = fonte
+
+    def definir_filtros_de_mercado(self, fonte: Callable[[str], MarketFilter | None]) -> None:
+        self._filtro_de_mercado = fonte
+
+    def _e_poeira_invendavel(self, position: Position) -> bool:
+        """Sobra que a exchange recusaria vender: sem stop, sem tentativas, sem alerta.
+
+        Com a taxa da compra cobrada no proprio ativo (Binance sem BNB) e a venda
+        truncada ao passo do par, TODA venda do saldo inteiro deixa um resto menor
+        que um passo -- a da estrategia tambem, nao so a de protecao. Sem isto, o
+        resto chegava ao stop, a venda era recusada pelo filtro tres vezes e saia
+        o alerta "acao manual necessaria" por centavos (auditoria de 09/11/2026).
+
+        Poeira aqui e o criterio da propria exchange (truncado ao passo da zero,
+        ou fica abaixo do MIN_NOTIONAL) E vale menos que metade do minimo de
+        ordem do sistema -- o mesmo corte do `RiskEngine`. Uma posicao invendavel
+        de valor relevante continua no caminho normal, que termina no aviso de
+        posicao sem protecao: o operador precisa saber dela. Sem filtro conhecido
+        (testes, broker sem catalogo) nada muda.
+        """
+        if self._filtro_de_mercado is None or position.current_price is None:
+            return False
+        quote = self._settings.trading.quote_currency
+        market = self._filtro_de_mercado(f"{position.asset}/{quote}")
+        if market is None:
+            return False
+        vendavel = market.truncate(position.quantity)
+        if vendavel > 0 and vendavel * position.current_price >= market.min_cost:
+            return False
+        valor = position.quantity * position.current_price
+        if valor >= self._limits.min_order_notional / 2:
+            return False
+        if self._poeira.get(position.asset) != position.quantity:
+            self._poeira[position.asset] = position.quantity
+            self.log.info(
+                "risk.poeira_sem_stop",
+                asset=position.asset,
+                quantidade=str(position.quantity),
+                valor=str(valor),
+                detail="abaixo do passo ou do minimo da exchange; sem stop ate a posicao crescer",
+            )
+        return True
 
     def _no_preco_corrente(self, signal: Signal) -> Signal:
         preco = self._preco_de_dimensionamento(signal)

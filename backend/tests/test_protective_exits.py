@@ -1052,6 +1052,56 @@ class TestPoeiraDepoisDoStop:
         assert ordens[0].quantity == Decimal("0.50000988")
 
 
+class TestPoeiraInvendavelDeQualquerVenda:
+    """Sobra de uma venda da ESTRATEGIA tambem e poeira (consolidacao das frentes P0).
+
+    Com o papel fiel a Binance (taxa da compra no ativo, venda truncada ao passo),
+    toda venda do saldo inteiro deixa um resto menor que um passo. A frente de
+    risco tratou o resto da saida de PROTECAO; o da estrategia chegava ao stop,
+    era recusado pelo filtro tres vezes e terminava em "acao manual necessaria"
+    por centavos. O criterio e o da propria exchange, pelo filtro do par.
+    """
+
+    @staticmethod
+    def _filtro(_simbolo):
+        from crypto_traders.exchanges.filters import MarketFilter
+
+        return MarketFilter(
+            symbol="BTC/USDT", amount_step=Decimal("0.00001"),
+            min_cost=Decimal("5"), min_amount=Decimal("0.00001"),
+        )
+
+    async def test_resto_menor_que_um_passo_nao_recebe_stop_nem_alerta(self, settings):
+        import asyncio
+
+        base = TestOAbandonoDestrava()
+        agente = await base._agente(settings)
+        agente.definir_filtros_de_mercado(self._filtro)
+
+        for minuto in range(0, 10):
+            # 0,000004 BTC a 90 (abaixo do stop de 95): truncado ao passo da zero.
+            assert await agente.enforce_protective_exits(
+                base._snapshot(minuto, "0.000004")
+            ) == []
+        await asyncio.sleep(0.05)
+        tipos = {a["type"] for a in agente.alertas}
+        assert not tipos & {"protective_exit_failed", "protective_exit_impossible"}
+
+    async def test_sem_filtro_conhecido_nada_muda(self, settings):
+        base = TestOAbandonoDestrava()
+        agente = await base._agente(settings)
+        ordens = await agente.enforce_protective_exits(base._snapshot(0, "0.000004"))
+        assert len(ordens) == 1
+
+    async def test_posicao_vendavel_continua_com_stop(self, settings):
+        base = TestOAbandonoDestrava()
+        agente = await base._agente(settings)
+        agente.definir_filtros_de_mercado(self._filtro)
+        ordens = await agente.enforce_protective_exits(base._snapshot(0, "1"))
+        assert len(ordens) == 1
+        assert ordens[0].quantity == Decimal("1")
+
+
 class TestSaidaPreenchidaEPosicaoQueVoltou:
     """Segundo caminho do P0 #5: a saida preencheu e a posicao voltou a crescer.
 

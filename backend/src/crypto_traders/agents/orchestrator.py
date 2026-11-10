@@ -307,6 +307,11 @@ class Orchestrator:
         self.onchain = self._onchain_injetado or OnChainProvider(self.settings)
         self.risk_manager = RiskManagerAgent(self.bus, self.settings, onchain=self.onchain)
         self.risk_manager.definir_precos_de_mercado(self.market_data.precos_de_mercado)
+        # Passo e minimo do par vem do broker (catalogo ao vivo ou versionado): e
+        # o que separa poeira invendavel de posicao que precisa de stop.
+        filtros = getattr(self._broker, "market_filter", None)
+        if callable(filtros):
+            self.risk_manager.definir_filtros_de_mercado(filtros)
         self.execution = ExecutionAgent(self.bus, self._broker, self.settings)
         self.portfolio = PortfolioAgent(
             self.bus,
