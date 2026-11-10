@@ -371,7 +371,11 @@ async def _load_business_config(settings) -> None:
         settings.with_business_config(trading, risk)
     except Exception as exc:
         print(f"\n  Configuracao de negocio : FALHOU ao ler do banco — {exc}")
-        print("    Seguindo com os padroes conservadores do codigo.")
+        # Os padroes do codigo NAO sao conservadores (USDT, 15m, duas estrategias),
+        # e o `run` recusa subir nesse estado desde 09/11/2026. O diagnostico
+        # segue so para mostrar o resto, e diz isso.
+        print("    O sistema NAO sobe assim: corrija a configuracao gravada antes do `run`.")
+        print("    (o restante deste diagnostico usa os padroes do codigo, so para referencia)")
         return
 
     origem = "banco" if existia else "padroes de fabrica (linha criada agora)"

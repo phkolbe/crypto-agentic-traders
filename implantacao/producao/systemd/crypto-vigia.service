@@ -1,0 +1,13 @@
+[Unit]
+Description=Vigia do Sistema Cripto (reinicia crypto-prd unhealthy; ping de vida opcional)
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+# /var/lib/crypto-vigia: contagem de verificacoes unhealthy seguidas e reinicios da hora.
+StateDirectory=crypto-vigia
+Environment=VIGIA_ESTADO=/var/lib/crypto-vigia
+ExecStart=/opt/crypto/codigo/implantacao/producao/vigia.sh
+# O docker restart espera ate 60 s (stop_grace_period); folga para o ping.
+TimeoutStartSec=150

@@ -2,41 +2,31 @@ import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useState } from 'react'
 
 import { ApiError, api } from '../api/client'
-import { money, multiplyDecimal, quoteOf } from '../api/format'
+import { dateTime, money, multiplyDecimal, price, quantity, quoteOf } from '../api/format'
+import {
+  formularioVazio,
+  lancamentoDoFormulario,
+  type FormularioDeLancamento,
+  type LancamentoManual,
+} from '../api/mutacoes'
 import { Card, useQuoteCurrency } from '../components/Shared'
-
-/** `datetime-local` espera o horario LOCAL sem timezone; ISO com Z apareceria deslocado. */
-function nowForInput(): string {
-  const now = new Date()
-  now.setMinutes(now.getMinutes() - now.getTimezoneOffset())
-  return now.toISOString().slice(0, 16)
-}
-
-/**
- * Formulario vazio.
- *
- * `fee_currency` NAO tem valor de fabrica: era `'USDT'`, e depois da migracao
- * para USDC todo lancamento manual salvo sem tocar no campo gravava a moeda
- * errada no historico. O padrao passa a ser a moeda de cotacao vigente,
- * resolvida em tempo de renderizacao.
- */
-const EMPTY = {
-  executed_at: nowForInput(),
-  exchange: 'binance',
-  symbol: '',
-  side: 'buy',
-  quantity: '',
-  price: '',
-  fee: '',
-  fee_currency: '',
-  notes: '',
-}
 
 export default function ManualTrade() {
   const queryClient = useQueryClient()
   const moeda = useQuoteCurrency()
-  const [form, setForm] = useState(EMPTY)
+  // Inicializador preguicoso: a data padrao e a de quando a tela abre, nao a
+  // de quando o app carregou (ver `formularioVazio`).
+  const [form, setForm] = useState<FormularioDeLancamento>(() => formularioVazio(new Date()))
   const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null)
+  /**
+   * Lancamento em revisao. Registrar era um clique, e o lancamento entra no
+   * preco medio que define o stop: um zero a menos no preco derrubava o stop do
+   * BTC de ~92 mil para ~51 mil sem aviso. Agora o envio mostra o resumo e so
+   * grava no "Sim, registrar".
+   */
+  const [revisando, setRevisando] = useState<LancamentoManual | null>(null)
+  /** Recusa 409 da API: preco longe do ultimo preco conhecido do par. */
+  const [foraDoMercado, setForaDoMercado] = useState<string | null>(null)
 
   const create = useMutation({
     mutationFn: api.createManualTrade,
@@ -44,33 +34,41 @@ export default function ManualTrade() {
       queryClient.invalidateQueries({ queryKey: ['trades'] })
       queryClient.invalidateQueries({ queryKey: ['portfolio'] })
       setMessage({ ok: true, text: 'Negociação registrada no histórico.' })
-      setForm({ ...EMPTY, executed_at: nowForInput() })
+      setForm(formularioVazio(new Date()))
+      setRevisando(null)
+      setForaDoMercado(null)
     },
-    onError: (error) =>
+    onError: (error) => {
+      if (error instanceof ApiError && error.status === 409) {
+        // Mantem a revisao aberta: o operador corrige o preco ou confirma que
+        // ele esta certo (operacao antiga, de outra epoca de preco).
+        setForaDoMercado(error.message)
+        return
+      }
+      setRevisando(null)
       setMessage({
         ok: false,
         text: error instanceof ApiError ? error.message : String(error),
-      }),
+      })
+    },
   })
 
-  const update = (field: string) => (value: string) => setForm({ ...form, [field]: value })
+  const update = (field: keyof FormularioDeLancamento) => (value: string) => {
+    // Mexeu no formulario, a revisao deixou de descrever o que vai ser enviado.
+    setRevisando(null)
+    setForaDoMercado(null)
+    setForm({ ...form, [field]: value })
+  }
 
   const submit = (event: React.FormEvent) => {
     event.preventDefault()
     setMessage(null)
-    create.mutate({
-      // O input entrega horario local; convertemos para ISO com timezone para
-      // que o backend nao precise adivinhar o fuso.
-      executed_at: new Date(form.executed_at).toISOString(),
-      exchange: form.exchange,
-      symbol: form.symbol.toUpperCase(),
-      side: form.side,
-      quantity: form.quantity,
-      price: form.price,
-      fee: form.fee || '0',
-      fee_currency: form.fee_currency || moedaDoPar || null,
-      notes: form.notes || null,
-    })
+    setForaDoMercado(null)
+    setRevisando(lancamentoDoFormulario(form, moedaDoPar))
+  }
+
+  const registrar = (aceitarPrecoForaDoMercado: boolean) => {
+    if (revisando) create.mutate({ lancamento: revisando, aceitarPrecoForaDoMercado })
   }
 
   /**
@@ -219,20 +217,73 @@ export default function ManualTrade() {
               <div className={`form-message ${message.ok ? 'ok' : 'err'}`}>{message.text}</div>
             )}
 
-            <div className="row-tight">
-              <button type="submit" className="primary" disabled={create.isPending}>
-                {create.isPending ? 'Registrando…' : 'Registrar negociação'}
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setForm({ ...EMPTY, executed_at: nowForInput() })
-                  setMessage(null)
-                }}
-              >
-                Limpar
-              </button>
-            </div>
+            {revisando && (
+              <div className="alert-banner">
+                <div>
+                  <strong>
+                    Registrar a {revisando.side === 'buy' ? 'compra' : 'venda'} de{' '}
+                    {quantity(revisando.quantity)} {revisando.symbol} a {price(revisando.price)}{' '}
+                    {quoteOf(revisando.symbol)}, em {dateTime(revisando.executed_at)}?
+                  </strong>{' '}
+                  <span className="muted">
+                    O lançamento entra no preço médio da posição e move o stop e o alvo dela.
+                    Confira o preço contra o extrato da exchange.
+                  </span>
+                  {foraDoMercado && (
+                    <div className="form-message err" style={{ marginTop: 8 }}>
+                      {foraDoMercado}
+                    </div>
+                  )}
+                </div>
+                <div className="row-tight">
+                  {!foraDoMercado ? (
+                    <button
+                      type="button"
+                      className="primary"
+                      onClick={() => registrar(false)}
+                      disabled={create.isPending}
+                    >
+                      {create.isPending ? 'Registrando…' : 'Sim, registrar'}
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      className="danger"
+                      onClick={() => registrar(true)}
+                      disabled={create.isPending}
+                    >
+                      {create.isPending ? 'Registrando…' : 'O preço está certo, registrar'}
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setRevisando(null)
+                      setForaDoMercado(null)
+                    }}
+                  >
+                    Voltar e corrigir
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {!revisando && (
+              <div className="row-tight">
+                <button type="submit" className="primary">
+                  Revisar e registrar
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setForm(formularioVazio(new Date()))
+                    setMessage(null)
+                  }}
+                >
+                  Limpar
+                </button>
+              </div>
+            )}
           </form>
         </Card>
       </div>

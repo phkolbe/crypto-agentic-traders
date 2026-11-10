@@ -79,8 +79,8 @@ services:
       - "127.0.0.1:${PORTA_CRYPTO:-8000}:8000"
     depends_on:
       migrar: {condition: service_completed_successfully}
-    # Os agentes terminam o ciclo corrente antes de parar (runtime.py): nenhuma
-    # ordem enviada fica sem registro. 10 s (o padrao) pode cortar isso.
+    # A parada drena o evento em processamento por ate 20 s (runtime.py); o que
+    # ficar vai para o log e o audit_log. 10 s (o padrao) cortaria a drenagem.
     stop_grace_period: 60s
     logging:
       driver: json-file

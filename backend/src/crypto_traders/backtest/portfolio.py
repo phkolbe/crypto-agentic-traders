@@ -33,6 +33,7 @@ from ..logging_setup import get_logger
 from ..onchain import reading_from_series
 from ..risk.rules import PortfolioState, RiskEngine
 from ..strategies import MarketFrame, Strategy
+from .engine import liquido_e_taxa, preenchimento
 
 log = get_logger(__name__)
 
@@ -62,6 +63,14 @@ class PortfolioTrade:
     Sem isso nao da para responder a pergunta que decide o valor do stop: das
     saidas, quantas foram protecao disparando e quantas foram a estrategia
     mandando sair?
+    """
+
+    fee_no_ativo: Decimal = Decimal(0)
+    """Taxa cobrada no ativo base, na unidade dele (compra na Binance sem BNB).
+
+    `fee` fica sempre na moeda de cotacao, para as taxas somarem. Este campo e o
+    que permite reproduzir o trade como a producao grava: `quantity` bruta e a
+    taxa no ativo, com o saldo entrando liquido.
     """
 
 
@@ -397,35 +406,37 @@ class PortfolioBacktestEngine:
                 continue
 
             order_seq += 1
-            order = await broker.place_order(
-                OrderRequest(
-                    client_order_id=f"pbt-{motivo}-{order_seq}",
-                    signal_id=None,
-                    risk_event_id=f"protecao-{order_seq}",
-                    exchange=ExchangeName.PAPER,
-                    symbol=symbol,
-                    side=Side.SELL,
-                    order_type=OrderType.LIMIT,
-                    price=fill,
-                    quantity=held,
-                    notional=held * fill,
-                    strategy="protecao",
-                )
+            pedido = OrderRequest(
+                client_order_id=f"pbt-{motivo}-{order_seq}",
+                signal_id=None,
+                risk_event_id=f"protecao-{order_seq}",
+                exchange=ExchangeName.PAPER,
+                symbol=symbol,
+                side=Side.SELL,
+                order_type=OrderType.LIMIT,
+                price=fill,
+                quantity=held,
+                notional=held * fill,
+                strategy="protecao",
             )
+            order = await preenchimento(broker.place_order(pedido), pedido)
             if order.status is not OrderStatus.FILLED:
                 continue
 
             preco = order.average_price or fill
             medio = cost_basis.get(base, Decimal(0)) / held if held > 0 else Decimal(0)
-            realizado = held * preco - order.fee - held * medio
+            vendido, taxa = liquido_e_taxa(order, Side.SELL, base, preco)
+            realizado = order.filled_quantity * preco - taxa - vendido * medio
 
-            # A posicao foi zerada: sem base de custo e sem protecao pendente.
-            cost_basis[base] = Decimal(0)
+            # A posicao foi zerada, salvo a poeira que o truncamento ao passo do
+            # par deixa (como no live): ela fica com o custo dela e sem protecao.
+            sobra = max(Decimal(0), held - vendido)
+            cost_basis[base] = sobra * medio
             protection.pop(base, None)
             # O cooldown vale para a reentrada: um stop que dispara e o momento
             # em que menos se quer recomprar no candle seguinte.
             last_order_at[symbol] = now
-            balances[base] = Decimal(0)
+            balances[base] = sobra
 
             result.trades.append(
                 PortfolioTrade(
@@ -433,10 +444,10 @@ class PortfolioBacktestEngine:
                     symbol=symbol,
                     strategy="protecao",
                     side=str(Side.SELL),
-                    quantity=held,
+                    quantity=order.filled_quantity,
                     price=preco,
-                    notional=held * preco,
-                    fee=order.fee,
+                    notional=order.filled_quantity * preco,
+                    fee=taxa,
                     realized_pnl=realizado,
                     exit_reason=motivo,
                 )
@@ -500,18 +511,21 @@ class PortfolioBacktestEngine:
             take_profit=assessment.take_profit,
             strategy=signal.strategy,
         )
-        order = await broker.place_order(request)
+        order = await preenchimento(broker.place_order(request), request)
         if order.status is not OrderStatus.FILLED:
             return
 
         fill = order.average_price or signal.reference_price
         quantity = order.filled_quantity
+        no_saldo, taxa = liquido_e_taxa(order, side, base, fill)
         last_order_at[signal.symbol] = now
 
         realized: Decimal | None = None
         held = (await broker.fetch_balances()).get(base, Decimal(0))
         if side is Side.BUY:
-            cost_basis[base] = cost_basis.get(base, Decimal(0)) + quantity * fill + order.fee
+            # Taxa no ativo recebido (Binance sem BNB): o saldo ja entrou liquido
+            # e o custo e o bruto pago -- a taxa fica embutida no medio.
+            cost_basis[base] = cost_basis.get(base, Decimal(0)) + no_saldo * fill + taxa
             # Os niveis protegem a POSICAO, nao o lote: ao reforcar uma posicao
             # existente eles sao recalculados sobre o preco medio. Manter o stop
             # do primeiro lote deixaria a parte nova sem protecao, e criar um
@@ -523,10 +537,10 @@ class PortfolioBacktestEngine:
                 medio * (Decimal(1) + Decimal(str(self.limits.take_profit_pct))),
             )
         else:
-            previous = held + quantity
+            previous = held + no_saldo
             average = (cost_basis.get(base, Decimal(0)) / previous) if previous > 0 else Decimal(0)
-            realized = quantity * fill - order.fee - quantity * average
-            cost_basis[base] = cost_basis.get(base, Decimal(0)) - quantity * average
+            realized = quantity * fill - taxa - no_saldo * average
+            cost_basis[base] = cost_basis.get(base, Decimal(0)) - no_saldo * average
             if held <= 0:
                 protection.pop(base, None)
             result.exits["estrategia"] += 1
@@ -540,10 +554,11 @@ class PortfolioBacktestEngine:
                 quantity=quantity,
                 price=fill,
                 notional=quantity * fill,
-                fee=order.fee,
+                fee=taxa,
                 confidence=signal.confidence,
                 realized_pnl=realized,
                 exit_reason="estrategia" if side is Side.SELL else None,
+                fee_no_ativo=order.fee if order.fee_currency == base else Decimal(0),
             )
         )
         result.trades_per_symbol[signal.symbol] += 1

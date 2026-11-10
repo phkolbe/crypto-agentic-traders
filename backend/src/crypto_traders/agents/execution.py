@@ -53,9 +53,17 @@ from .base import BaseAgent
 
 #: A exchange dizendo que o `clientOrderId` ja existe e PROVA de que a ordem
 #: chegou e foi criada -- e nao motivo para registrar falha. Na Binance vem como
-#: `-2010 Duplicate order sent`, e e exatamente o que acontece quando o cliente
-#: sofre timeout depois de a exchange aceitar e o ccxt reenvia com o mesmo id.
-_ORDEM_JA_EXISTE = re.compile(r"duplicate order|duplicada|-2010", re.IGNORECASE)
+#: `-2010 Duplicate order sent`, e so quando ha uma ordem ABERTA com o mesmo id
+#: (a de uma MARKET ja preenchida nao conta). Casa pela MENSAGEM, nunca pelo
+#: codigo: ver `_RECUSA_DA_EXCHANGE`.
+_ORDEM_JA_EXISTE = re.compile(r"duplicate order|duplicada", re.IGNORECASE)
+
+#: `-2010` e o NEW_ORDER_REJECTED generico da Binance ("Market is closed", "Order
+#: would immediately match and take", ...): a exchange respondeu e disse nao, a
+#: ordem nao existe. Ate 09/11/2026 o codigo estava em `_ORDEM_JA_EXISTE`, e toda
+#: recusa dessas virava PENDING "a ordem FOI criada" com alerta de reconciliacao
+#: falso. E REJECTED, como o saldo insuficiente.
+_RECUSA_DA_EXCHANGE = re.compile(r"(?<!\d)-2010(?!\d)")
 
 
 class ExecutionAgent(BaseAgent):
@@ -257,7 +265,9 @@ class ExecutionAgent(BaseAgent):
             # nenhuma ordem foi criada, e retentar nao muda nada.
             result = self._rejected(request, str(exc))
         except Exception as exc:
-            # A chamada nao voltou. Isso NAO prova que a ordem nao aconteceu.
+            # A chamada nao voltou. Isso NAO prova que a ordem nao aconteceu. E
+            # por aqui que chega o `DesfechoDesconhecido` do `CcxtExchange`
+            # (timeout ou "status unknown" sem achar a ordem pelo clientOrderId).
             result = self._unknown(request, f"{type(exc).__name__}: {exc}")
 
         result = self._classificar(request, result)
@@ -609,6 +619,15 @@ class ExecutionAgent(BaseAgent):
 
         Uma mensagem de ordem duplicada e, portanto, o oposto de uma falha: e a
         exchange provando que a ordem EXISTE.
+
+        Correcao de 09/11/2026: aquela medicao foi contra um dublê que deduplica
+        para sempre. Na Binance o `clientOrderId` so e unico entre ordens ABERTAS,
+        e o reenvio de uma MARKET ja preenchida compra de novo. Por isso o
+        `CcxtExchange` nao reenvia mais depois de um desfecho incerto: consulta a
+        ordem pelo `clientOrderId` e, sem achar, levanta `DesfechoDesconhecido`
+        (que chega aqui pelo `except Exception` de `_execute`, como PENDING). A
+        duplicata continua tratada aqui porque ainda pode vir de uma ordem ABERTA
+        com o mesmo id. Ja o `-2010` sem "duplicate" e recusa: vira REJECTED.
         """
         if result.status not in (OrderStatus.FAILED, OrderStatus.REJECTED):
             return result
@@ -639,6 +658,10 @@ class ExecutionAgent(BaseAgent):
             # cara de falha, e essa informacao nao pode se perder na correcao.
             return result.model_copy(update={"status": preenchido})
         if not _ORDEM_JA_EXISTE.search(result.error or ""):
+            if result.status is OrderStatus.FAILED and _RECUSA_DA_EXCHANGE.search(
+                result.error or ""
+            ):
+                return self._rejected(request, result.error or "")
             return result
         return self._unknown(
             request,

@@ -25,6 +25,7 @@ import {
   CircuitBreakerBanner,
   Empty,
   Loading,
+  mensagemDeErro,
   ModeBanner,
   SizingBanner,
   Stat,
@@ -131,6 +132,8 @@ export default function Dashboard({ feed }: { feed: { event: string; data: any; 
         active={health.data?.circuit_breaker_active ?? false}
         onReset={() => reset.mutate()}
         resetting={reset.isPending}
+        // Sem isto, um rearme recusado nao aparecia em lugar nenhum desta tela.
+        erro={reset.isError ? mensagemDeErro(reset.error) : null}
       />
 
       <div className="grid grid-4" style={{ marginBottom: 14 }}>

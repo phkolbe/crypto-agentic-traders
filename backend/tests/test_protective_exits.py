@@ -452,23 +452,28 @@ class TestTheExitLockIsNotAPrison:
         assert "protective_exit_failed" in [a["type"] for a in alertas]
 
     async def test_a_partial_fill_leaves_the_rest_protected(self, settings):
-        """Vendeu parte: o restante e posicao aberta como qualquer outra."""
+        """Vendeu parte: o restante e posicao aberta como qualquer outra.
+
+        Quantidades maiores que as dos vizinhos de proposito: com 0,004 a 90 o
+        resto valia 0,36, abaixo do minimo negociavel -- poeira, que desde
+        09/11/2026 nao recebe stop (`TestPoeiraDepoisDoStop`).
+        """
         from crypto_traders.domain.enums import OrderStatus
 
         agente = await self._agente(settings, stop=0.05)
         primeira = await agente.enforce_protective_exits(
-            self._snapshot("100", "94", quantidade="0.01")
+            self._snapshot("100", "94", quantidade="1")
         )
         await self._desfecho(settings, primeira[0], OrderStatus.PARTIALLY_FILLED)
 
         resto = await agente.enforce_protective_exits(
             self._snapshot(
-                "100", "90", quantidade="0.004",
+                "100", "90", quantidade="0.4",
                 quando=datetime(2026, 9, 9, 12, 1, tzinfo=UTC),
             )
         )
         assert len(resto) == 1
-        assert resto[0].quantity == Decimal("0.004")
+        assert resto[0].quantity == Decimal("0.4")
 
     async def test_an_order_without_an_outcome_is_never_resold(self, settings):
         """Revender por cima de uma ordem viva duplicaria a venda."""
@@ -884,3 +889,266 @@ class TestRetryingHasABrake:
         # A carteira volta a ter a posicao: o orcamento de tentativas e inteiro.
         emitidas = await self._ciclos(agente, settings, 20)
         assert emitidas == MAX_TENTATIVAS_DE_SAIDA
+
+
+class TestOAbandonoDestrava:
+    """Ativo abandonado nao pode ficar sem stop para sempre (auditoria 09/11, P0 #5).
+
+    A docstring de `_handle_failed_exit` prometia que a trava caia "quando o
+    saldo mudar", e nada fazia isso: o stop vendia, sobrava poeira, a poeira era
+    recusada tres vezes, o ativo era abandonado com a trava armada -- e a
+    posicao NOVA que a estrategia comprava dias depois nunca era avaliada contra
+    stop nem alvo enquanto o processo vivesse.
+    """
+
+    INICIO = datetime(2026, 9, 9, 12, 0, tzinfo=UTC)
+
+    async def _agente(self, settings, stop=0.05, alvo=0.10):
+        import asyncio
+
+        from crypto_traders.agents.risk_manager import RiskManagerAgent
+        from crypto_traders.bus import InMemoryEventBus, Topics
+
+        bus = InMemoryEventBus()
+        await bus.start()
+        configurado = settings.model_copy(
+            update={"risk": settings.risk.model_copy(update={
+                "stop_loss_pct": stop, "take_profit_pct": alvo,
+            })}
+        )
+        agente = RiskManagerAgent(bus, configurado)
+        agente.alertas = []
+
+        async def escuta():
+            async for alerta in bus.subscribe(Topics.ALERTS):
+                agente.alertas.append(alerta)
+
+        agente._escuta = asyncio.create_task(escuta())
+        await asyncio.sleep(0)
+        return agente
+
+    def _snapshot(self, minuto, quantidade, atual="90", medio="100"):
+        from crypto_traders.domain.models import PortfolioSnapshot, Position
+
+        return PortfolioSnapshot(
+            total_value=Decimal("1000"), cash_value=Decimal("500"),
+            positions_value=Decimal("500"),
+            timestamp=self.INICIO + timedelta(minutes=minuto),
+            positions=[Position(
+                exchange=ExchangeName.BINANCE, asset="BTC",
+                quantity=Decimal(quantidade), average_price=Decimal(medio),
+                current_price=Decimal(atual),
+            )],
+        )
+
+    async def _desfecho(self, settings, request, status, preenchido="0", minuto=None):
+        from crypto_traders.db.repositories import OrderRepository
+        from crypto_traders.db.session import session_scope
+
+        async with session_scope(settings) as session:
+            order = await OrderRepository(session).create_pending(request, "dry_run")
+            order.status = str(status)
+            order.filled_quantity = Decimal(preenchido)
+            await session.flush()
+            if minuto is not None:
+                order.updated_at = self.INICIO + timedelta(minutes=minuto, seconds=30)
+
+    async def _abandonar(self, agente, settings, quantidade, atual="90"):
+        """Recusa toda saida ate o sistema desistir. Devolve o proximo minuto."""
+        from crypto_traders.domain.enums import OrderStatus
+
+        for minuto in range(10):
+            for request in await agente.enforce_protective_exits(
+                self._snapshot(minuto, quantidade, atual)
+            ):
+                await self._desfecho(settings, request, OrderStatus.REJECTED)
+        assert "BTC" in agente._exit_abandoned
+        return 10
+
+    async def test_a_posicao_nova_maior_que_a_tentativa_volta_a_ter_stop(self, settings):
+        agente = await self._agente(settings)
+        minuto = await self._abandonar(agente, settings, "0.01")
+
+        # A estrategia compra de novo: a posicao passa da quantidade abandonada.
+        ordens = await agente.enforce_protective_exits(self._snapshot(minuto, "0.5"))
+        assert len(ordens) == 1, "a posicao nova precisa ser avaliada contra o stop"
+        assert ordens[0].quantity == Decimal("0.5")
+        assert agente._exit_failures == {}
+        assert "BTC" not in agente._exit_abandoned
+
+    async def test_passar_a_valer_acima_do_minimo_destrava(self, settings):
+        """Abandonado valendo 0,90 (minimo 10); o mesmo saldo passa a valer 12."""
+        agente = await self._agente(settings, alvo=0.10)
+        minuto = await self._abandonar(agente, settings, "0.01")
+
+        ordens = await agente.enforce_protective_exits(
+            self._snapshot(minuto, "0.01", atual="1200")
+        )
+        assert len(ordens) == 1, "acima do minimo, o alvo volta a ser avaliado"
+
+    async def test_abandonado_acima_do_minimo_nao_vira_laco(self, settings):
+        """Recusa permanente de outra natureza (credencial sem spot) com 90 em BTC.
+
+        Ja valia acima do minimo ao desistir: "valer acima" nao e transicao, e
+        destravar a cada retrato devolveria uma ordem recusada e um alerta por
+        ciclo.
+        """
+        agente = await self._agente(settings)
+        minuto = await self._abandonar(agente, settings, "1")
+        for m in range(minuto, minuto + 10):
+            assert await agente.enforce_protective_exits(self._snapshot(m, "1")) == []
+
+    async def test_destravar_avisa_que_o_stop_voltou(self, settings):
+        import asyncio
+
+        agente = await self._agente(settings)
+        minuto = await self._abandonar(agente, settings, "0.01")
+        await agente.enforce_protective_exits(self._snapshot(minuto, "0.5"))
+        await asyncio.sleep(0.05)
+        tipos = [a["type"] for a in agente.alertas]
+        assert "protective_exit_resumed" in tipos
+
+
+class TestPoeiraDepoisDoStop:
+    """O stop vende e sobra poeira (taxa no ativo + LOT_SIZE): nao e posicao a proteger.
+
+    Antes, a poeira disparava o stop de novo a cada retrato: recusada pela
+    exchange (abaixo do minimo), tres tentativas, alerta de "acao manual
+    necessaria" -- e o abandono que prendia a trava para sempre.
+    """
+
+    async def test_a_poeira_nao_dispara_stop_nem_alerta(self, settings):
+        import asyncio
+
+        from crypto_traders.domain.enums import OrderStatus
+
+        base = TestOAbandonoDestrava()
+        agente = await base._agente(settings)
+        primeira = await agente.enforce_protective_exits(base._snapshot(0, "1"))
+        assert len(primeira) == 1
+        await base._desfecho(settings, primeira[0], OrderStatus.FILLED, preenchido="0.99999012")
+
+        for minuto in range(1, 20):
+            assert await agente.enforce_protective_exits(
+                base._snapshot(minuto, "0.00000988")
+            ) == []
+        await asyncio.sleep(0.05)
+        tipos = {a["type"] for a in agente.alertas}
+        assert "protective_exit_failed" not in tipos
+        assert "protective_exit_impossible" not in tipos
+        assert "BTC" not in agente._exit_abandoned
+
+    async def test_recomprar_por_cima_da_poeira_volta_a_ter_stop(self, settings):
+        from crypto_traders.domain.enums import OrderStatus
+
+        base = TestOAbandonoDestrava()
+        agente = await base._agente(settings)
+        primeira = await agente.enforce_protective_exits(base._snapshot(0, "1"))
+        await base._desfecho(settings, primeira[0], OrderStatus.FILLED, preenchido="0.99999012")
+        await agente.enforce_protective_exits(base._snapshot(1, "0.00000988"))
+
+        ordens = await agente.enforce_protective_exits(base._snapshot(2, "0.50000988"))
+        assert len(ordens) == 1
+        assert ordens[0].quantity == Decimal("0.50000988")
+
+
+class TestPoeiraInvendavelDeQualquerVenda:
+    """Sobra de uma venda da ESTRATEGIA tambem e poeira (consolidacao das frentes P0).
+
+    Com o papel fiel a Binance (taxa da compra no ativo, venda truncada ao passo),
+    toda venda do saldo inteiro deixa um resto menor que um passo. A frente de
+    risco tratou o resto da saida de PROTECAO; o da estrategia chegava ao stop,
+    era recusado pelo filtro tres vezes e terminava em "acao manual necessaria"
+    por centavos. O criterio e o da propria exchange, pelo filtro do par.
+    """
+
+    @staticmethod
+    def _filtro(_simbolo):
+        from crypto_traders.exchanges.filters import MarketFilter
+
+        return MarketFilter(
+            symbol="BTC/USDT", amount_step=Decimal("0.00001"),
+            min_cost=Decimal("5"), min_amount=Decimal("0.00001"),
+        )
+
+    async def test_resto_menor_que_um_passo_nao_recebe_stop_nem_alerta(self, settings):
+        import asyncio
+
+        base = TestOAbandonoDestrava()
+        agente = await base._agente(settings)
+        agente.definir_filtros_de_mercado(self._filtro)
+
+        for minuto in range(0, 10):
+            # 0,000004 BTC a 90 (abaixo do stop de 95): truncado ao passo da zero.
+            assert await agente.enforce_protective_exits(
+                base._snapshot(minuto, "0.000004")
+            ) == []
+        await asyncio.sleep(0.05)
+        tipos = {a["type"] for a in agente.alertas}
+        assert not tipos & {"protective_exit_failed", "protective_exit_impossible"}
+
+    async def test_sem_filtro_conhecido_nada_muda(self, settings):
+        base = TestOAbandonoDestrava()
+        agente = await base._agente(settings)
+        ordens = await agente.enforce_protective_exits(base._snapshot(0, "0.000004"))
+        assert len(ordens) == 1
+
+    async def test_posicao_vendavel_continua_com_stop(self, settings):
+        base = TestOAbandonoDestrava()
+        agente = await base._agente(settings)
+        agente.definir_filtros_de_mercado(self._filtro)
+        ordens = await agente.enforce_protective_exits(base._snapshot(0, "1"))
+        assert len(ordens) == 1
+        assert ordens[0].quantity == Decimal("1")
+
+
+class TestSaidaPreenchidaEPosicaoQueVoltou:
+    """Segundo caminho do P0 #5: a saida preencheu e a posicao voltou a crescer.
+
+    Compra manual (ou da estrategia) entre o preenchimento e o retrato seguinte:
+    `restante >= voo.quantity`, o ramo de preenchimento so soltava a trava com
+    `restante < voo.quantity`, e a trava ficava armada para sempre, sem aviso.
+    """
+
+    async def test_a_trava_cai_quando_um_retrato_posterior_mostra_a_posicao(self, settings):
+        from crypto_traders.domain.enums import OrderStatus
+
+        base = TestOAbandonoDestrava()
+        agente = await base._agente(settings)
+        primeira = await agente.enforce_protective_exits(base._snapshot(0, "1"))
+        # Preencheu 30s depois do retrato do minuto 0.
+        await base._desfecho(settings, primeira[0], OrderStatus.FILLED, "1", minuto=0)
+
+        # Retrato do minuto 1: carimbado depois do preenchimento, mas o saldo
+        # pode ter sido lido antes dele. Nao solta: venderia duas vezes.
+        assert await agente.enforce_protective_exits(base._snapshot(1, "1.2")) == []
+        # Retrato do minuto 2: montado inteiro depois. A posicao e nova.
+        ordens = await agente.enforce_protective_exits(base._snapshot(2, "1.2"))
+        assert len(ordens) == 1
+        assert ordens[0].quantity == Decimal("1.2")
+
+
+class TestVendaParcialQueExpirou:
+    """M1: preencheu 60% e expirou (`CANCELED` com fill) nao e "nada vendido".
+
+    Antes, o status vinha antes da quantidade: `CANCELED` caia em
+    `SAIDA_SEM_VENDA`, o aviso dizia "NAO executada... a posicao continua
+    aberta" (falso: 60% saiu) e uma das tres tentativas era gasta -- tres
+    expiracoes parciais levavam ao abandono.
+    """
+
+    async def test_cancelada_com_preenchimento_e_saida_parcial(self, settings):
+        import asyncio
+
+        from crypto_traders.domain.enums import OrderStatus
+
+        base = TestOAbandonoDestrava()
+        agente = await base._agente(settings)
+        primeira = await agente.enforce_protective_exits(base._snapshot(0, "1"))
+        await base._desfecho(settings, primeira[0], OrderStatus.CANCELED, preenchido="0.6")
+
+        resto = await agente.enforce_protective_exits(base._snapshot(1, "0.4"))
+        await asyncio.sleep(0.05)
+        assert len(resto) == 1 and resto[0].quantity == Decimal("0.4")
+        assert agente._exit_failures == {}
+        assert "protective_exit_failed" not in [a["type"] for a in agente.alertas]

@@ -15,7 +15,11 @@ from decimal import Decimal
 
 from ..bus import EventBus, Topics
 from ..config import Settings
-from ..db.repositories import AgentRunRepository, CandleRepository
+from ..db.repositories import (
+    AgentRunRepository,
+    CandleRepository,
+    PortfolioSnapshotRepository,
+)
 from ..db.session import session_scope
 from ..discovery import DEFAULT_EXCLUDED_ASSETS, DiscoveryCriteria, DiscoveryResult, discover
 from ..domain.models import Candle
@@ -126,7 +130,8 @@ class MarketDataAgent(BaseAgent):
 
         self._precos_correntes_em: dict[str, datetime] = {}
         self.pares_sem_preco_corrente: list[str] = []
-        """Pares ativos sem preco corrente recente: stop e alvo deles nao sao avaliados."""
+        """Pares vigiados (universo e carteira) sem preco corrente recente: stop e
+        alvo deles nao sao avaliados."""
 
         self._suspeitos: dict[str, Decimal] = {}
         """Leitura com salto grande, a espera da confirmacao do ciclo seguinte."""
@@ -136,6 +141,18 @@ class MarketDataAgent(BaseAgent):
         contra o fechamento do candle quando os candles do ciclo chegarem."""
 
         self._alertados_sem_preco: frozenset[str] = frozenset()
+
+        self._pares_em_carteira: dict[str, Decimal] = {}
+        """Par -> preco do ultimo retrato, para cada posicao com preco medio.
+
+        O universo (`active_symbols`) define o que se pode ABRIR, nao o que se
+        protege. Antes, um ativo em carteira cujo par saia da lista -- revarredura
+        de 24h, ou o operador editando SYMBOLS -- deixava de ter ticker; em 3 min
+        sumia de `precos_de_mercado`, o Risk pulava o stop, e o aviso de frescor,
+        calculado so sobre os pares ativos, nao dizia nada (auditoria 09/11/2026,
+        P0 #7). So posicao com preco medio entra: sem ele nao ha stop, e pedir
+        ticker de um par que talvez nem exista so arriscaria a leitura.
+        """
 
         self._condicao: dict[str, str] = {}
         """Condicao anormal de coleta vigente por simbolo, para logar a MUDANCA.
@@ -288,14 +305,64 @@ class MarketDataAgent(BaseAgent):
         return max(TICKER_MAX_AGE_MIN, ciclo * TICKER_MAX_AGE_CYCLES)
 
     async def _atualizar_precos_correntes(self) -> None:
-        """Le o ticker de todos os pares ativos, numa chamada so quando a fonte deixa.
+        """Le o ticker dos pares ativos e dos pares em carteira fora deles.
 
         Falha aqui nao interrompe o ciclo: os candles ainda chegam. O par sem
         preco corrente fica sem avaliacao de stop e alvo (com alerta) ate voltar.
+
+        Os pares em carteira fora do universo sao lidos par a par, fora do lote:
+        um deles deslistado (`BadSymbol`) derrubaria a leitura em lote de todos os
+        outros a cada ciclo.
         """
+        await self._ler_carteira()
         symbols = self.active_symbols
-        if not symbols:
+        if symbols:
+            await self._ler_tickers(symbols)
+        fora = [s for s in self._pares_em_carteira if s not in symbols]
+        if fora:
+            await self._ler_tickers_par_a_par(fora)
+
+    async def _ler_carteira(self) -> None:
+        """Pares das posicoes com preco medio no ultimo retrato gravado deste modo.
+
+        Pelo banco, e nao por uma assinatura do topico de retratos: e o mesmo
+        retrato que o Portfolio grava, nao depende de uma tarefa a mais viva neste
+        agente, e falhar aqui so mantem a lista anterior.
+        """
+        quote = self._settings.trading.quote_currency
+        try:
+            async with session_scope(self._settings) as session:
+                retrato = await PortfolioSnapshotRepository(session).latest(
+                    mode=str(self._settings.trading_mode)
+                )
+        except Exception as exc:
+            self._log_de_estado(
+                "*",
+                "carteira",
+                f"falha:{type(exc).__name__}",
+                "warning",
+                "market_data.carteira_ilegivel",
+                error=str(exc),
+                detail="pares em carteira fora do universo mantidos da leitura anterior",
+            )
             return
+        self._condicao.pop("*|carteira", None)
+        pares: dict[str, Decimal] = {}
+        for posicao in (retrato.positions or []) if retrato is not None else []:
+            asset = posicao.get("asset")
+            if not asset or asset.upper() == quote.upper():
+                continue
+            try:
+                quantidade = Decimal(str(posicao.get("quantity") or 0))
+                medio = Decimal(str(posicao.get("average_price") or 0))
+                preco = Decimal(str(posicao.get("current_price") or 0))
+            except ArithmeticError:
+                continue
+            if quantidade > 0 and medio > 0:
+                pares[f"{asset}/{quote}"] = preco
+        self._pares_em_carteira = pares
+
+    async def _ler_tickers(self, symbols: list[str]) -> None:
         varios = getattr(self._source, "fetch_tickers", None)
         if varios is not None:
             try:
@@ -320,6 +387,9 @@ class MarketDataAgent(BaseAgent):
                 for symbol, ticker in tickers.items():
                     self._receber_ticker(symbol, ticker.price, agora)
                 return
+        await self._ler_tickers_par_a_par(symbols)
+
+    async def _ler_tickers_par_a_par(self, symbols: list[str]) -> None:
         for symbol in symbols:
             try:
                 async with asyncio.timeout(TICKER_PAR_TIMEOUT_SECONDS):
@@ -350,7 +420,13 @@ class MarketDataAgent(BaseAgent):
                 detail="preco corrente invalido; ignorado",
             )
             return
-        referencia = self.precos_correntes.get(chave) or self.latest_prices.get(chave)
+        # Par em carteira fora do universo nao tem candle coletado: a referencia
+        # do salto, na primeira leitura, e o preco com que o retrato o avaliou.
+        referencia = (
+            self.precos_correntes.get(chave)
+            or self.latest_prices.get(chave)
+            or self._pares_em_carteira.get(symbol)
+        )
         if referencia is None or referencia <= 0:
             self._pendentes[chave] = (symbol, preco, agora)
             return
@@ -402,7 +478,10 @@ class MarketDataAgent(BaseAgent):
             self._julgar(chave, symbol, preco, self.latest_prices.get(chave), em)
 
     def _chaves_ativas(self) -> set[str]:
-        return {self._chave_de_preco(s) for s in self.active_symbols}
+        """Pares vigiados: o universo e as posicoes em carteira fora dele."""
+        return {self._chave_de_preco(s) for s in self.active_symbols} | {
+            self._chave_de_preco(s) for s in self._pares_em_carteira
+        }
 
     def precos_de_mercado(self) -> dict[str, Decimal]:
         """So o preco corrente RECENTE (`idade_maxima_do_preco`), por ativo.

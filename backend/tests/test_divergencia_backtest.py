@@ -155,6 +155,10 @@ async def apurar_como_producao(
     async with session_scope(configurado) as sessao:
         repositorio = TradeRepository(sessao)
         for trade in trades:
+            # Compra com a taxa no ativo base (o papel imita a Binance sem BNB):
+            # grava como o Execution Agent grava -- quantidade bruta e a taxa na
+            # moeda em que foi cobrada --, e nao o valor convertido do relatorio.
+            no_ativo = getattr(trade, "fee_no_ativo", Decimal(0))
             await repositorio.record(
                 executed_at=trade.timestamp,
                 exchange="paper",
@@ -162,8 +166,8 @@ async def apurar_como_producao(
                 side=trade.side,
                 quantity=trade.quantity,
                 price=trade.price,
-                fee=trade.fee,
-                fee_currency=quote,
+                fee=no_ativo if no_ativo > 0 else trade.fee,
+                fee_currency=trade.symbol.partition("/")[0] if no_ativo > 0 else quote,
                 mode=modo,
                 strategy=trade.strategy,
             )
@@ -190,7 +194,9 @@ class _Lancamento:
         self.strategy = "sequencia"
 
 
-async def realizado_pelo_backtest(sequencia: list[_Lancamento], quote: str = "USDC"):
+async def realizado_pelo_backtest(
+    sequencia: list[_Lancamento], quote: str = "USDC", taxa: Decimal = Decimal(0)
+):
     """A MESMA sequencia pelo caminho de PnL do backtest.
 
     Nao e reimplementacao: chama `PortfolioBacktestEngine._execute`, que e o
@@ -199,12 +205,12 @@ async def realizado_pelo_backtest(sequencia: list[_Lancamento], quote: str = "US
     sinais -- aqui a sequencia e ditada, para que os dois lados recebam
     exatamente a mesma entrada.
     """
-    engine = motor(quote, initial_balance=Decimal("1000000"), fee_pct=Decimal(0),
+    engine = motor(quote, initial_balance=Decimal("1000000"), fee_pct=taxa,
                    slippage_pct=Decimal(0))
     broker = PaperBroker(
         quote_currency=quote,
         initial_balance=Decimal("1000000"),
-        fee_pct=Decimal(0),
+        fee_pct=taxa,
         slippage_pct=Decimal(0),
     )
     resultado = PortfolioBacktestResult(
@@ -433,6 +439,32 @@ class TestOsDoisCaminhosDePnl:
         backtest, _ = await realizado_pelo_backtest(sequencia)
         assert producao.realizado == backtest.realized_pnl, (
             f"{nome}: producao={producao.realizado} backtest={backtest.realized_pnl}"
+        )
+
+    async def test_taxa_da_compra_no_ativo_base_concorda_nos_dois_caminhos(self, tmp_path):
+        """O papel cobra a taxa da compra no BTC recebido, como a Binance sem BNB.
+
+        O backtest guarda a posicao liquida com o custo bruto; a producao apura a
+        quantidade bruta menos a taxa no ativo. As duas contas tem de chegar ao
+        mesmo realizado e ao mesmo medio -- e a taxa do relatorio tem de estar em
+        USDC, nao somada em BTC.
+        """
+        sequencia = [
+            _Lancamento(0, "BTC/USDC", "buy", "1", "100"),
+            _Lancamento(1, "BTC/USDC", "buy", "3", "200"),
+            _Lancamento(2, "BTC/USDC", "sell", "2", "500"),
+        ]
+        backtest, custos = await realizado_pelo_backtest(sequencia, taxa=Decimal("0.001"))
+        producao = await apurar_como_producao(tmp_path, backtest.trades, "USDC")
+
+        primeira = backtest.trades[0]
+        assert (primeira.fee, primeira.fee_no_ativo) == (Decimal("0.1"), Decimal("0.001"))
+        assert abs(producao.realizado - backtest.realized_pnl) <= UM_WEI * 3
+        assert abs(producao.custos["BTC"] - custos["BTC"]) <= UM_WEI * 3
+        # 700 pagos por 3,996 BTC: 2 vendidos a 500 com 0,1% de taxa na venda.
+        medio = Decimal("700") / Decimal("3.996")
+        assert backtest.realized_pnl == pytest.approx(
+            Decimal("1000") - Decimal("1") - 2 * medio, abs=Decimal("1e-18")
         )
 
     async def test_o_residuo_do_fechamento_total_nao_contamina_a_rodada_seguinte(

@@ -10,9 +10,13 @@ verdade responde, com dinheiro ficticio:
    URL da testnet -- conferido ANTES de qualquer ordem;
 2. o catalogo e o filtro do par (passo de lote, valor minimo) vem da exchange;
 3. uma compra a mercado e executada, com quantidade, preco medio e taxa lidos
-   como o sistema le;
-4. o MESMO `clientOrderId` reenviado (o que o retry de rede faz) e MEDIDO: se a
-   exchange aceitar, uma queda de rede no meio de uma compra pode virar duas;
+   como o sistema le; e a CONSULTA pelo `clientOrderId` acha essa compra -- e o
+   mecanismo com que o adaptador descobre o desfecho de um envio sem resposta, em
+   vez de reenviar;
+4. o MESMO `clientOrderId` reenviado e MEDIDO: se a exchange aceitar, REPROVA. E
+   a prova de que o id nao protege um reenvio (a MARKET preenchida deixa de ser
+   ordem aberta), e de que qualquer caminho que reenvie depois de timeout compra
+   duas vezes;
 5. a venda a mercado -- o caminho da saida protetora -- devolve a posicao;
 6. uma ordem abaixo do minimo volta como falha da ordem, e nao derruba o agente.
 
@@ -160,7 +164,16 @@ async def ensaiar(
             return relatorio
         quantidade = filtro.truncate(valor / preco)
         compra = _pedido(cliente, par, Side.BUY, quantidade, preco)
-        resultado = await cliente.place_order(compra)
+        try:
+            resultado = await cliente.place_order(compra)
+        except ExchangeError as exc:
+            # Inclui `DesfechoDesconhecido`: sem resposta e sem achar a ordem.
+            relatorio.registrar(
+                "compra a mercado", FALHOU,
+                f"{type(exc).__name__}: {exc} -- confira a testnet pelo clientOrderId "
+                f"{compra.client_order_id}",
+            )
+            return relatorio
         if not _executada(resultado):
             relatorio.registrar(
                 "compra a mercado", FALHOU, f"{resultado.status}: {resultado.error}"
@@ -179,7 +192,30 @@ async def ensaiar(
             f"{resultado.fee} {resultado.fee_currency or '(moeda nao informada)'}",
         )
 
-        # 4. Idempotencia do clientOrderId (o retry de rede reenvia o mesmo).
+        # 3b. A consulta pelo clientOrderId acha a compra. E dela que o adaptador
+        # depende para descobrir o desfecho de um envio sem resposta sem reenviar.
+        try:
+            consultada = await cliente.consultar_ordem(compra)
+        except Exception as exc:
+            consultada = None
+            detalhe = f"a consulta falhou: {type(exc).__name__}: {exc}"
+        else:
+            detalhe = (
+                "a exchange nao achou a ordem executada"
+                if consultada is None
+                else f"{consultada.status}, {consultada.filled_quantity} {base}"
+            )
+        relatorio.registrar(
+            "consulta por clientOrderId",
+            OK
+            if consultada is not None
+            and _executada(consultada)
+            and consultada.filled_quantity == resultado.filled_quantity
+            else FALHOU,
+            detalhe,
+        )
+
+        # 4. Idempotencia do clientOrderId: o que a exchange faz com um reenvio.
         try:
             repetida = await cliente.place_order(compra)
         except ExchangeError as exc:
@@ -187,11 +223,15 @@ async def ensaiar(
             relatorio.registrar("clientOrderId repetido", OK, f"recusado: {exc}")
         if repetida is not None:
             if _executada(repetida):
+                # FALHOU e nao AVISO (auditoria de 09/11/2026, M1): com AVISO o
+                # ensaio saia "APROVADO (com avisos)" com o risco de compra dupla
+                # que o SEGURANCA §17 diz ser bloqueante para o live.
                 relatorio.registrar(
-                    "clientOrderId repetido", AVISO,
-                    "a exchange ACEITOU o mesmo clientOrderId de uma ordem ja executada: "
-                    "uma queda de rede durante a compra, seguida do retry, pode comprar duas "
-                    "vezes. Ver docs/SEGURANCA.md (idempotencia).",
+                    "clientOrderId repetido", FALHOU,
+                    "a exchange ACEITOU o mesmo clientOrderId de uma ordem ja executada e "
+                    "comprou de novo: o id nao protege um reenvio, e qualquer caminho que "
+                    "reenvie depois de um timeout compra duas vezes. Ver docs/SEGURANCA.md "
+                    "(idempotencia).",
                 )
             else:
                 relatorio.registrar(

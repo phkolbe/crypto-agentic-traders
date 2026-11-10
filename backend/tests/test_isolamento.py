@@ -38,7 +38,11 @@ from crypto_traders.db.repositories import TradeRepository
 from crypto_traders.db.session import get_engine, session_scope
 from crypto_traders.domain.enums import ExchangeName, OrderStatus, OrderType, Side
 from crypto_traders.domain.models import OrderRequest
-from crypto_traders.exchanges.base import ExchangeError, InsufficientFunds
+from crypto_traders.exchanges.base import (
+    DesfechoDesconhecido,
+    ExchangeError,
+    InsufficientFunds,
+)
 from crypto_traders.exchanges.ccxt_adapter import CcxtExchange
 
 # ---------------------------------------------------------------------------
@@ -177,6 +181,11 @@ class _ClienteQueFalha:
             raise self._erro
         return self._resposta
 
+    async def fetch_order(self, *args, **kwargs):
+        """A consulta pelo clientOrderId nao acha nada (`-2013`)."""
+        self.consultas = getattr(self, "consultas", 0) + 1
+        raise ccxt.OrderNotFound('binance {"code":-2013,"msg":"Order does not exist."}')
+
     async def close(self) -> None:
         return None
 
@@ -269,14 +278,38 @@ class TestContraAExchange:
         assert desligado._testnet is False
         assert criados[-1].sandbox is False
 
-    async def test_timeout_e_retentado_com_backoff_e_termina_como_falha(
+    async def test_timeout_no_envio_nao_reenvia_e_vira_desfecho_desconhecido(
         self, monkeypatch
     ):
-        """Timeout e transitorio: retenta, e se insistir NAO vira FILLED.
+        """Timeout no `create_order` NAO e retentado: consulta, e sem achar, desconhecido.
 
-        O status importa mais que a excecao: uma ordem declarada preenchida sem
-        confirmacao criaria posicao inexistente no historico, e e do historico
-        que sai o preco medio que arma o stop.
+        Este teste exigia o contrario -- 3 envios da mesma MARKET e FAILED no fim
+        -- e protegia o defeito da auditoria de 09/11/2026 (P0 #1 e #2): na
+        Binance o `clientOrderId` so deduplica ordens ABERTAS, entao o reenvio de
+        uma MARKET ja preenchida compra de novo; e FAILED gravava "nada
+        aconteceu" para uma ordem que podia ter preenchido. A cadeia ate o
+        ExecutionAgent esta em `test_ordem_real_binance.py`.
+        """
+
+        async def sem_esperar(_segundos):
+            return None
+
+        monkeypatch.setattr("crypto_traders.exchanges.ccxt_adapter.asyncio.sleep", sem_esperar)
+
+        cliente = _ClienteQueFalha(ccxt.RequestTimeout("request timeout"))
+        async with _adaptador(cliente, max_retries=3) as adaptador:
+            with pytest.raises(DesfechoDesconhecido, match="timeout"):
+                await adaptador.place_order(_pedido())
+
+        assert cliente.chamadas == 1, "o create_order foi reenviado depois do timeout"
+        assert cliente.consultas == 1, "o desfecho nao foi consultado pelo clientOrderId"
+
+    async def test_recusa_na_porta_e_retentada_com_backoff_e_termina_como_falha(
+        self, monkeypatch
+    ):
+        """429 e o caso em que retentar a ORDEM e seguro: a Binance nao a processou.
+
+        Esgotado, FAILED e verdade (nenhuma ordem criada), e nunca FILLED.
         """
         dormidas: list[float] = []
 
@@ -288,16 +321,15 @@ class TestContraAExchange:
         # duas primeiras esperas, que sao as do backoff.
         monkeypatch.setattr("crypto_traders.exchanges.ccxt_adapter.asyncio.sleep", sem_esperar)
 
-        cliente = _ClienteQueFalha(ccxt.RequestTimeout("request timeout"))
+        cliente = _ClienteQueFalha(ccxt.RateLimitExceeded("binance 429 Too many requests"))
         async with _adaptador(cliente, max_retries=3) as adaptador:
             resultado = await adaptador.place_order(_pedido())
             do_backoff = list(dormidas)
 
-        assert cliente.chamadas == 3, "timeout tem de ser retentado ate o limite"
+        assert cliente.chamadas == 3, "recusa na porta tem de ser retentada ate o limite"
         assert do_backoff == [1.0, 2.0], "o backoff exponencial nao aconteceu"
         assert resultado.status is OrderStatus.FAILED
-        assert resultado.status is not OrderStatus.FILLED
-        assert "timeout" in (resultado.error or "").lower()
+        assert "nenhuma ordem criada" in (resultado.error or "")
 
     async def test_ordem_recusada_pela_exchange_chega_como_REJECTED(self):
         """`status: rejected` no corpo da resposta, nao excecao."""
@@ -365,10 +397,11 @@ class TestSaldoInsuficienteNoBrokerDeVerdade:
     `except ExchangeError` no adaptador -- a ordem dos blocos era o defeito. O
     `xfail(strict=True)` que morava aqui virou XPASS e foi removido.
 
-    O que estes testes fixam agora: os formatos continuam diferentes de
-    proposito (o adaptador LEVANTA, o `PaperBroker` devolve REJECTED, cada um
-    coerente com sua camada), mas o desfecho no ExecutionAgent e o mesmo nos
-    dois. E o desfecho que o cooldown le, e portanto o que precisa concordar.
+    O que estes testes fixam agora: os dois LEVANTAM `InsufficientFunds` e o
+    desfecho no ExecutionAgent e o mesmo nos dois. E o desfecho que o cooldown
+    le, e portanto o que precisa concordar. Ate 09/11/2026 o `PaperBroker`
+    devolvia REJECTED: o desfecho coincidia, mas o caminho do dry_run nao era o
+    do live (auditoria de 09/11/2026, M3 de exchanges).
     """
 
     async def test_o_adaptador_real_levanta_em_vez_de_devolver_failed(self):
@@ -378,13 +411,20 @@ class TestSaldoInsuficienteNoBrokerDeVerdade:
             with pytest.raises(InsufficientFunds, match="insuficiente"):
                 await adaptador.place_order(_pedido())
 
-    async def test_o_paper_broker_devolve_REJECTED_e_nao_levanta(self, settings):
-        """O outro broker real: formato diferente, mesmo desfecho."""
+    async def test_o_paper_broker_levanta_como_o_adaptador(self, settings):
+        """O outro broker real: mesmo formato e mesmo desfecho no agente."""
+        from crypto_traders.agents.execution import ExecutionAgent
+        from crypto_traders.bus import InMemoryEventBus
         from crypto_traders.exchanges.paper import PaperBroker
 
         broker = PaperBroker(quote_currency="USDC", initial_balance=Decimal("1"))
         broker.set_price("BTC", Decimal("50000"))
-        resultado = await broker.place_order(_pedido())
+        with pytest.raises(InsufficientFunds, match="insuficiente"):
+            await broker.place_order(_pedido())
+
+        agente = ExecutionAgent(InMemoryEventBus(), broker, settings)
+        resultado = await agente._execute(_pedido())
+        assert resultado is not None
         assert resultado.status is OrderStatus.REJECTED
 
     async def test_chega_ao_agente_como_recusa_definitiva(self, settings):

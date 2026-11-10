@@ -180,3 +180,160 @@ class TestDimensionamentoNoPrecoCorrente:
         rm.definir_precos_de_mercado(lambda: {"BTC": Decimal("1.3962")})
         estado = await rm._build_state(sinal)
         assert estado.prices["BTC"] == Decimal("1.3962")
+
+
+async def _gravar_carteira(settings, *posicoes) -> None:
+    """Grava um retrato com estas posicoes, como o Portfolio Agent faria."""
+    from crypto_traders.db.repositories import PortfolioSnapshotRepository
+    from crypto_traders.db.session import session_scope
+    from crypto_traders.domain.models import PortfolioSnapshot, Position
+
+    async with session_scope(settings) as session:
+        await PortfolioSnapshotRepository(session).save(
+            PortfolioSnapshot(
+                total_value=Decimal("1000"), cash_value=Decimal("900"),
+                positions_value=Decimal("100"),
+                positions=[
+                    Position(
+                        exchange=ExchangeName.BINANCE, asset=asset,
+                        quantity=Decimal(quantidade),
+                        average_price=Decimal(medio) if medio is not None else None,
+                        current_price=Decimal(atual),
+                    )
+                    for asset, quantidade, medio, atual in posicoes
+                ],
+            ),
+            str(settings.trading_mode),
+        )
+
+
+class TestParForaDoUniversoContinuaVigiado:
+    """P0 #7: o universo define o que se pode ABRIR, nao o que se protege.
+
+    Carteira com XRP; a revarredura tira XRP/USDT do universo (ou o operador
+    edita SYMBOLS). Antes: o ticker de XRP deixava de ser lido, em 3 min sumia
+    de `precos_de_mercado`, o Risk pulava o stop -- e o aviso de frescor so
+    olhava os pares ativos, entao NENHUM alerta saia.
+    """
+
+    async def test_par_removido_do_universo_com_posicao_continua_com_ticker(self, settings):
+        dados, _, fonte = await montar(
+            settings,
+            {"BTC/USDT": "100", "XRP/USDT": "1.30"},
+            {"BTC/USDT": "101", "XRP/USDT": "1.31"},
+        )
+        await _gravar_carteira(settings, ("XRP", "10", "1.30", "1.31"))
+        await dados.refresh()
+        assert dados.precos_de_mercado()["XRP"] == Decimal("1.31")
+
+        # O operador tira XRP da lista. A posicao continua na carteira.
+        dados._settings = com_negocio(dados._settings, symbols=["BTC/USDT"])
+        fonte.precos["XRP/USDT"] = Decimal("1.20")
+        _envelhecer(dados, "XRP")
+        await dados.refresh()
+        assert dados.precos_de_mercado()["XRP"] == Decimal("1.20")
+
+    async def test_par_fora_do_universo_sem_preco_gera_alerta(self, settings):
+        dados, bus, fonte = await montar(settings, {"BTC/USDT": "100"}, {"BTC/USDT": "101"})
+        fonte.precos["XRP/USDT"] = ExchangeError("503")
+        await _gravar_carteira(settings, ("XRP", "10", "1.30", "1.31"))
+        await dados.refresh()
+        alertas = [p for t, p in bus.publicados if t == Topics.ALERTS]
+        assert [a["type"] for a in alertas] == ["preco_corrente_ausente"]
+        assert "XRP" in alertas[0]["title"]
+
+    async def test_primeira_leitura_do_par_fora_do_universo_vale_no_mesmo_ciclo(self, settings):
+        """Sem candle do par, a referencia do salto e o preco do retrato."""
+        dados, _, fonte = await montar(settings, {"BTC/USDT": "100"}, {"BTC/USDT": "101"})
+        fonte.precos["XRP/USDT"] = Decimal("1.32")
+        await _gravar_carteira(settings, ("XRP", "10", "1.30", "1.31"))
+        await dados.refresh()
+        assert dados.precos_de_mercado()["XRP"] == Decimal("1.32")
+
+    async def test_posicao_sem_preco_medio_nao_entra(self, settings):
+        """Sem preco medio nao ha stop: buscar ticker dela so arriscaria o lote."""
+        dados, _, _ = await montar(settings, {"BTC/USDT": "100"}, {"BTC/USDT": "101"})
+        await _gravar_carteira(settings, ("DOGE", "10", None, "0.1"))
+        await dados.refresh()
+        assert dados.pares_sem_preco_corrente == []
+
+
+class TestRiskAvisaPosicaoSemPreco:
+    """O `continue` silencioso do Risk para ativo sem preco corrente (P0 #7)."""
+
+    async def test_alerta_uma_vez_por_transicao(self, settings):
+        import asyncio
+
+        rm = await agente(settings, stop=0.03, alvo=0.10)
+        rm.definir_precos_de_mercado(dict)
+        alertas: list[dict] = []
+
+        async def escuta():
+            async for alerta in rm.bus.subscribe(Topics.ALERTS):
+                alertas.append(alerta)
+
+        tarefa = asyncio.create_task(escuta())
+        await asyncio.sleep(0)
+        for _ in range(3):
+            await rm.enforce_protective_exits(snapshot("1.3969", "1.40"))
+        rm.definir_precos_de_mercado(lambda: {"BTC": Decimal("1.40")})
+        await rm.enforce_protective_exits(snapshot("1.3969", "1.40"))
+        rm.definir_precos_de_mercado(dict)
+        await rm.enforce_protective_exits(snapshot("1.3969", "1.40"))
+        await asyncio.sleep(0.05)
+        tarefa.cancel()
+
+        tipos = [a["type"] for a in alertas]
+        assert tipos.count("position_without_current_price") == 2
+        assert "BTC" in alertas[0]["title"]
+
+
+class TestAberturaSemPrecoCorrente:
+    """M3: sem ticker recente, a ABERTURA e recusada; o FLAT continua passando.
+
+    Antes, o dimensionamento caia no fechamento do candle: LONG do candle 1d
+    com o fechamento de ontem 100 e o mercado a 108 dimensionava a 100 e
+    gastava 8% acima do teto -- contra o que o SEGURANCA afirma.
+    """
+
+    def _sinal(self, direcao):
+        return Signal(
+            strategy="ma_crossover", exchange=ExchangeName.BINANCE, symbol="BTC/USDT",
+            timeframe="1d", direction=direcao, confidence=0.8, reason="teste",
+            reference_price=Decimal("1.30"),
+        )
+
+    async def _avaliar(self, rm, sinal):
+        import asyncio
+
+        avaliacoes: list = []
+
+        async def escuta():
+            async for a in rm.bus.subscribe(Topics.RISK_ASSESSMENTS):
+                avaliacoes.append(a)
+
+        tarefa = asyncio.create_task(escuta())
+        await asyncio.sleep(0)
+        await rm._on_batch([sinal])
+        await asyncio.sleep(0.05)
+        tarefa.cancel()
+        return avaliacoes[0]
+
+    async def test_long_sem_preco_corrente_e_recusado(self, settings):
+        from crypto_traders.domain.enums import RiskDecision
+
+        rm = await agente(settings)
+        rm.observe_snapshot(snapshot("1.3", "1.3"))
+        rm.definir_precos_de_mercado(dict)
+        avaliacao = await self._avaliar(rm, self._sinal(SignalDirection.LONG))
+        assert avaliacao.decision is RiskDecision.REJECTED
+        assert any("preco corrente" in r for r in avaliacao.reasons)
+
+    async def test_flat_sem_preco_corrente_continua_passando(self, settings):
+        from crypto_traders.domain.enums import RiskDecision
+
+        rm = await agente(settings)
+        rm.observe_snapshot(snapshot("1.3", "1.3", quantidade="100"))
+        rm.definir_precos_de_mercado(dict)
+        avaliacao = await self._avaliar(rm, self._sinal(SignalDirection.FLAT))
+        assert avaliacao.decision is RiskDecision.APPROVED
