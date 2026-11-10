@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useEffect, useState } from 'react'
+import { useEffect, useId, useState } from 'react'
 
 import { ApiError, api } from '../api/client'
 import { dateTime, money } from '../api/format'
@@ -149,6 +149,8 @@ function mesmoRascunho(a: Record<string, string>, b: Record<string, string>): bo
 export default function RiskSettings() {
   const queryClient = useQueryClient()
   const moeda = useQuoteCurrency()
+  // Rotulo ligado ao campo (leitor de tela e clique no rotulo).
+  const uid = useId()
   const [draft, setDraft] = useState<Record<string, string>>({})
   /**
    * Os valores do servidor de que o rascunho partiu.
@@ -313,6 +315,12 @@ export default function RiskSettings() {
         </div>
       </div>
 
+      {/* Sem isto, falha ao ler o capital sumia com o banner do portao: parecia
+          que nao havia saldo esperando autorizacao. */}
+      {capital.isError && !capital.data && (
+        <ErroDeCarga error={capital.error} oQue="o capital autorizado" />
+      )}
+
       <CapitalGateBanner
         status={capital.data}
         onAuthorize={(patrimonioVisto) => authorize.mutate(patrimonioVisto)}
@@ -355,7 +363,7 @@ export default function RiskSettings() {
         <div className="form-grid">
           {FIELDS.map((field) => (
             <div className="field" key={field.key}>
-              <label>
+              <label htmlFor={`${uid}-${field.key}`}>
                 {field.label}
                 {/* Limite de dinheiro sem unidade e um numero que nao se pode
                     conferir: "5" e cinco de que? A moeda vem da configuracao. */}
@@ -364,6 +372,7 @@ export default function RiskSettings() {
                 {field.nullable && <span className="faint"> — vazio = sem limite</span>}
               </label>
               <input
+                id={`${uid}-${field.key}`}
                 type="number"
                 step={field.kind === 'int' ? '1' : 'any'}
                 min="0"
@@ -378,16 +387,18 @@ export default function RiskSettings() {
 
         <div className="form-grid" style={{ marginTop: 14 }}>
           <div className="field">
-            <label>Ativos permitidos</label>
+            <label htmlFor={`${uid}-ativos`}>Ativos permitidos</label>
             <input
+              id={`${uid}-ativos`}
               value={draft.asset_whitelist ?? ''}
               onChange={(e) => setDraft({ ...draft, asset_whitelist: e.target.value.toUpperCase() })}
             />
             <span className="hint">Separados por vírgula. Evita tokens ilíquidos ou desconhecidos.</span>
           </div>
           <div className="field">
-            <label>Pares permitidos</label>
+            <label htmlFor={`${uid}-pares`}>Pares permitidos</label>
             <input
+              id={`${uid}-pares`}
               value={draft.symbol_whitelist ?? ''}
               onChange={(e) => setDraft({ ...draft, symbol_whitelist: e.target.value.toUpperCase() })}
             />

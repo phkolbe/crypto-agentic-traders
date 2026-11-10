@@ -21,8 +21,10 @@ export type LiveEvent =
 const INVALIDATES: Record<string, string[]> = {
   signal: ['signals'],
   risk_assessment: ['riskEvents', 'portfolioAnalise'],
-  order_result: ['trades', 'orders', 'portfolio', 'portfolioAnalise'],
-  portfolio: ['portfolio', 'portfolioHistory'],
+  // `capital` e `health` (`sizing_feasible`) dependem do patrimonio: sem eles o
+  // banner "não autorizados" e o aviso de dimensionamento esperavam o polling.
+  order_result: ['trades', 'orders', 'portfolio', 'portfolioAnalise', 'capital', 'health'],
+  portfolio: ['portfolio', 'portfolioHistory', 'capital'],
   alert: ['health', 'riskConfig'],
 }
 
@@ -38,6 +40,7 @@ export function useLiveEvents() {
 
   useEffect(() => {
     let disposed = false
+    let jaConectou = false
 
     const connect = () => {
       if (disposed) return
@@ -45,7 +48,15 @@ export function useLiveEvents() {
       const socket = new WebSocket(`${protocol}://${window.location.host}${RAIZ}/ws`)
       socketRef.current = socket
 
-      socket.onopen = () => setConnected(true)
+      socket.onopen = () => {
+        setConnected(true)
+        // Reconexao: o que aconteceu durante a queda (um circuit breaker
+        // disparado, uma ordem executada) nao vem pelo socket, que nao guarda
+        // historico. Sem revalidar, a tela ficava ate 30 s (o polling) com dado
+        // velho e o rodape ja dizendo "tempo real ativo".
+        if (jaConectou) queryClient.invalidateQueries()
+        jaConectou = true
+      }
 
       socket.onmessage = (message) => {
         try {

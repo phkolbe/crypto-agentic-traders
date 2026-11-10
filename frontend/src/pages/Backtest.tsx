@@ -1,14 +1,16 @@
 import { useMutation, useQuery } from '@tanstack/react-query'
-import { useState } from 'react'
+import { useState, useId } from 'react'
 import { ApiError, api } from '../api/client'
 import { money, percent, price, quoteOf, shortDate, signedPercent } from '../api/format'
 import type { BacktestResult, StrategyInfo } from '../api/types'
 import { TimeSeriesChart } from '../components/Charts'
-import { Card, Empty, Stat, useQuoteCurrency } from '../components/Shared'
+import { Card, Empty, ErroDeCarga, Stat, useQuoteCurrency } from '../components/Shared'
 
 const TIMEFRAMES = ['15m', '30m', '1h', '4h', '1d']
 
 export default function Backtest() {
+  // Rotulo ligado ao campo (leitor de tela e clique no rotulo).
+  const uid = useId()
   const moeda = useQuoteCurrency()
   const [form, setForm] = useState({
     // Sem par fixo: `BTC/USDT` era o padrao e deixou de existir na configuracao
@@ -67,16 +69,16 @@ export default function Backtest() {
       <Card>
         <div className="row">
           <div className="field" style={{ maxWidth: 160 }}>
-            <label>Par</label>
-            <input
+            <label htmlFor={`${uid}-1`}>Par</label>
+            <input id={`${uid}-1`}
               value={form.symbol}
               placeholder={parPadrao}
               onChange={(e) => setForm({ ...form, symbol: e.target.value.toUpperCase() })}
             />
           </div>
           <div className="field" style={{ maxWidth: 220 }}>
-            <label>Estratégia</label>
-            <select
+            <label htmlFor={`${uid}-2`}>Estratégia</label>
+            <select id={`${uid}-2`}
               value={form.strategy}
               onChange={(e) => setForm({ ...form, strategy: e.target.value })}
             >
@@ -88,8 +90,8 @@ export default function Backtest() {
             </select>
           </div>
           <div className="field" style={{ maxWidth: 120 }}>
-            <label>Timeframe</label>
-            <select
+            <label htmlFor={`${uid}-3`}>Timeframe</label>
+            <select id={`${uid}-3`}
               value={form.timeframe}
               onChange={(e) => setForm({ ...form, timeframe: e.target.value })}
             >
@@ -101,8 +103,8 @@ export default function Backtest() {
             </select>
           </div>
           <div className="field" style={{ maxWidth: 110 }}>
-            <label>Dias</label>
-            <input
+            <label htmlFor={`${uid}-4`}>Dias</label>
+            <input id={`${uid}-4`}
               type="number"
               min={1}
               max={365}
@@ -111,11 +113,11 @@ export default function Backtest() {
             />
           </div>
           <div className="field" style={{ maxWidth: 140 }}>
-            <label>
+            <label htmlFor={`${uid}-5`}>
               Saldo inicial
               {moeda && <span className="faint"> ({moeda})</span>}
             </label>
-            <input
+            <input id={`${uid}-5`}
               type="number"
               min={1}
               value={form.initial_balance}
@@ -131,7 +133,17 @@ export default function Backtest() {
           </button>
         </div>
 
-        {error && <div className="form-message err" style={{ marginTop: 12 }}>{error}</div>}
+        {strategies.isError && (
+          // A lista de estrategias vazia parecia "nenhuma estrategia existe".
+          <div style={{ marginTop: 12 }}>
+            <ErroDeCarga error={strategies.error} oQue="as estratégias" />
+          </div>
+        )}
+        {error && (
+          <div className="form-message err" style={{ marginTop: 12 }} role="alert">
+            {error}
+          </div>
+        )}
       </Card>
 
       {!summary ? (

@@ -23,7 +23,7 @@ import { chaveDoPeriodo, parametrosDoPeriodo, rotuloDoPeriodo } from '../api/per
 import type { AnalisePortfolio, AuditEntry, EquityPoint } from '../api/types'
 import { BarChart, HorizontalBars, MultiSeriesChart } from '../components/Charts'
 import { SeletorDePeriodo, usePeriodo } from '../components/Periodo'
-import { Card, Empty, Loading, Stat, useQuoteCurrency } from '../components/Shared'
+import { Card, Empty, ErroDeCarga, Loading, Stat, useQuoteCurrency } from '../components/Shared'
 
 /** Cores das series; repetem se houver muitos ativos. */
 const CORES = ['#58a6ff', '#3fb950', '#d29922', '#bc8cff', '#f85149', '#39c5cf']
@@ -68,6 +68,29 @@ export default function Portfolio() {
     )
   }
 
+  // Falha dita como falha. Sem o historico ou sem a analise, todos os cartoes
+  // diziam "histórico insuficiente" e "nenhuma venda no período" — como se a
+  // carteira estivesse parada, e nao a API fora.
+  const falhas = [
+    historico.isError && !historico.data && (
+      <ErroDeCarga key="h" error={historico.error} oQue="o histórico de patrimônio" />
+    ),
+    analise.isError && !analise.data && (
+      <ErroDeCarga key="a" error={analise.error} oQue="a análise do período" />
+    ),
+    audit.isError && !audit.data && (
+      <ErroDeCarga key="l" error={audit.error} oQue="o log de auditoria (moeda da série)" />
+    ),
+  ].filter(Boolean)
+  if (historico.isError && !historico.data && analise.isError && !analise.data) {
+    return (
+      <>
+        <Cabecalho periodo={periodo} onChange={setPeriodo} />
+        {falhas}
+      </>
+    )
+  }
+
   const pontos = historico.data ?? []
   const entradas = audit.data ?? []
   const fronteira = fronteiraDaMoeda(
@@ -102,6 +125,7 @@ export default function Portfolio() {
   }
 
   const pares = dados?.pares ?? []
+  const moedasDosPares = [...new Set(pares.map((p) => p.moeda))]
   const ganhos = pares.reduce((s, p) => s + p.ganhos, 0)
   const perdas = pares.reduce((s, p) => s + p.perdas, 0)
   const alocacao = alocacaoNoTempo(serie.map((p) => ({ allocations: p.allocations ?? {} })))
@@ -110,6 +134,8 @@ export default function Portfolio() {
   return (
     <>
       <Cabecalho periodo={periodo} onChange={setPeriodo} />
+
+      {falhas.length > 0 && <div className="stack" style={{ gap: 8, marginBottom: 14 }}>{falhas}</div>}
 
       {fronteira.tipo === 'trocada' && pontos.length > serie.length && (
         <div className="chart-note" style={{ marginBottom: 14 }}>
@@ -315,10 +341,21 @@ export default function Portfolio() {
             <Empty>Nenhuma compra ou venda no período.</Empty>
           ) : (
             <div className="pares-layout">
-              <HorizontalBars
-                itens={pares.map((p) => ({ rotulo: p.simbolo, valor: toNumber(p.realizado) }))}
-                formatValue={(v) => money(v, moeda)}
-              />
+              <div>
+                {/* A moeda de CADA par, como na tabela ao lado: com BTC/BRL de
+                    antes da migracao no periodo, a barra dizia "385,00 USDC"
+                    sobre reais. */}
+                <HorizontalBars
+                  itens={pares.map((p) => ({ rotulo: p.simbolo, valor: toNumber(p.realizado) }))}
+                  formatValue={(v, i) => money(v, pares[i]?.moeda ?? '')}
+                />
+                {moedasDosPares.length > 1 && (
+                  <div className="chart-note">
+                    Pares em moedas diferentes ({moedasDosPares.join(', ')}): o comprimento das
+                    barras só se compara entre pares da mesma moeda.
+                  </div>
+                )}
+              </div>
               <div className="table-wrap">
                 <table className="nowrap">
                   <thead>

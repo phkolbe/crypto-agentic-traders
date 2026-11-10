@@ -978,7 +978,8 @@ export function HorizontalBars({
   rotulosLongos = false,
 }: {
   itens: Barra[]
-  formatValue: (value: number) => string
+  /** Recebe o indice para que cada barra possa ter a sua unidade (a moeda do par). */
+  formatValue: (value: number, indice: number) => string
   /** Com cor: todas as barras nela (contagens). Sem: verde/vermelho pelo sinal. */
   corNeutra?: string
   /** Rótulo numa linha própria, inteiro, acima da barra (frases, como motivos). */
@@ -987,7 +988,7 @@ export function HorizontalBars({
   const maior = Math.max(...itens.map((i) => Math.abs(i.valor)), 0)
   return (
     <div className={`hbars ${rotulosLongos ? 'hbars-longos' : ''}`}>
-      {itens.map((item) => (
+      {itens.map((item, indice) => (
         <div key={item.rotulo} className="hbar-row" title={item.detalhe}>
           <span className="hbar-label">{item.rotulo}</span>
           <span className="hbar-track">
@@ -1000,7 +1001,7 @@ export function HorizontalBars({
               }}
             />
           </span>
-          <span className="hbar-value num">{formatValue(item.valor)}</span>
+          <span className="hbar-value num">{formatValue(item.valor, indice)}</span>
         </div>
       ))}
     </div>

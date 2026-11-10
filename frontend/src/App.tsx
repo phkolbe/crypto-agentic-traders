@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { NavLink, Navigate, Route, Routes } from 'react-router-dom'
 
+import { ModeBanner, useHealth } from './components/Shared'
 import { useLiveEvents } from './hooks/useLiveEvents'
 import Agents from './pages/Agents'
 import Backtest from './pages/Backtest'
@@ -124,6 +125,7 @@ function useMenuRecolhido(): [boolean, () => void] {
 
 export default function App() {
   const { connected, feed } = useLiveEvents()
+  const health = useHealth()
   const [recolhido, alternarMenu] = useMenuRecolhido()
   const estado = connected ? 'tempo real ativo' : 'reconectando…'
 
@@ -177,6 +179,9 @@ export default function App() {
       </aside>
 
       <main className="main">
+        {/* No layout, e nao em cada pagina: a faixa Simulacao/Dinheiro real so
+            aparecia no Dashboard e em Agentes. */}
+        <ModeBanner health={health.data} erro={health.error} />
         <Routes>
           <Route path="/" element={<Navigate to="/dashboard" replace />} />
           <Route path="/dashboard" element={<Dashboard feed={feed} />} />

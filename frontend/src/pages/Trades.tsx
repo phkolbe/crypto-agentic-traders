@@ -1,8 +1,8 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Fragment, useState } from 'react'
+import { Fragment, useState, useId } from 'react'
 
 import { api, ApiError } from '../api/client'
-import { MODE_LABEL, dateTime, money, price, quantity, quoteOf, toNumber } from '../api/format'
+import { MODE_LABEL, dateTime, money, price, quantity, quoteOf, taxa } from '../api/format'
 import type { TradePage } from '../api/types'
 import {
   Card,
@@ -17,6 +17,8 @@ import {
 const PAGE_SIZE = 25
 
 export default function Trades() {
+  // Rotulo ligado ao campo (leitor de tela e clique no rotulo).
+  const uid = useId()
   const queryClient = useQueryClient()
   const moeda = useQuoteCurrency()
   const [offset, setOffset] = useState(0)
@@ -74,24 +76,24 @@ export default function Trades() {
       <Card>
         <div className="row" style={{ marginBottom: 14 }}>
           <div className="field" style={{ maxWidth: 160 }}>
-            <label>Origem</label>
-            <select value={origin} onChange={(e) => resetFilter(setOrigin)(e.target.value)}>
+            <label htmlFor={`${uid}-1`}>Origem</label>
+            <select id={`${uid}-1`} value={origin} onChange={(e) => resetFilter(setOrigin)(e.target.value)}>
               <option value="">Todas</option>
               <option value="agent">Agentes</option>
               <option value="manual">Manuais</option>
             </select>
           </div>
           <div className="field" style={{ maxWidth: 160 }}>
-            <label>Lado</label>
-            <select value={side} onChange={(e) => resetFilter(setSide)(e.target.value)}>
+            <label htmlFor={`${uid}-2`}>Lado</label>
+            <select id={`${uid}-2`} value={side} onChange={(e) => resetFilter(setSide)(e.target.value)}>
               <option value="">Todos</option>
               <option value="buy">Compra</option>
               <option value="sell">Venda</option>
             </select>
           </div>
           <div className="field" style={{ maxWidth: 180 }}>
-            <label>Par</label>
-            <input
+            <label htmlFor={`${uid}-3`}>Par</label>
+            <input id={`${uid}-3`}
               value={symbol}
               onChange={(e) => resetFilter(setSymbol)(e.target.value.toUpperCase())}
               placeholder={moeda ? `BTC/${moeda}` : ''}
@@ -174,9 +176,9 @@ export default function Trades() {
                         <span className="unit">{quoteOf(trade.symbol)}</span>
                       </td>
                       <td className="right">{money(trade.notional, quoteOf(trade.symbol))}</td>
-                      <td className="right muted">
-                        {toNumber(trade.fee) > 0 ? money(trade.fee, trade.fee_currency ?? '') : '—'}
-                      </td>
+                      {/* `taxa`: cobrada no ativo base (compra em live), 0,0000012 BTC
+                          aparecia como "0,00 BTC". */}
+                      <td className="right muted">{taxa(trade.fee, trade.fee_currency, trade.symbol)}</td>
                       <td><OriginBadge origin={trade.origin} /></td>
                       <td className="muted">{trade.strategy ?? '—'}</td>
                       <td className="muted" style={{ fontSize: 12 }}>

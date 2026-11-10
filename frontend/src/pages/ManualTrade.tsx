@@ -1,5 +1,5 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { useState } from 'react'
+import { useState, useId } from 'react'
 
 import { ApiError, api } from '../api/client'
 import { dateTime, money, multiplyDecimal, price, quantity, quoteOf } from '../api/format'
@@ -12,6 +12,8 @@ import {
 import { Card, useQuoteCurrency } from '../components/Shared'
 
 export default function ManualTrade() {
+  // Rotulo ligado ao campo (leitor de tela e clique no rotulo).
+  const uid = useId()
   const queryClient = useQueryClient()
   const moeda = useQuoteCurrency()
   // Inicializador preguicoso: a data padrao e a de quando a tela abre, nao a
@@ -104,8 +106,8 @@ export default function ManualTrade() {
           <form onSubmit={submit} className="stack">
             <div className="form-grid">
               <div className="field">
-                <label>Data e hora</label>
-                <input
+                <label htmlFor={`${uid}-1`}>Data e hora</label>
+                <input id={`${uid}-1`}
                   type="datetime-local"
                   value={form.executed_at}
                   onChange={(e) => update('executed_at')(e.target.value)}
@@ -114,8 +116,8 @@ export default function ManualTrade() {
               </div>
 
               <div className="field">
-                <label>Exchange</label>
-                <select value={form.exchange} onChange={(e) => update('exchange')(e.target.value)}>
+                <label htmlFor={`${uid}-2`}>Exchange</label>
+                <select id={`${uid}-2`} value={form.exchange} onChange={(e) => update('exchange')(e.target.value)}>
                   <option value="binance">Binance</option>
                   {/* "outra" continua disponivel: um lancamento manual pode vir
                       de qualquer lugar, mesmo o sistema operando so na Binance. */}
@@ -124,8 +126,8 @@ export default function ManualTrade() {
               </div>
 
               <div className="field">
-                <label>Par</label>
-                <input
+                <label htmlFor={`${uid}-3`}>Par</label>
+                <input id={`${uid}-3`}
                   value={form.symbol}
                   onChange={(e) => update('symbol')(e.target.value.toUpperCase())}
                   placeholder={moeda ? `BTC/${moeda}` : ''}
@@ -136,16 +138,16 @@ export default function ManualTrade() {
               </div>
 
               <div className="field">
-                <label>Lado</label>
-                <select value={form.side} onChange={(e) => update('side')(e.target.value)}>
+                <label htmlFor={`${uid}-4`}>Lado</label>
+                <select id={`${uid}-4`} value={form.side} onChange={(e) => update('side')(e.target.value)}>
                   <option value="buy">Compra</option>
                   <option value="sell">Venda</option>
                 </select>
               </div>
 
               <div className="field">
-                <label>Quantidade</label>
-                <input
+                <label htmlFor={`${uid}-5`}>Quantidade</label>
+                <input id={`${uid}-5`}
                   type="number"
                   step="any"
                   min="0"
@@ -157,8 +159,8 @@ export default function ManualTrade() {
               </div>
 
               <div className="field">
-                <label>Preço unitário</label>
-                <input
+                <label htmlFor={`${uid}-6`}>Preço unitário</label>
+                <input id={`${uid}-6`}
                   type="number"
                   step="any"
                   min="0"
@@ -170,8 +172,8 @@ export default function ManualTrade() {
               </div>
 
               <div className="field">
-                <label>Taxa paga</label>
-                <input
+                <label htmlFor={`${uid}-7`}>Taxa paga</label>
+                <input id={`${uid}-7`}
                   type="number"
                   step="any"
                   min="0"
@@ -183,8 +185,8 @@ export default function ManualTrade() {
               </div>
 
               <div className="field">
-                <label>Moeda da taxa</label>
-                <input
+                <label htmlFor={`${uid}-8`}>Moeda da taxa</label>
+                <input id={`${uid}-8`}
                   value={form.fee_currency}
                   onChange={(e) => update('fee_currency')(e.target.value.toUpperCase())}
                   placeholder={moedaDoPar}
@@ -196,8 +198,8 @@ export default function ManualTrade() {
             </div>
 
             <div className="field">
-              <label>Observações</label>
-              <textarea
+              <label htmlFor={`${uid}-9`}>Observações</label>
+              <textarea id={`${uid}-9`}
                 rows={2}
                 value={form.notes}
                 onChange={(e) => update('notes')(e.target.value)}

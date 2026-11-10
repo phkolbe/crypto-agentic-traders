@@ -130,9 +130,26 @@ export function Stat({
  *
  * Fica visivel em todas as telas de proposito: a diferenca entre simulacao e
  * dinheiro real nunca deve depender de o operador lembrar do que configurou.
+ * Por isso e desenhada UMA vez, no layout (`App.tsx`), acima das rotas. Ate
+ * 09/11/2026 so o Dashboard e Agentes a desenhavam: Risco, Configuracoes,
+ * Lancar manual e Negociacoes — justamente as telas das acoes com dinheiro — nao
+ * diziam se era simulacao ou dinheiro real.
+ *
+ * Sem o health por falha (que nao seja o 503 de agentes parados), a faixa diz
+ * que o modo nao foi confirmado, em vez de sumir: sumir le como "nada a temer".
  */
-export function ModeBanner({ health }: { health: Health | undefined }) {
-  if (!health) return null
+export function ModeBanner({ health, erro }: { health: Health | undefined; erro?: unknown }) {
+  if (!health) {
+    if (!erro || (erro instanceof ApiError && erro.agentsAreDown)) return null
+    return (
+      <div className="mode-banner mode-testnet" role="status">
+        <span>●</span>
+        <span>
+          <strong>Modo de operação não confirmado</strong> · {mensagemDeErro(erro)}
+        </span>
+      </div>
+    )
+  }
   const mode = health.mode
   const className =
     mode === 'live' ? 'mode-live' : mode === 'testnet' ? 'mode-testnet' : 'mode-simulated'

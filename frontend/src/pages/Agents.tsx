@@ -10,8 +10,9 @@ import {
   Card,
   CircuitBreakerBanner,
   Empty,
+  ErroDeCarga,
   Loading,
-  ModeBanner,
+  mensagemDeErro,
   SizingBanner,
   useHealth,
 } from '../components/Shared'
@@ -45,18 +46,25 @@ export default function Agents() {
   const resumeAll = useMutation({ mutationFn: api.resumeAll, onSuccess: invalidate, onError })
   const resetBreaker = useMutation({
     mutationFn: api.resetCircuitBreaker,
-    onSuccess: invalidate,
-    onError,
+    onSuccess: () => {
+      // A trava mora em duas fontes (health aqui, riskConfig na tela Risco).
+      invalidate()
+      queryClient.invalidateQueries({ queryKey: ['riskConfig'] })
+    },
   })
 
-  if (health.isError) {
+  if (health.isError && !health.data) {
     const error = health.error
     if (error instanceof ApiError && error.agentsAreDown) return <AgentsOffline />
+    // Era um cartao "Estado dos agentes" vazio, como se nao houvesse agente.
+    return <ErroDeCarga error={error} oQue="o estado dos agentes" />
   }
   if (health.isLoading) return <Loading />
 
   const agents = Object.entries(health.data?.agents ?? {})
   const anyPaused = agents.some(([, status]) => status.paused)
+  const travado = health.data?.circuit_breaker_active ?? false
+  const motivoDaTrava = 'Circuit breaker acionado: rearme a trava antes de retomar.'
 
   return (
     <>
@@ -70,12 +78,8 @@ export default function Agents() {
             <button
               className="primary"
               onClick={() => resumeAll.mutate()}
-              disabled={resumeAll.isPending || health.data?.circuit_breaker_active}
-              title={
-                health.data?.circuit_breaker_active
-                  ? 'Rearme o circuit breaker antes de retomar'
-                  : undefined
-              }
+              disabled={resumeAll.isPending || travado}
+              title={travado ? motivoDaTrava : undefined}
             >
               Retomar todos
             </button>
@@ -87,13 +91,14 @@ export default function Agents() {
         </div>
       </div>
 
-      <ModeBanner health={health.data} />
       <SizingBanner health={health.data} />
       <CircuitBreakerBanner
-        active={health.data?.circuit_breaker_active ?? false}
+        active={travado}
         onReset={() => resetBreaker.mutate()}
         resetting={resetBreaker.isPending}
+        erro={resetBreaker.isError ? mensagemDeErro(resetBreaker.error) : null}
       />
+      {health.isError && <ErroDeCarga error={health.error} oQue="o estado mais novo dos agentes" />}
 
       {message && <div className="form-message err" style={{ marginBottom: 14 }}>{message}</div>}
 
@@ -130,16 +135,29 @@ export default function Agents() {
                   {status.last_error ? ` · erro: ${status.last_error}` : ''}
                 </div>
               </div>
-              <button
-                className="small"
-                onClick={() =>
-                  status.paused ? resume.mutate(name) : pause.mutate(name)
-                }
-              >
-                {status.paused ? 'retomar' : 'pausar'}
-              </button>
+              {/* "retomar" de UM agente tambem respeita a trava. So o "Retomar
+                  todos" era bloqueado: com o breaker ativo, retomar `strategy` e
+                  `execution` um a um contornava a parada pela tela. */}
+              <div className="stack" style={{ gap: 2, alignItems: 'flex-end' }}>
+                <button
+                  className="small"
+                  onClick={() =>
+                    status.paused ? resume.mutate(name) : pause.mutate(name)
+                  }
+                  disabled={status.paused && travado}
+                  title={status.paused && travado ? motivoDaTrava : undefined}
+                >
+                  {status.paused ? 'retomar' : 'pausar'}
+                </button>
+                {status.paused && travado && (
+                  <span className="faint" style={{ fontSize: 11 }}>trava acionada</span>
+                )}
+              </div>
             </div>
           ))}
+          {travado && anyPaused && (
+            <div className="hint" style={{ marginTop: 10 }}>{motivoDaTrava}</div>
+          )}
           <div className="faint" style={{ fontSize: 12, marginTop: 12 }}>
             Pausar as decisões mantém o Market Data Agent rodando de propósito: sem preço
             atualizado o dashboard congela justamente quando você mais precisa olhar para ele.
@@ -149,6 +167,8 @@ export default function Agents() {
         <Card title="Estratégias">
           {strategies.isLoading ? (
             <Loading />
+          ) : strategies.isError && !strategies.data ? (
+            <ErroDeCarga error={strategies.error} oQue="as estratégias" />
           ) : (
             <div className="stack" style={{ gap: 10 }}>
               {(strategies.data ?? []).map((strategy) => (
@@ -182,6 +202,8 @@ export default function Agents() {
         <Card title="Sinais recentes">
           {signals.isLoading ? (
             <Loading />
+          ) : signals.isError && !signals.data ? (
+            <ErroDeCarga error={signals.error} oQue="os sinais" />
           ) : (signals.data ?? []).length === 0 ? (
             <Empty>
               Nenhum sinal gerado ainda. As estratégias só decidem sobre candles fechados, e não
