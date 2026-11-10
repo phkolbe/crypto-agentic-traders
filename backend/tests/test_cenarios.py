@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import ROUND_DOWN, Decimal
 
 import pytest
@@ -523,3 +523,63 @@ async def test_compra_dimensionada_no_preco_corrente(tmp_path):
         assert executado <= teto, (
             f"executado {executado} passou do aprovado {notional_aprovado} + slippage"
         )
+
+
+# ======================================================================
+# 8. O proprio simulador
+# ======================================================================
+class _Relogio(datetime):
+    """`datetime` com `now` controlado, para o simulador cruzar a virada do dia."""
+
+    agora = datetime(2026, 11, 10, 23, 59, 59, tzinfo=UTC)
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls.agora
+
+
+async def test_a_virada_do_periodo_no_meio_do_cenario_nao_move_a_serie(monkeypatch):
+    """Datas relidas do relogio a cada consulta: flake perto das 21:00 de Brasilia.
+
+    Um cenario que cruzasse a virada do periodo via todos os `open_time` andarem
+    um dia -- um "candle novo" que ninguem fechou, com o mesmo preco. Ancorado na
+    criacao, a serie fica onde estava e continua toda fechada pelo relogio real.
+    """
+    from crypto_traders.simulacao import mercado as modulo
+
+    monkeypatch.setattr(modulo, "datetime", _Relogio)
+    mercado = MercadoSimulado(timeframe="1d")
+    mercado.adicionar_par(SIMBOLO, FECHAMENTOS)
+    antes = [c.open_time for c in await mercado.fetch_candles(SIMBOLO, "1d") if c.closed]
+
+    monkeypatch.setattr(_Relogio, "agora", datetime(2026, 11, 11, 0, 0, 1, tzinfo=UTC))
+    depois = [c.open_time for c in await mercado.fetch_candles(SIMBOLO, "1d") if c.closed]
+    assert depois == antes
+    assert depois[-1] + timedelta(days=1) <= _Relogio.agora
+
+
+async def test_fechar_candle_aceita_o_pavio_roteirizado_e_recusa_faixa_impossivel():
+    """O pavio que o ticker nao viu precisa existir no candle para o backtest le-lo.
+
+    A faixa sintetica (+-0,2%) nao permitia o cenario; uma faixa que nao contem
+    abertura e fechamento seria recusada pelo agente como candle impossivel, e o
+    cenario mediria o filtro -- o simulador recusa antes.
+    """
+    mercado = MercadoSimulado(timeframe="1d")
+    mercado.adicionar_par(SIMBOLO, FECHAMENTOS)
+    candle = mercado.fechar_candle(SIMBOLO, 50500, maxima=52000, minima=48000)
+    assert (candle.open, candle.high, candle.low, candle.close) == (
+        Decimal("50000"), Decimal("52000"), Decimal("48000"), Decimal("50500")
+    )
+    with pytest.raises(ValueError, match="nao contem"):
+        mercado.fechar_candle(SIMBOLO, 51000, maxima=50800)
+
+
+async def test_fechar_candle_so_move_o_ticker_quando_pedido():
+    """Fechamento e preco corrente sao separados de proposito (cenario 1)."""
+    mercado = MercadoSimulado(timeframe="1d")
+    mercado.adicionar_par(SIMBOLO, FECHAMENTOS)
+    mercado.fechar_candle(SIMBOLO, 51000)
+    assert mercado.preco(SIMBOLO) == FECHAMENTO_ANTERIOR
+    mercado.fechar_candle(SIMBOLO, 51200, preco=51300)
+    assert mercado.preco(SIMBOLO) == Decimal("51300")

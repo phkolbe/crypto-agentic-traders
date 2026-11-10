@@ -11,10 +11,11 @@ mostra -- e falhava no motor anterior.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 import pytest
+from structlog.testing import capture_logs
 
 from crypto_traders.backtest.engine import BacktestEngine
 from crypto_traders.backtest.portfolio import PortfolioBacktestEngine
@@ -440,3 +441,102 @@ class TestCooldownNoFechamento:
         r = await carteira([compra, dobro], risco).run({"BTC/USDT": plano("BTC/USDT", 6)})
         assert len(compras(r)) == 1
         assert any("cooldown" in m for m in r.rejection_reasons)
+
+
+# ---------------------------------------------------------------------------
+# 7. A saida de protecao nao contamina o preco da compra seguinte
+# ---------------------------------------------------------------------------
+class TestRecompraDepoisDoStopNoFechamento:
+    """O `PaperBroker` guarda o preco da ultima ordem como preco do ativo.
+
+    A venda do stop sai como LIMIT no nivel calculado (94,88 com stop em 95), e
+    o broker passava a "cotar" o BTC ali. Uma recompra no fechamento do MESMO
+    candle (93) -- possivel desde que o cooldown passou a ser medido no
+    fechamento -- era preenchida a 94,88: o risco dimensionava a 93 e a ordem
+    pagava 2% a mais. Em producao a compra sai no ticker do fechamento.
+    """
+
+    async def test_na_carteira_a_recompra_preenche_no_fechamento(self):
+        compra, recompra, risco, candles = TestCooldownNoFechamento()._cenario()
+        r = await carteira([compra, recompra], risco).run({"BTC/USDT": candles})
+        assert r.exits["stop"] == 1
+        precos = [t.price for t in r.trades if t.side == "buy"]
+        assert precos == [Decimal("100"), Decimal("93")], precos
+
+    async def test_no_motor_de_um_par_tambem(self):
+        _, _, risco, candles = TestCooldownNoFechamento()._cenario()
+        quando = (INICIO + 3 * DIA, INICIO + 4 * DIA)
+
+        class CompraERecompra(Roteiro):
+            def evaluate(self, market):
+                if market.frame.index[-1].to_pydatetime() not in quando:
+                    return None
+                return Signal(
+                    exchange=market.exchange, symbol=market.symbol,
+                    timeframe=market.timeframe, strategy=self.name,
+                    direction=SignalDirection.LONG, confidence=0.9, reason="t",
+                    reference_price=Decimal(str(market.frame["close"].iloc[-1])),
+                )
+
+        motor = BacktestEngine(
+            CompraERecompra({}), risco, quote_currency="USDT",
+            initial_balance=Decimal("1000"), fee_pct=Decimal("0"),
+            slippage_pct=Decimal("0"), lookback=50,
+        )
+        r = await motor.run(candles)
+        assert r.exits["stop"] == 1
+        precos = [t.price for t in r.trades if t.side == "buy"]
+        assert precos == [Decimal("100"), Decimal("93")], precos
+
+
+# ---------------------------------------------------------------------------
+# 8. Vies de sobrevivencia declarado
+# ---------------------------------------------------------------------------
+class TestViesDeSobrevivencia:
+    """A lista de pares e a de HOJE; o motor nao sabe que pares existiam antes.
+
+    Par deslistado ou que perdeu liquidez no periodo nao esta na lista, e a
+    carteira medida so tem sobreviventes -- o numero sai otimista num valor que
+    o motor nao tem como calcular. O minimo e o resultado dizer isso.
+    """
+
+    PARES = ("BTC/USDT", "ETH/USDT")
+
+    def _candles(self):
+        return {par: plano(par, 13) for par in self.PARES}
+
+    def _motor(self, **extra):
+        return carteira([Roteiro({})], limites(list(self.PARES)), **extra)
+
+    async def test_lista_da_configuracao_atual_leva_o_aviso_no_resultado_e_no_log(self):
+        with capture_logs() as logs:
+            r = await self._motor().run(self._candles())
+        assert r.vies_de_sobrevivencia is not None
+        assert "sobrevivencia" in r.vies_de_sobrevivencia
+        avisos = [e for e in logs if e["event"] == "portfolio_backtest.vies_de_sobrevivencia"]
+        assert len(avisos) == 1 and avisos[0]["log_level"] == "warning"
+
+    async def test_lista_fixada_antes_do_inicio_tira_o_aviso(self):
+        """Universo historico fornecido por quem chama (ex.: os pares de 01/01)."""
+        with capture_logs() as logs:
+            r = await self._motor(universo_fixado_em=date(2026, 1, 1)).run(self._candles())
+        assert r.vies_de_sobrevivencia is None
+        assert not [e for e in logs if e["event"] == "portfolio_backtest.vies_de_sobrevivencia"]
+
+    async def test_lista_fixada_depois_do_inicio_mantem_o_aviso(self):
+        """Fixar a lista no meio da janela ja escolhe pelos que sobreviveram ate la."""
+        r = await self._motor(universo_fixado_em=date(2026, 1, 8)).run(self._candles())
+        assert r.vies_de_sobrevivencia is not None
+        assert "2026-01-08" in r.vies_de_sobrevivencia
+
+    async def test_par_cuja_serie_acaba_antes_do_fim_e_declarado(self):
+        """O par deslistado de uma lista historica: a serie dele para no meio.
+
+        O motor nao inventa o preco da deslistagem: o que sobrar nele fica no
+        ultimo fechamento ate o fim. O resultado tem de dizer quem parou e quando.
+        """
+        candles = {"BTC/USDT": plano("BTC/USDT", 13), "LUNA/USDT": plano("LUNA/USDT", 8)}
+        with capture_logs() as logs:
+            r = await carteira([Roteiro({})], limites(list(candles))).run(candles)
+        assert r.pares_encerrados == {"LUNA/USDT": INICIO + 7 * DIA}
+        assert [e for e in logs if e["event"] == "portfolio_backtest.pares_encerrados"]

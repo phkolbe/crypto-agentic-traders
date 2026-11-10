@@ -131,7 +131,14 @@ class TestMetrics:
 
         engine = make_engine(risk_limits)
         result = await engine.run(make_candles(oscillating(200)))
-        json.dumps(result.summary())  # nao pode levantar
+        # Ida e volta, e nao so "nao levanta": um Decimal ou datetime que
+        # escapasse da conversao levantaria aqui, e um numero convertido em
+        # texto passaria no `dumps` e chegaria errado a tela.
+        lido = json.loads(json.dumps(result.summary()))
+        assert lido["trades"] == len(result.trades)
+        assert lido["final_value"] == pytest.approx(float(result.final_value))
+        assert lido["total_return_pct"] == pytest.approx(result.total_return_pct)
+        assert lido["start"] == result.start.isoformat()
 
     async def test_win_rate_only_counts_closed_trades(self, risk_limits):
         """Compra em aberto nao tem resultado ainda e nao pode entrar na conta."""

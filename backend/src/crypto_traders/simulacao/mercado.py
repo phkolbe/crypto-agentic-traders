@@ -5,7 +5,9 @@ em producao --, entao nada no caminho do preco e substituido: filtro de candle
 fechado, chave de preco, ticker corrente e fallback para o fechamento rodam como
 rodam contra a Binance.
 
-Os candles sao ancorados no relogio REAL. `_closed_confiaveis` recusa candle cujo
+Os candles sao ancorados no relogio REAL, lido uma vez na criacao do simulador
+(ver `__init__`: relido a cada consulta, a virada do periodo no meio do cenario
+movia a serie inteira). `_closed_confiaveis` recusa candle cujo
 periodo ainda nao terminou pelo relogio da maquina, entao uma serie com datas
 inventadas no passado distante ou no futuro testaria o filtro, nao o cenario. A
 serie termina no periodo anterior ao corrente; os ultimos periodos ficam
@@ -42,6 +44,8 @@ class _Serie:
 
     def __init__(self, fechamentos: list[Decimal], reservados: int) -> None:
         self.fechamentos: list[Decimal | None] = [*fechamentos, *([None] * reservados)]
+        #: (maxima, minima) roteirizadas do periodo; None = a faixa sintetica.
+        self.extremos: list[tuple[Decimal, Decimal] | None] = [None] * len(self.fechamentos)
         self.visiveis = len(fechamentos)
 
 
@@ -60,6 +64,13 @@ class MercadoSimulado(MarketDataSource):
         self.timeframe = timeframe
         self.exchange = exchange
         self._duracao = timedelta(seconds=timeframe_seconds(timeframe))
+        # O periodo corrente e lido UMA vez, na criacao. Relido a cada consulta,
+        # um cenario que cruzasse a virada (21:00 de Brasilia em 1d; a cada 15
+        # min em 15m) via todos os `open_time` andarem um periodo no meio do
+        # roteiro -- um candle "novo" que ninguem fechou. Ancorado, a serie
+        # continua toda fechada pelo relogio real depois da virada, e o candle
+        # em formacao (marcado aberto) continua descartado pelo agente.
+        self._ancora = self._periodo_corrente_real()
         self._reservados = reservados
         self._series: dict[str, _Serie] = {}
         self._precos: dict[str, Decimal] = {}
@@ -86,15 +97,48 @@ class MercadoSimulado(MarketDataSource):
         self._series[symbol] = _Serie(valores, self._reservados)
         self._precos[symbol] = _dec(preco) if preco is not None else valores[-1]
 
-    def fechar_candle(self, symbol: str, fechamento: Decimal | str | float | int) -> Candle:
-        """Fecha o proximo periodo reservado com `fechamento` e o torna visivel."""
+    def fechar_candle(
+        self,
+        symbol: str,
+        fechamento: Decimal | str | float | int,
+        *,
+        maxima: Decimal | str | float | int | None = None,
+        minima: Decimal | str | float | int | None = None,
+        preco: Decimal | str | float | int | None = None,
+    ) -> Candle:
+        """Fecha o proximo periodo reservado com `fechamento` e o torna visivel.
+
+        **O ticker nao se move**, salvo `preco`: o preco corrente e o fechamento
+        sao coisas diferentes de proposito (a compra executa no ticker, nao no
+        fechamento da vespera). Fechar a 110 sem mover o ticker deixa o sinal com
+        referencia 110 e o dimensionamento (no preco corrente) no ticker antigo.
+
+        `maxima`/`minima` roteirizam o pavio do periodo. Sem elas a faixa e
+        sintetica (+-0,2% da abertura e do fechamento), estreita demais para um
+        pavio que o ticker nao viu -- o que o backtest le e a producao nao.
+        """
         serie = self._series[symbol]
         if serie.visiveis >= len(serie.fechamentos):
             raise RuntimeError(
                 f"{symbol}: periodos reservados esgotados; aumente `reservados`"
             )
-        serie.fechamentos[serie.visiveis] = _dec(fechamento)
+        valor = _dec(fechamento)
+        if maxima is not None or minima is not None:
+            abertura = serie.fechamentos[serie.visiveis - 1] or valor
+            alta = _dec(maxima) if maxima is not None else max(abertura, valor)
+            baixa = _dec(minima) if minima is not None else min(abertura, valor)
+            if alta < max(abertura, valor) or baixa > min(abertura, valor):
+                # O agente recusaria o candle como impossivel, e o cenario
+                # mediria o filtro em vez do que pretendia.
+                raise ValueError(
+                    f"{symbol}: faixa [{baixa}, {alta}] nao contem abertura {abertura} "
+                    f"e fechamento {valor}"
+                )
+            serie.extremos[serie.visiveis] = (alta, baixa)
+        serie.fechamentos[serie.visiveis] = valor
         serie.visiveis += 1
+        if preco is not None:
+            self.definir_preco(symbol, preco)
         return self._candles_fechados(symbol)[-1]
 
     def definir_preco(self, symbol: str, preco: Decimal | str | float | int) -> None:
@@ -172,11 +216,15 @@ class MercadoSimulado(MarketDataSource):
             self.falhas_de_ticker += 1
             raise TickerIndisponivel("ticker indisponivel (falha roteirizada)")
 
-    def _periodo_corrente(self) -> datetime:
+    def _periodo_corrente_real(self) -> datetime:
         agora = datetime.now(UTC)
         segundos = int(self._duracao.total_seconds())
         inicio = int(agora.timestamp()) // segundos * segundos
         return datetime.fromtimestamp(inicio, tz=UTC)
+
+    def _periodo_corrente(self) -> datetime:
+        """O periodo corrente de quando o simulador foi criado (ver `__init__`)."""
+        return self._ancora
 
     def _candles_fechados(self, symbol: str) -> list[Candle]:
         serie = self._series[symbol]
@@ -191,7 +239,13 @@ class MercadoSimulado(MarketDataSource):
             assert fechamento is not None
             abertura = anterior if anterior is not None else fechamento
             candles.append(
-                self._candle(symbol, primeiro + indice * self._duracao, abertura, fechamento)
+                self._candle(
+                    symbol,
+                    primeiro + indice * self._duracao,
+                    abertura,
+                    fechamento,
+                    extremos=serie.extremos[indice],
+                )
             )
             anterior = fechamento
         return candles
@@ -209,17 +263,24 @@ class MercadoSimulado(MarketDataSource):
         fechamento: Decimal,
         *,
         fechado: bool = True,
+        extremos: tuple[Decimal, Decimal] | None = None,
     ) -> Candle:
         # Faixa coerente por construcao: open e close DENTRO de [low, high],
-        # senao o agente recusa o candle como impossivel.
+        # senao o agente recusa o candle como impossivel. A roteirizada ja foi
+        # conferida em `fechar_candle`.
+        if extremos is not None:
+            alta, baixa = extremos
+        else:
+            alta = max(abertura, fechamento) * Decimal("1.002")
+            baixa = min(abertura, fechamento) * Decimal("0.998")
         return Candle(
             exchange=self.exchange,
             symbol=symbol,
             timeframe=self.timeframe,
             open_time=abertura_em,
             open=abertura,
-            high=max(abertura, fechamento) * Decimal("1.002"),
-            low=min(abertura, fechamento) * Decimal("0.998"),
+            high=alta,
+            low=baixa,
             close=fechamento,
             volume=Decimal("100"),
             closed=fechado,

@@ -33,10 +33,33 @@ producao em cada ponto em que ela decide algo (auditoria de 09/11/2026):
   candle).
 - **Periodo e comprar-e-segurar** a partir do primeiro instante operavel.
 
-O que ele NAO sabe: quais pares existiam em cada data. Ele recebe o universo de
-quem chama (hoje, os pares liquidos de HOJE) -- par deslistado ou que perdeu
-liquidez no periodo nao entra, e isso e vies de sobrevivencia. Par que comeca
-depois entra quando completa o aquecimento e sai declarado em `pares_tardios`.
+**Vies de sobrevivencia.** O motor nao sabe quais pares existiam em cada data:
+ele recebe o universo de quem chama, e hoje esse universo e a lista de HOJE
+(`SYMBOLS`, ou os pares liquidos que a descoberta acha agora). Par deslistado ou
+que perdeu liquidez no periodo nao entra, e a carteira medida so tem
+sobreviventes -- retorno e comprar-e-segurar tendem a sair otimistas. Sem dado
+historico de listagem nao ha reconstrucao; o que o dado publico permite, o
+motor faz:
+
+- o primeiro candle de cada par marca a entrada dele: par listado no meio da
+  janela comeca a operar quando completa o aquecimento e fica declarado em
+  `pares_tardios`, fora do comprar-e-segurar;
+- par cuja serie ACABA antes do fim (deslistado, numa lista historica) fica
+  declarado em `pares_encerrados`. O que sobrar nele fica avaliado no ultimo
+  fechamento ate o fim -- o motor nao inventa o preco da deslistagem;
+- sem `universo_fixado_em` (ou com uma data depois do inicio da janela), o
+  resultado leva `vies_de_sobrevivencia` e o log
+  `portfolio_backtest.vies_de_sobrevivencia` diz o mesmo.
+
+Como medir o efeito, quando houver a lista de uma data passada (o sistema nao
+guarda historico de universo; quem tiver a lista fornece): (1) fixe os pares
+negociaveis numa data D anterior a janela -- inclusive os que depois sairam --,
+com os candles que existirem deles; (2) rode a MESMA janela e configuracao com
+essa lista (`universo_fixado_em=D`) e com a lista de hoje; (3) a diferenca de
+`total_return_pct` e de `buy_and_hold_pct` entre as duas execucoes e a
+estimativa do vies, e `pares_encerrados` diz quanto dela veio de pares que
+pararam no meio. Uma unica janela e uma medida, nao uma lei: repetir em datas D
+diferentes.
 """
 
 from __future__ import annotations
@@ -138,6 +161,21 @@ class PortfolioBacktestResult:
     inteiro e nao entram no comprar-e-segurar.
     """
 
+    pares_encerrados: dict[str, datetime] = field(default_factory=dict)
+    """Par cuja serie acaba antes do fim da janela, com o ultimo candle dele.
+
+    Numa lista historica e o par deslistado: o que sobrar nele fica avaliado no
+    ultimo fechamento ate o fim, porque o motor nao inventa o preco da saida.
+    """
+
+    vies_de_sobrevivencia: str | None = None
+    """Aviso de vies de sobrevivencia, ou None quando o universo e historico.
+
+    Preenchido quando a lista de pares nao foi fixada numa data ate o inicio da
+    janela (`universo_fixado_em`): a carteira medida so tem os pares que
+    sobreviveram ate a data da lista. Ver o docstring do modulo.
+    """
+
     @property
     def buy_and_hold_pct(self) -> float:
         """Comprar e segurar em partes iguais nos mesmos pares, no mesmo periodo.
@@ -237,8 +275,13 @@ class PortfolioBacktestEngine:
         mvrv_series: list[tuple[date, float]] | None = None,
         signal_batch_window_seconds: float = JANELA_DE_LOTE_DA_PRODUCAO,
         folgas: FolgasDeProtecao = FOLGAS_PADRAO,
+        universo_fixado_em: date | None = None,
     ) -> None:
         self.strategies = strategies
+        # Data em que a lista de pares de `run` foi fixada. None = a lista e a
+        # da configuracao atual (o caso de hoje), e o resultado leva o aviso de
+        # vies de sobrevivencia; so uma data ate o inicio da janela o tira.
+        self.universo_fixado_em = universo_fixado_em
         # Espelha `TradingSettings.signal_batch_window_seconds`: 0 decide cada
         # sinal sozinho, por ordem de chegada (o padrao de producao); acima de 0,
         # o instante inteiro vira um lote decidido por confianca. Passe o valor
@@ -352,6 +395,29 @@ class PortfolioBacktestEngine:
                 pares={s: m.isoformat() for s, m in tardios.items()},
                 detail="entraram depois do inicio; fora do comprar-e-segurar",
             )
+        # O outro lado da mesma linha do tempo: serie que termina antes do fim.
+        encerrados = {
+            symbol: frame.index[-1].to_pydatetime()
+            for symbol, frame in frames.items()
+            if frame.index[-1] < timeline[-1]
+        }
+        if encerrados:
+            log.warning(
+                "portfolio_backtest.pares_encerrados",
+                pares={s: m.isoformat() for s, m in encerrados.items()},
+                detail="a serie acaba antes do fim; o que sobrar fica no ultimo fechamento",
+            )
+        vies = self._aviso_de_sobrevivencia(inicio)
+        if vies is not None:
+            log.warning(
+                "portfolio_backtest.vies_de_sobrevivencia",
+                universo_fixado_em=(
+                    self.universo_fixado_em.isoformat() if self.universo_fixado_em else None
+                ),
+                inicio=inicio.isoformat(),
+                pares=len(frames),
+                detail=vies,
+            )
 
         broker = PaperBroker(
             quote_currency=self.quote_currency,
@@ -369,6 +435,8 @@ class PortfolioBacktestEngine:
             symbols=sorted(frames),
             pares_descartados=descartados,
             pares_tardios=tardios,
+            pares_encerrados=encerrados,
+            vies_de_sobrevivencia=vies,
         )
 
         # Comprar-e-segurar numa data COMUM: o fechamento em `inicio`, o mesmo
@@ -471,6 +539,27 @@ class PortfolioBacktestEngine:
         )
         return result
 
+    def _aviso_de_sobrevivencia(self, inicio: datetime) -> str | None:
+        """Texto do aviso de vies de sobrevivencia, ou None com universo historico.
+
+        Uma lista fixada DEPOIS do inicio da janela ainda escolhe pelos pares que
+        sobreviveram ate a data dela, entao so uma data ate o inicio tira o aviso.
+        """
+        fixado = self.universo_fixado_em
+        if fixado is not None and fixado <= inicio.date():
+            return None
+        origem = (
+            "a da configuracao atual (SYMBOLS ou a descoberta de hoje)"
+            if fixado is None
+            else f"fixada em {fixado.isoformat()}, depois do inicio da janela"
+        )
+        return (
+            f"vies de sobrevivencia: a lista de pares e {origem}, nao a que existia "
+            f"em {inicio.date().isoformat()}. Par deslistado ou que perdeu liquidez no "
+            "periodo nao entra, e retorno e comprar-e-segurar tendem a sair otimistas. "
+            "Como medir: docstring de crypto_traders.backtest.portfolio."
+        )
+
     async def _apply_protective_exits(
         self, frames, now, broker, cost_basis, protection, last_order_at, result, order_seq
     ) -> int:
@@ -529,6 +618,11 @@ class PortfolioBacktestEngine:
                 strategy="protecao",
             )
             order = await preenchimento(broker.place_order(pedido), pedido)
+            # O `PaperBroker` passa a cotar o ativo no preco da ultima ordem (o
+            # nivel do stop). Uma recompra no fechamento deste candle -- outra
+            # estrategia, cooldown ja vencido -- seria preenchida ali, e nao no
+            # fechamento em que o risco a dimensionou. Devolve o fechamento.
+            broker.set_price(base, Decimal(str(frame.at[now, "close"])))
             if order.status is not OrderStatus.FILLED:
                 continue
 

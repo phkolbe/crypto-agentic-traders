@@ -11,14 +11,19 @@ suite gravava trades e `audit_log` -- append-only -- no historico real, e o
 
 from __future__ import annotations
 
+import os
+
 import pytest
 from conftest import BancoDoEnsaioTocado
 from helpers import (
     LIBERACAO_DO_BANCO_DO_SISTEMA,
     e_o_banco_do_sistema,
+    isolar_do_ambiente,
     recusa_do_banco_do_sistema,
+    variaveis_do_sistema,
 )
 
+from crypto_traders.config import Settings
 from crypto_traders.db import session as db_session
 
 DO_SISTEMA = [
@@ -90,3 +95,54 @@ def test_o_gancho_da_suite_recusa_antes_de_coletar(monkeypatch):
 
     with pytest.raises(pytest.UsageError, match="Postgres do sistema"):
         conftest.pytest_configure(None)
+
+
+# ---------------------------------------------------------------------------
+# O ambiente do shell nao chega aos testes
+# ---------------------------------------------------------------------------
+def test_reconhece_as_variaveis_que_settings_leria():
+    """Campo e campo aninhado (`__`) saem; o que nao e campo de `Settings` fica."""
+    ambiente = {
+        "DATABASE_URL": "postgresql://x@y/z",
+        "TRADING_MODE": "live",
+        "live_trading_confirmed": "true",
+        "BINANCE__API_KEY": "k",
+        "BINANCE_TESTNET__API_SECRET": "s",
+        "SMTP_PASSWORD": "p",
+        "API_KEY": "le-se sozinho: ExchangeCredentials e BaseSettings",
+        "POSTGRES_TEST_URL": "postgresql://descartavel",
+        "PATH": "/usr/bin",
+        "BINANCE_QUALQUER": "nao e campo nem aninhado",
+    }
+    assert sorted(variaveis_do_sistema(ambiente)) == sorted(
+        [
+            "DATABASE_URL",
+            "TRADING_MODE",
+            "live_trading_confirmed",
+            "BINANCE__API_KEY",
+            "BINANCE_TESTNET__API_SECRET",
+            "SMTP_PASSWORD",
+            "API_KEY",
+        ]
+    )
+
+
+def test_settings_do_teste_nao_le_o_modo_nem_as_chaves_do_shell(monkeypatch):
+    """`isolate_from_dotenv` desligava so o `.env`: o `os.environ` passava.
+
+    Com `TRADING_MODE=live` e as chaves da Binance exportados no shell, todo
+    `Settings()` da suite nascia em live com as chaves da maquina. A fixture
+    autouse roda ANTES do teste; aqui o corpo dela e chamado de novo, depois de
+    sujar o ambiente, para provar que limpa o que o shell deixou.
+    """
+    monkeypatch.setenv("TRADING_MODE", "live")
+    monkeypatch.setenv("BINANCE__API_KEY", "chave-do-shell")
+    monkeypatch.setenv("API_SECRET", "segredo-sem-prefixo")
+    monkeypatch.setenv("POSTGRES_TEST_URL", "postgresql+asyncpg://p:p@127.0.0.1:55432/x")
+    isolar_do_ambiente(monkeypatch)
+
+    cfg = Settings()
+    assert str(cfg.trading_mode) == "dry_run"
+    assert not cfg.binance.api_key
+    assert not cfg.binance.api_secret and not cfg.binance_testnet.api_secret
+    assert os.environ["POSTGRES_TEST_URL"].endswith("/x")

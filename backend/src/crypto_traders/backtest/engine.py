@@ -295,6 +295,10 @@ class BacktestEngine:
                         exit_order = await preenchimento(
                             broker.place_order(pedido_de_saida), pedido_de_saida
                         )
+                        # O papel passa a cotar o ativo no nivel do stop; a
+                        # recompra deste fechamento sairia ali. Ver o motor de
+                        # carteira.
+                        broker.set_price(base, price)
                         if exit_order.status is OrderStatus.FILLED:
                             preco = exit_order.average_price or saida
                             medio = cost_basis / held_now if held_now > 0 else Decimal(0)
