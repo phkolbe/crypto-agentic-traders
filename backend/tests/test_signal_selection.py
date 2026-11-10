@@ -147,13 +147,20 @@ class TestClosesGoFirst:
 
 class TestStateSimulation:
     def test_cash_is_consumed_between_signals_of_the_same_batch(self, engine):
-        """Sem simular a aprovação, dois sinais gastariam o mesmo dinheiro."""
+        """Sem simular a aprovação, dois sinais gastariam o mesmo dinheiro.
+
+        A versão anterior pedia `gasto <= 120` com caixa 120 e 10% por ordem:
+        cada ordem vale no máximo 12, duas no máximo 24 -- passava sem simulação
+        nenhuma. Aqui o caixa (15) cabe uma ordem de 12 e não duas, e sobra vaga
+        (2 posições) para as duas: só o caixa simulado separa uma da outra.
+        """
         batch = [sinal("A/USDT", 0.95), sinal("B/USDT", 0.90)]
-        apertado = estado(total="120", cash="120")
+        apertado = estado(total="120", cash="15")
         decisoes = engine.evaluate_batch(batch, apertado, NOW)
         aprovadas = [a for _, a in decisoes if a.decision is RiskDecision.APPROVED]
         gasto = sum((a.approved_notional or Decimal(0)) for a in aprovadas)
-        assert gasto <= Decimal("120")
+        assert len(aprovadas) == 1
+        assert gasto <= Decimal("15")
 
     def test_caller_state_is_not_mutated(self, engine):
         """O retrato do portfólio pertence a quem chamou."""
