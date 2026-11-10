@@ -157,7 +157,7 @@ export default function App() {
         ))}
 
         <div className="sidebar-rodape">
-          <div className="row-tight sidebar-estado" title={estado}>
+          <div className="row-tight sidebar-estado" title={estado} role="status">
             <span className={`dot ${connected ? 'dot-live' : 'dot-off'}`} />
             <span className="nav-label">{estado}</span>
           </div>

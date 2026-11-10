@@ -8,6 +8,8 @@ operacoes pela interface que podem causar estrago real.
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 import json
 import math
 import time
@@ -127,6 +129,26 @@ class TestPortfolio:
         body = (await client.get("/api/portfolio")).json()
         assert body["change_since_start_pct"] == pytest.approx(0.10)
 
+    async def test_variacao_de_7d_nao_compara_com_outro_modo(self, client, settings):
+        """api.md (low): o "desde o inicio" ja filtrava o modo, o 24h e o 7d nao.
+        Dois dias depois de ligar o live, o 7d comparava 1.100 reais com os 5.000
+        de papel do ensaio: -78%, uma perda que nao existiu."""
+        agora = datetime.now(UTC)
+        async with session_scope(settings) as session:
+            repo = PortfolioSnapshotRepository(session)
+            for valor, idade, modo in (
+                ("5000", timedelta(days=8), "dry_run"),
+                ("1000", timedelta(days=2), "live"),
+                ("1100", timedelta(minutes=1), "live"),
+            ):
+                retrato = _snapshot(valor).model_copy(update={"timestamp": agora - idade})
+                await repo.save(retrato, modo)
+
+        body = (await client.get("/api/portfolio")).json()
+        # Sem retrato do live de 7 dias atras: nao ha comparacao, e nao -78%.
+        assert body["change_7d_pct"] is None, body
+        assert body["change_24h_pct"] == pytest.approx(0.10), body
+
 
 class TestNotificacoesDeixamRastro:
     async def test_trocar_o_destinatario_vai_para_a_auditoria(self, client):
@@ -140,6 +162,37 @@ class TestNotificacoesDeixamRastro:
         entradas = (await client.get("/api/audit?limit=5")).json()
         entrada = next(e for e in entradas if e["action"] == "notification_config_updated")
         assert "5511988887777" in json.dumps(entrada)
+
+    @pytest.mark.parametrize(
+        "corpo",
+        [
+            {"email_to": "paulo.exemplo.com"},
+            {"email_to": "paulo@exemplo"},
+            {"email_to": "paulo @exemplo.com"},
+            {"whatsapp_to": "11999"},
+            {"whatsapp_to": "551199999888877776"},
+            {"whatsapp_to": "55 11 9999x-8888"},
+        ],
+    )
+    async def test_destinatario_que_nao_recebe_nada_e_recusado(self, client, corpo):
+        """api.md (low): sem validacao de formato, um e-mail sem `@` ou um numero
+        sem DDD gravava com 200, e o alerta de stop ia para lugar nenhum com o
+        canal "ligado" na tela."""
+        resposta = await client.put("/api/notifications/config", json=corpo)
+        assert resposta.status_code == 422, resposta.text
+
+    @pytest.mark.parametrize(
+        "corpo",
+        [
+            {"email_to": "paulo@exemplo.com.br"},
+            {"whatsapp_to": "5511999998888"},
+            # O canal tira o que nao e digito (`channels._only_digits`).
+            {"whatsapp_to": "+55 (11) 99999-8888"},
+        ],
+    )
+    async def test_destinatario_valido_passa(self, client, corpo):
+        resposta = await client.put("/api/notifications/config", json=corpo)
+        assert resposta.status_code == 200, resposta.text
 
 
 class TestTrades:
@@ -226,6 +279,81 @@ class TestTrades:
         """Simulacao nunca pode ser confundida com dinheiro real no CSV."""
         text = (await client.get("/api/trades/export")).text
         assert "dry_run" in text
+
+
+class TestExportacaoEFuso:
+    """api.md (low): exportacao com formula injetavel e corte silencioso, e
+    `start`/`end` com fuso comparados como hora local."""
+
+    @staticmethod
+    async def _trade(settings, *, quando: datetime, notes: str | None = None) -> None:
+        async with session_scope(settings) as session:
+            await TradeRepository(session).record(
+                executed_at=quando,
+                exchange="binance", symbol="BTC/USDT", side=str(Side.BUY),
+                quantity=Decimal("0.001"), price=Decimal("50000"),
+                origin=TradeOrigin.MANUAL, mode="manual", notes=notes,
+            )
+
+    @pytest.mark.parametrize(
+        "nota", ['=HYPERLINK("http://x","ok")', "+1+1", "-2+3", "@SUM(A1)"]
+    )
+    async def test_observacao_nao_vira_formula_na_planilha(self, client, settings, nota):
+        """O Excel executa celula que comeca com = + - @: uma observacao digitada
+        (ou colada) no lancamento manual virava formula no CSV fiscal."""
+        await self._trade(settings, quando=datetime.now(UTC) - timedelta(hours=1), notes=nota)
+
+        texto = (await client.get("/api/trades/export")).text.lstrip("﻿")
+        linhas = list(csv.reader(io.StringIO(texto), delimiter=";"))
+        celula = linhas[1][-1]
+        assert celula == "'" + nota, celula
+
+    async def test_numero_negativo_continua_numero(self, client, settings):
+        """So o texto livre e protegido: o PnL negativo nao pode ganhar aspas."""
+        async with session_scope(settings) as session:
+            await TradeRepository(session).record(
+                executed_at=datetime.now(UTC), exchange="binance", symbol="BTC/USDT",
+                side=str(Side.SELL), quantity=Decimal("0.001"), price=Decimal("50000"),
+                origin=TradeOrigin.AGENT, strategy="ma_crossover", mode="dry_run",
+                realized_pnl=Decimal("-1.25"),
+            )
+        linhas = (await client.get("/api/trades/export")).text.splitlines()
+        assert linhas[1].split(";")[12] == "-1.25", linhas[1]
+
+    async def test_acima_do_teto_recusa_em_vez_de_cortar(self, client, settings, monkeypatch):
+        """O CSV cortava em 100.000 linhas sem aviso: uma apuracao fiscal com as
+        negociacoes mais antigas faltando, e nada dizendo que faltavam."""
+        from crypto_traders.api.routes import trades as rota
+
+        monkeypatch.setattr(rota, "LIMITE_DA_EXPORTACAO", 2)
+        agora = datetime.now(UTC)
+        for horas in (1, 2, 3):
+            await self._trade(settings, quando=agora - timedelta(hours=horas))
+
+        resposta = await client.get("/api/trades/export")
+        assert resposta.status_code == 422, resposta.text
+        assert "start" in resposta.json()["detail"]
+
+        # Com um periodo que cabe, exporta.
+        inicio = (agora - timedelta(hours=2, minutes=30)).isoformat()
+        parcial = await client.get("/api/trades/export", params={"start": inicio})
+        assert parcial.status_code == 200, parcial.text
+        assert len(parcial.text.splitlines()) == 3
+
+    async def test_inicio_com_fuso_e_comparado_em_utc(self, client, settings):
+        """`start=10:00-03:00` e 13:00 UTC. Comparado como hora de parede, o
+        trade das 12:00 UTC entrava num filtro que comeca depois dele."""
+        await self._trade(settings, quando=datetime(2026, 11, 9, 12, 0, tzinfo=UTC))
+
+        corpo = (
+            await client.get("/api/trades", params={"start": "2026-11-09T10:00:00-03:00"})
+        ).json()
+        assert corpo["total"] == 0, corpo
+
+        corpo = (
+            await client.get("/api/trades", params={"start": "2026-11-09T08:30:00-03:00"})
+        ).json()
+        assert corpo["total"] == 1, corpo
 
 
 def _lancamento(**campos) -> dict:
@@ -1520,6 +1648,61 @@ class TestResettingTheBreakerIsNotOneClick:
         assert resposta.status_code == 200, resposta.text
         assert resposta.json()["circuit_breaker_active"] is False
         assert orchestrator.risk_manager.circuit_breaker_active is False
+
+
+class TestRespostaReleOEstadoEmVezDeLiterais:
+    """api.md (low): authorize e reset respondiam com valores fixos
+    (`unauthorized_value=0`, `circuit_breaker_active=False`) em vez de reler o
+    estado -- o padrao "200 com estado que nao existiu"."""
+
+    async def test_deposito_no_meio_do_authorize_aparece_como_nao_autorizado(
+        self, orquestrado
+    ):
+        http, orchestrator, _ = orquestrado
+        await TestAuthorizingCapitalIsNotOneClick._com_portao(
+            http, orchestrator, portao="29.29", patrimonio="5000"
+        )
+        risco = orchestrator.risk_manager
+        original = risco.authorize_all_capital
+
+        async def autoriza_e_chega_deposito(*args, **kwargs):
+            limites = await original(*args, **kwargs)
+            # Um retrato novo chega enquanto a rota ainda nao respondeu.
+            risco.observe_snapshot(_snapshot("5100"))
+            return limites
+
+        risco.authorize_all_capital = autoriza_e_chega_deposito
+
+        resposta = await http.post("/api/risk/capital/authorize", json={"confirm": True})
+
+        assert resposta.status_code == 200, resposta.text
+        corpo = resposta.json()
+        assert corpo["total_value"] == "5100", corpo
+        assert corpo["authorized_capital"] == "5000", corpo
+        # Era "0": a tela diria "tudo autorizado" com 100 esperando aval.
+        assert corpo["unauthorized_value"] == "100", corpo
+
+    async def test_trava_que_dispara_de_novo_no_rearme_aparece_na_resposta(
+        self, orquestrado
+    ):
+        http, orchestrator, _ = orquestrado
+        risco = orchestrator.risk_manager
+        await risco._trip("perda diaria de teste")
+
+        async def retoma_e_dispara_de_novo(*args, **kwargs):
+            # A perda que disparou continua alem do limite: o primeiro ciclo
+            # depois do rearme dispara a trava outra vez.
+            await risco._trip("perda diaria ainda acima do limite")
+            return False
+
+        orchestrator.resume_all = retoma_e_dispara_de_novo
+
+        resposta = await http.post("/api/risk/circuit-breaker/reset", json={"confirm": True})
+
+        assert resposta.status_code == 200, resposta.text
+        corpo = resposta.json()
+        assert corpo["circuit_breaker_active"] is True, corpo
+        assert corpo["circuit_breaker_reason"] == "perda diaria ainda acima do limite", corpo
 
 
 CONTRATO_DAS_TELAS = (

@@ -85,7 +85,21 @@ async def current_portfolio(session: AsyncSession = Depends(db_session)) -> Port
     current_value = Decimal(str(latest.total_value))
 
     async def change_since(delta: timedelta) -> float | None:
-        reference = await repository.value_at_or_before(now - delta)
+        # Do mesmo modo do retrato atual, como o "desde o inicio" abaixo. Era
+        # `value_at_or_before`, sem modo: dois dias depois de ligar o live, o 7d
+        # comparava o patrimonio real com o papel do ensaio (-78% medido em
+        # teste, uma perda que nao existiu). Sem retrato do modo naquela data,
+        # nao ha comparacao (`None`), e a tela mostra so a dica.
+        valor = (
+            await session.execute(
+                select(orm.PortfolioSnapshot.total_value)
+                .where(orm.PortfolioSnapshot.mode == latest.mode)
+                .where(orm.PortfolioSnapshot.timestamp <= now - delta)
+                .order_by(orm.PortfolioSnapshot.timestamp.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        reference = Decimal(str(valor)) if valor is not None else None
         if reference is None or reference <= 0:
             return None
         return float((current_value - reference) / reference)

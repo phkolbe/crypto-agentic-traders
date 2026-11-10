@@ -449,7 +449,8 @@ input:focus, select:focus, textarea:focus {
   box-shadow: 0 0 0 3px rgba(88, 166, 255, 0.16);
 }
 
-button {
+button,
+a.botao {
   background: var(--bg-subtle);
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
@@ -461,7 +462,8 @@ button {
   cursor: pointer;
   transition: background 0.12s, border-color 0.12s;
 }
-button:hover:not(:disabled) { border-color: var(--accent); }
+button:hover:not(:disabled), a.botao:hover { border-color: var(--accent); }
+a.botao { display: inline-block; text-decoration: none; }
 button:disabled { opacity: 0.45; cursor: not-allowed; }
 button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 button.primary:hover:not(:disabled) { filter: brightness(1.1); }
@@ -516,6 +518,7 @@ button.small { padding: 4px 9px; font-size: 12px; }
 .feed-item.order_result { border-left-color: var(--positive); }
 .feed-item.risk_assessment { border-left-color: var(--warning); }
 .feed-item.alert { border-left-color: var(--negative); }
+.feed-item.system { border-left-color: var(--neutral); }
 .feed-time { color: var(--text-faint); font-family: var(--mono); font-size: 11px; flex-shrink: 0; }
 
 .expandable { cursor: pointer; }

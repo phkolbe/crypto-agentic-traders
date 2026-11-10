@@ -28,15 +28,19 @@
 
 import {
   alteracoesDeNegocio,
+  alteracoesDeRisco,
   comparacaoAtravessaTroca,
   fronteiraDaMoeda,
   granularidadeDoIntervalo,
   money,
   multiplyDecimal,
+  rotuloDaPagina,
+  paginaValida,
   parDoEvento,
   percent,
   posicoesAbertas,
   price,
+  quantity,
   quoteOf,
   rodapeDoStat,
   rotuladorDeSerie,
@@ -47,6 +51,14 @@ import {
   toNumber,
   unidadeDoEvento,
 } from '../api/format'
+import {
+  chaveDoEvento,
+  descreverEvento,
+  horaDoFeed,
+  instanteDoEvento,
+  juntarAtividade,
+  type ItemDoFeed,
+} from '../api/atividade'
 import {
   alocacaoNoTempo,
   chaveDoGrupo,
@@ -72,6 +84,7 @@ import contratoDasMutacoes from './contrato-mutacoes.json'
 import {
   amostragemTipica,
   casasParaPasso,
+  resumoDaSerie,
   niceTicks,
   passosTemporais,
   tickIndices,
@@ -699,8 +712,15 @@ verifica(
 verifica('carteira vazia devolve lista vazia', posicoesAbertas([], 'USDC').length === 0)
 
 verifica('percent de nulo e travessao', percent(null) === '—')
-verifica('money de nulo com moeda', money(null, 'USDC') === '0,00 USDC', money(null, 'USDC'))
-verifica('money de string vazia', money('', 'USDC') === '0,00 USDC', money('', 'USDC'))
+// Estas duas exigiam "0,00 USDC" para nulo: era o defeito (telas.md, low
+// "toNumber transforma null em 0") — um zero que ninguem mediu, com unidade.
+verifica('money de nulo e travessao', money(null, 'USDC') === '—', money(null, 'USDC'))
+verifica('money de string vazia e travessao', money('', 'USDC') === '—', money('', 'USDC'))
+verifica(
+  'price e quantity de nulo ou lixo sao travessao',
+  price(null) === '—' && quantity(undefined) === '—' && price('abc' as never) === '—',
+)
+verifica('zero de verdade continua zero', money('0', 'USDC') === '0,00 USDC' && quantity('0') === '0,00')
 verifica('toNumber trata nulo como zero, sem NaN na tela', toNumber(null) === 0)
 verifica('toNumber trata texto invalido como zero', toNumber('abc' as never) === 0)
 
@@ -1527,6 +1547,52 @@ verifica(
   /onClick=\{pedirConfirmacao\}/.test(fonteConfiguracao),
 )
 
+// Risco tinha a mesma frase fixa para tudo (telas.md, low): apertar o stop e
+// esvaziar o "Capital autorizado" — que libera o patrimonio inteiro — pediam a
+// mesma confirmacao generica.
+const CAMPOS_DE_RISCO = [
+  { key: 'stop_loss_pct', label: 'Stop-loss' },
+  { key: 'authorized_capital', label: 'Capital autorizado a operar', nullable: true },
+  { key: 'max_order_notional', label: 'Valor máximo por ordem', nullable: true },
+]
+const BASE_DE_RISCO = { stop_loss_pct: '0.03', authorized_capital: '29.29', max_order_notional: '' }
+const liberarCapital = alteracoesDeRisco(CAMPOS_DE_RISCO, BASE_DE_RISCO, {
+  clear_authorized_capital: true,
+  stop_loss_pct: 0.05,
+})
+verifica(
+  'esvaziar o capital autorizado diz que libera o patrimonio e os depositos futuros',
+  liberarCapital.length === 2 &&
+    liberarCapital[0]!.campo === 'Capital autorizado a operar' &&
+    liberarCapital[0]!.antes === '29.29' &&
+    liberarCapital[0]!.depois === '(sem limite)' &&
+    /depósitos futuros/.test(liberarCapital[0]!.aviso ?? ''),
+  JSON.stringify(liberarCapital),
+)
+verifica(
+  'mudar o stop mostra antes e depois, sem aviso extra',
+  liberarCapital[1]!.campo === 'Stop-loss' &&
+    liberarCapital[1]!.antes === '0.03' &&
+    liberarCapital[1]!.depois === '0.05' &&
+    liberarCapital[1]!.aviso === undefined,
+  JSON.stringify(liberarCapital[1]),
+)
+const porTeto = alteracoesDeRisco(CAMPOS_DE_RISCO, BASE_DE_RISCO, { max_order_notional: '50' })
+verifica(
+  'campo que aceita vazio mostra "(sem limite)" como valor anterior',
+  porTeto[0]!.antes === '(sem limite)' && porTeto[0]!.depois === '50',
+  JSON.stringify(porTeto),
+)
+const fonteRisco = fonteSemComentarios('pages', 'RiskSettings.tsx')
+const salvarRisco = fonteRisco.match(/save\.mutate\([^)]*\)/g) ?? []
+verifica(
+  'Risco so envia o pedido confirmado, de onde o resumo saiu',
+  salvarRisco.length === 1 &&
+    salvarRisco[0] === 'save.mutate(pendente.pedido)' &&
+    /alteracoesDeRisco\(/.test(fonteRisco),
+  salvarRisco.join(', '),
+)
+
 // ===========================================================================
 bloco('Nenhuma tela de dados confunde falha com vazio')
 
@@ -1595,6 +1661,286 @@ const fonteLive = fonteSemComentarios('hooks', 'useLiveEvents.ts')
 verifica(
   'reconectar o WebSocket revalida as consultas',
   /onopen = \(\) => \{[\s\S]*?invalidateQueries\(\)[\s\S]*?\}/.test(fonteLive),
+)
+
+// ===========================================================================
+bloco('Feed de atividade: historico do banco + tempo real, sem repetir')
+
+// Payloads com a forma REAL das duas fontes: `GET /api/atividade`
+// (`routes/atividade.py`, conferida em `tests/test_atividade.py`) e a mensagem
+// do WebSocket (`routes/ws.py`, `model_dump(mode="json")` do modelo de dominio).
+const SINAL_ID = '6f1c2a9e0b7d4e3f8a5c1d2e3f4a5b6c'
+const DECISAO_ID = '0a1b2c3d4e5f60718293a4b5c6d7e8f9'
+const ORDEM_ID = 'ffeeddccbbaa99887766554433221100'
+const HISTORICO_REAL: ItemDoFeed[] = [
+  {
+    event: 'alert',
+    at: '2026-11-10T03:12:40.512000+00:00',
+    data: {
+      type: 'circuit_breaker',
+      title: 'Circuit breaker acionado',
+      reason: 'perda diaria de 5,2% acima do limite de 5%',
+      target: 'risk_config',
+      timestamp: '2026-11-10T03:12:40.512000+00:00',
+    },
+  },
+  {
+    event: 'order_result',
+    at: '2026-11-10T02:44:11.020000+00:00',
+    data: {
+      id: ORDEM_ID,
+      order_request_id: ORDEM_ID,
+      symbol: 'BTC/BRL',
+      side: 'buy',
+      status: 'filled',
+      filled_quantity: '0.00004',
+      average_price: '562340.12',
+      error: null,
+      timestamp: '2026-11-10T02:44:11.020000+00:00',
+    },
+  },
+  {
+    event: 'risk_assessment',
+    at: '2026-11-10T02:44:10.900000+00:00',
+    data: {
+      id: DECISAO_ID,
+      decision: 'approved',
+      reasons: [],
+      approved_notional: '22.50',
+      snapshot: { symbol: 'BTC/BRL' },
+    },
+  },
+  {
+    event: 'signal',
+    at: '2026-11-10T02:44:10.100000+00:00',
+    data: {
+      id: SINAL_ID,
+      created_at: '2026-11-10T02:44:10.100000',
+      symbol: 'BTC/BRL',
+      strategy: 'ma_crossover',
+      direction: 'long',
+      confidence: 0.71,
+      reason: 'media curta cruzou a longa',
+      reference_price: '562300.00',
+    },
+  },
+  {
+    event: 'system',
+    at: '2026-11-09T22:14:03.000000+00:00',
+    data: { type: 'system_started', actor: 'system', target: 'orchestrator', mode: 'dry_run' },
+  },
+]
+// O WebSocket entregou o mesmo sinal e o mesmo alerta (com 30 ms de diferenca do
+// registro no banco), mais tres retratos de portfolio.
+const chegada = new Date('2026-11-10T03:20:00Z')
+const AO_VIVO: ItemDoFeed[] = [
+  {
+    event: 'portfolio',
+    data: { timestamp: '2026-11-10T03:15:00+00:00', total_value: '29.29', unrealized_pnl: '0' },
+  },
+  {
+    event: 'alert',
+    data: {
+      type: 'circuit_breaker',
+      title: 'Circuit breaker acionado',
+      message: 'perda diaria de 5,2% acima do limite de 5%\n\nOs agentes de decisao foram pausados.',
+      reason: 'perda diaria de 5,2% acima do limite de 5%',
+      timestamp: '2026-11-10T03:12:40.542000+00:00',
+    },
+  },
+  {
+    event: 'portfolio',
+    data: { timestamp: '2026-11-10T03:14:00+00:00', total_value: '29.30', unrealized_pnl: '0' },
+  },
+  {
+    event: 'portfolio',
+    data: { timestamp: '2026-11-10T03:13:00+00:00', total_value: '29.31', unrealized_pnl: '0' },
+  },
+  {
+    event: 'signal',
+    data: { ...HISTORICO_REAL[3]!.data, created_at: '2026-11-10T02:44:10.100000+00:00' },
+  },
+].map((m) => ({ ...m, at: instanteDoEvento(m.data, chegada) }))
+
+const juntado = juntarAtividade(HISTORICO_REAL, AO_VIVO, 50)
+const chaves = juntado.map(chaveDoEvento)
+const concatenado = [...AO_VIVO, ...HISTORICO_REAL]
+verifica(
+  'o defeito existe: so concatenar repete o sinal e o alerta',
+  concatenado.filter((i) => i.event === 'signal').length === 2 &&
+    concatenado.filter((i) => i.event === 'alert').length === 2,
+)
+verifica(
+  'ao abrir a tela, o historico aparece mesmo sem nada ao vivo',
+  juntarAtividade(HISTORICO_REAL, [], 50).length === HISTORICO_REAL.length,
+)
+verifica(
+  'o mesmo sinal (mesmo id) aparece uma vez',
+  juntado.filter((i) => i.event === 'signal').length === 1,
+)
+verifica(
+  'o mesmo alerta (mesmo tipo, 30 ms de diferenca) aparece uma vez, e e o do tempo real',
+  juntado.filter((i) => i.event === 'alert').length === 1 &&
+    typeof juntado.find((i) => i.event === 'alert')!.data.message === 'string',
+)
+verifica('nenhuma chave repetida (a key do React)', new Set(chaves).size === chaves.length, chaves.join(', '))
+verifica(
+  'retratos de portfolio: so o mais recente',
+  juntado.filter((i) => i.event === 'portfolio').length === 1 &&
+    juntado.find((i) => i.event === 'portfolio')!.data.total_value === '29.29',
+)
+const instantesJuntados = juntado.map((i) => Date.parse(i.at))
+verifica(
+  'do mais novo para o mais antigo, historico e tempo real intercalados',
+  instantesJuntados.every((ms, i) => i === 0 || ms <= instantesJuntados[i - 1]!) &&
+    juntado[0]!.event === 'portfolio' &&
+    juntado[juntado.length - 1]!.event === 'system',
+  juntado.map((i) => `${i.event}@${i.at}`).join(' | '),
+)
+verifica('o maximo e respeitado', juntarAtividade(HISTORICO_REAL, AO_VIVO, 3).length === 3)
+const outroDisparo: ItemDoFeed = {
+  ...HISTORICO_REAL[0]!,
+  at: '2026-11-10T04:12:40.512000+00:00',
+  data: { ...HISTORICO_REAL[0]!.data, timestamp: '2026-11-10T04:12:40.512000+00:00' },
+}
+verifica(
+  'dois disparos do circuit breaker com 1 h de distancia sao dois eventos',
+  juntarAtividade([outroDisparo, ...HISTORICO_REAL], [], 50).filter((i) => i.event === 'alert')
+    .length === 2,
+)
+const mesmaOrdemAberta: ItemDoFeed = {
+  event: 'order_result',
+  at: '2026-11-10T02:44:10.990000+00:00',
+  data: { order_request_id: ORDEM_ID, status: 'open', filled_quantity: '0' },
+}
+verifica(
+  'a mesma ordem em dois estados (aberta, executada) sao dois eventos',
+  juntarAtividade(HISTORICO_REAL, [mesmaOrdemAberta], 50).filter((i) => i.event === 'order_result')
+    .length === 2,
+)
+verifica(
+  'instante do tempo real vem do servidor, nao da chegada',
+  AO_VIVO[1]!.at === '2026-11-10T03:12:40.542000+00:00',
+  AO_VIVO[1]!.at,
+)
+verifica(
+  'sem instante no payload, vale a chegada',
+  instanteDoEvento({ total_value: '1' }, chegada) === chegada.toISOString(),
+)
+
+const textoSubida = descreverEvento('system', HISTORICO_REAL[4]!.data, 'USDC')
+verifica('marco de subida diz o modo', textoSubida === 'Sistema iniciado em simulação', textoSubida)
+const textoParada = descreverEvento(
+  'system',
+  { type: 'system_stopped', detail: 'sinal de parada (SIGTERM)' },
+  'USDC',
+)
+verifica('marco de parada diz o motivo', textoParada === 'Sistema parado: sinal de parada (SIGTERM)', textoParada)
+const textoAlerta = descreverEvento('alert', HISTORICO_REAL[0]!.data, 'USDC')
+verifica(
+  'alerta do historico mostra titulo e motivo',
+  textoAlerta === 'ALERTA: Circuit breaker acionado — perda diaria de 5,2% acima do limite de 5%',
+  textoAlerta,
+)
+const textoSemMotivo = descreverEvento(
+  'alert',
+  { type: 'unclean_shutdown', title: 'A execucao anterior nao desligou -- ela foi derrubada' },
+  'USDC',
+)
+verifica(
+  'alerta sem motivo mostra o titulo, nao o tipo cru',
+  textoSemMotivo.includes('foi derrubada') && !textoSemMotivo.includes('unclean_shutdown'),
+  textoSemMotivo,
+)
+const textoDecisao = descreverEvento('risk_assessment', HISTORICO_REAL[2]!.data, 'USDC')
+verifica(
+  'decisao do historico usa a moeda do PAR, nao a de hoje',
+  textoDecisao === 'Risk Manager aprovou em BTC/BRL 22,50 BRL',
+  textoDecisao,
+)
+verifica(
+  'hora do feed: evento de ontem leva a data',
+  horaDoFeed('2026-11-09T12:00:00', new Date('2026-11-10T12:00:00')).includes('09/11') &&
+    !horaDoFeed('2026-11-10T09:00:00', new Date('2026-11-10T12:00:00')).includes('/'),
+)
+// [VERIFICACAO DE FONTE] A tela le o historico e junta com o tempo real; a
+// linha do feed e identificada pelo evento, nao pela posicao.
+const fonteDoFeed = fonteSemComentarios('pages', 'Dashboard.tsx')
+verifica(
+  'Dashboard le /atividade e junta com o tempo real',
+  /api\.atividade\(/.test(fonteDoFeed) && /juntarAtividade\(/.test(fonteDoFeed),
+)
+verifica('linha do feed com key do evento', /key=\{chaveDoEvento\(item\)\}/.test(fonteDoFeed))
+
+// ===========================================================================
+bloco('Negociacoes: paginacao depois de excluir, linha por teclado, avisos anunciados')
+
+// Excluir o unico item da ultima pagina (26 lancamentos, pagina 2) deixava a
+// tela em "26–25 de 25" com uma pagina vazia.
+const rotuloAntigo = (offset: number, tamanho: number, total: number) =>
+  total === 0 ? 'nenhum registro' : `${offset + 1}–${Math.min(offset + tamanho, total)} de ${total}`
+verifica('o defeito existe: a faixa antiga dizia "26–25 de 25"', rotuloAntigo(25, 25, 25) === '26–25 de 25')
+verifica(
+  'depois de excluir, a pagina volta para a ultima que existe',
+  paginaValida(25, 25, 25) === 0 && rotuloDaPagina(25, 25, 25) === '1–25 de 25',
+  rotuloDaPagina(25, 25, 25),
+)
+verifica(
+  'pagina valida nao muda; vazio e "nenhum registro"',
+  paginaValida(25, 25, 26) === 25 &&
+    rotuloDaPagina(25, 25, 26) === '26–26 de 26' &&
+    rotuloDaPagina(0, 25, 0) === 'nenhum registro',
+)
+// [VERIFICACAO DE FONTE] Acessibilidade e um defeito do texto do JSX.
+const fonteNegociacoes = fonteSemComentarios('pages', 'Trades.tsx')
+// Ate o `>` sozinho na linha que fecha a tag: os `=>` das funcoes ficam dentro.
+const linhaExpansivel = fonteNegociacoes.match(/<tr\s+className="expandable"[\s\S]*?\n\s*>/)?.[0] ?? ''
+verifica(
+  'linha que expande abre pelo teclado e diz se esta aberta',
+  /tabIndex=\{0\}/.test(linhaExpansivel) &&
+    /onKeyDown=/.test(linhaExpansivel) &&
+    /aria-expanded=/.test(linhaExpansivel),
+  linhaExpansivel,
+)
+const botaoDentroDeLink = paginas.filter((pagina) =>
+  /<a\b[^>]*>\s*<button/.test(fonteSemComentarios('pages', pagina)),
+)
+verifica('nenhum botao dentro de link', botaoDentroDeLink.length === 0, botaoDentroDeLink.join(', '))
+verifica('filtro "Par" espera a digitacao parar', /setTimeout\(/.test(fonteNegociacoes))
+const avisosMudos: string[] = []
+for (const partes of arquivosComClasse) {
+  const codigo = fonteSemComentarios(...partes)
+  for (const tag of codigo.matchAll(/<div\s+className=(?:"form-message[^"]*"|\{`form-message[^`]*`\})[^>]*>/g)) {
+    if (!/\brole=/.test(tag[0])) avisosMudos.push(`${partes.join('/')}: ${tag[0].slice(0, 60)}`)
+  }
+}
+verifica(
+  'toda mensagem de resultado e anunciada ao leitor de tela (role)',
+  avisosMudos.length === 0,
+  avisosMudos.join('; '),
+)
+verifica('o rodape "reconectando…" e anunciado', /sidebar-estado"[^>]*role="status"/.test(fonteApp))
+
+// ===========================================================================
+bloco('Graficos com nome para o leitor de tela')
+
+verifica(
+  'resumo da serie: primeiro e ultimo valor medidos, buraco ignorado',
+  resumoDaSerie([null, 29.29, 30, null, 31.02, null], (v) => money(v, 'USDC')) ===
+    'de 29,29 USDC a 31,02 USDC',
+  resumoDaSerie([null, 29.29, 30, null, 31.02, null], (v) => money(v, 'USDC')),
+)
+verifica('serie sem nenhum valor diz "sem dados"', resumoDaSerie([null, null], String) === 'sem dados')
+// [VERIFICACAO DE FONTE] `<svg>` sem papel nem nome: o leitor de tela pulava o
+// grafico, e o valor so existia no tooltip de mouse.
+const fonteGraficos = fonteSemComentarios('components', 'Charts.tsx')
+const svgsSemNome = [...fonteGraficos.matchAll(/<svg\b[\s\S]*?\n?\s*>/g)]
+  .map((m) => m[0])
+  .filter((tag) => !/role="img"/.test(tag) || !/aria-label=/.test(tag))
+verifica(
+  'todo <svg> de grafico tem role="img" e aria-label',
+  svgsSemNome.length === 0 && fonteGraficos.includes('<svg'),
+  svgsSemNome.map((t) => t.slice(0, 50)).join(' | '),
 )
 
 // ===========================================================================

@@ -245,7 +245,7 @@ function ChannelCard({
       </div>
 
       {!ready && (
-        <div className="form-message err" style={{ marginBottom: 12, fontSize: 12 }}>
+        <div className="form-message err" style={{ marginBottom: 12, fontSize: 12 }} role="note">
           {help?.setup}
           {status && status.missing_settings.length > 0 && (
             <>

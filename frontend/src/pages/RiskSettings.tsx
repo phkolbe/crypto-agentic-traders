@@ -2,7 +2,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useEffect, useId, useState } from 'react'
 
 import { ApiError, api } from '../api/client'
-import { dateTime, money } from '../api/format'
+import { type Alteracao, alteracoesDeRisco, dateTime, money } from '../api/format'
 import type { AuditEntry, CapitalStatus, RiskConfig } from '../api/types'
 import {
   AgentsOffline,
@@ -167,7 +167,11 @@ export default function RiskSettings() {
   /** Campos editados aqui que o servidor também mudou durante a edição. */
   const [conflitos, setConflitos] = useState<string[]>([])
   const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null)
-  const [confirming, setConfirming] = useState(false)
+  /** O pedido congelado no primeiro clique, com o que ele muda; `null` sem confirmação aberta. */
+  const [pendente, setPendente] = useState<{
+    pedido: Record<string, unknown>
+    alteracoes: Alteracao[]
+  } | null>(null)
 
   const config = useQuery<RiskConfig>({
     queryKey: ['riskConfig'],
@@ -225,7 +229,7 @@ export default function RiskSettings() {
     mutationFn: api.updateRiskConfig,
     onSuccess: (atualizado) => {
       setMessage({ ok: true, text: 'Limites atualizados e registrados no log de auditoria.' })
-      setConfirming(false)
+      setPendente(null)
       const novo = rascunhoDe(atualizado)
       setDraft(novo)
       setBase(novo)
@@ -268,7 +272,7 @@ export default function RiskSettings() {
     FIELDS.find((field) => field.key === chave)?.label ??
     (chave === 'asset_whitelist' ? 'Ativos permitidos' : 'Pares permitidos')
 
-  const submit = () => {
+  const montarPedido = (): Record<string, unknown> => {
     const payload: Record<string, unknown> = {}
     for (const field of FIELDS) {
       const value = draft[field.key]
@@ -291,16 +295,25 @@ export default function RiskSettings() {
       payload.asset_whitelist = assets
     if (symbols.join(',') !== splitList(anterior('symbol_whitelist')).join(','))
       payload.symbol_whitelist = symbols
+    return payload
+  }
 
-    if (Object.keys(payload).length === 0) {
+  /**
+   * Primeiro passo: congela o pedido e mostra o que ele muda. Nada sai daqui.
+   *
+   * O segundo passo envia ESTE pedido, e nao o rascunho do momento do clique:
+   * um refetch no meio da confirmação não muda o que foi mostrado.
+   */
+  const pedirConfirmacao = () => {
+    const pedido = montarPedido()
+    if (Object.keys(pedido).length === 0) {
       // Antes isto ia para a API como `{confirm: true}` e a tela dizia
       // "Limites atualizados" sem nada ter mudado.
-      setConfirming(false)
       setMessage({ ok: false, text: 'Nada a aplicar: nenhum campo difere do que está valendo.' })
       return
     }
     setMessage(null)
-    save.mutate(payload)
+    setPendente({ pedido, alteracoes: alteracoesDeRisco(FIELDS, base ?? {}, pedido) })
   }
 
   return (
@@ -337,13 +350,17 @@ export default function RiskSettings() {
       {config.isError && <ErroDeCarga error={config.error} oQue="a versão mais nova dos limites" />}
 
       {message && (
-        <div className={`form-message ${message.ok ? 'ok' : 'err'}`} style={{ marginBottom: 14 }}>
+        <div
+          className={`form-message ${message.ok ? 'ok' : 'err'}`}
+          style={{ marginBottom: 14 }}
+          role={message.ok ? 'status' : 'alert'}
+        >
           {message.text}
         </div>
       )}
 
       {conflitosVigentes.length > 0 && base && (
-        <div className="form-message err" style={{ marginBottom: 14 }}>
+        <div className="form-message err" style={{ marginBottom: 14 }} role="alert">
           Enquanto você editava, o servidor também mudou:{' '}
           {conflitosVigentes.map(rotuloDoCampo).join(', ')}. Se aplicar, vale o que você digitou.{' '}
           <button
@@ -351,7 +368,7 @@ export default function RiskSettings() {
             onClick={() => {
               setDraft(base)
               setConflitos([])
-              setConfirming(false)
+              setPendente(null)
             }}
           >
             Descartar minhas edições
@@ -407,22 +424,45 @@ export default function RiskSettings() {
         </div>
 
         <div className="row-tight" style={{ marginTop: 18 }}>
-          {!confirming ? (
-            <button className="primary" disabled={!changed} onClick={() => setConfirming(true)}>
+          {!pendente ? (
+            <button className="primary" disabled={!changed} onClick={pedirConfirmacao}>
               Salvar alterações
             </button>
           ) : (
-            <>
-              <span className="muted" style={{ fontSize: 13 }}>
-                Estes limites controlam quanto dinheiro real o sistema pode comprometer. Confirmar?
-              </span>
-              <button className="danger" onClick={submit} disabled={save.isPending}>
-                {save.isPending ? 'Aplicando…' : 'Sim, aplicar'}
-              </button>
-              <button onClick={() => setConfirming(false)}>Cancelar</button>
-            </>
+            // O que muda, campo a campo, no padrão de Configurações: a frase
+            // fixa de antes era a mesma para apertar um stop e para liberar
+            // o patrimônio inteiro.
+            <div className="alert-banner" role="alertdialog" style={{ width: '100%' }}>
+              <div>
+                <strong>
+                  Aplicar {pendente.alteracoes.length === 1 ? 'esta alteração' : 'estas alterações'}?
+                  Estes limites controlam quanto dinheiro o sistema pode comprometer.
+                </strong>
+                <ul style={{ margin: '8px 0 0', paddingLeft: 18 }}>
+                  {pendente.alteracoes.map((a) => (
+                    <li key={a.campo} style={{ marginBottom: 4 }}>
+                      <strong>{a.campo}:</strong>{' '}
+                      <span className="muted">{a.antes}</span> → <span>{a.depois}</span>
+                      {a.aviso && <div className="muted" style={{ fontSize: 12 }}>{a.aviso}</div>}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+              <div className="row-tight">
+                <button
+                  className="danger"
+                  onClick={() => save.mutate(pendente.pedido)}
+                  disabled={save.isPending}
+                >
+                  {save.isPending ? 'Aplicando…' : 'Sim, aplicar'}
+                </button>
+                <button onClick={() => setPendente(null)} disabled={save.isPending}>
+                  Cancelar
+                </button>
+              </div>
+            </div>
           )}
-          {changed && !confirming && <span className="muted" style={{ fontSize: 12 }}>alterações não salvas</span>}
+          {changed && !pendente && <span className="muted" style={{ fontSize: 12 }}>alterações não salvas</span>}
         </div>
       </Card>
 

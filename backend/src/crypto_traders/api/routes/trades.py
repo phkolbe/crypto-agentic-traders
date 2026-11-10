@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import csv
 import io
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
@@ -22,6 +22,39 @@ from ..schemas import ManualTradeIn, OrderOut, SignalOut, TradeOut, TradePage
 
 router = APIRouter()
 
+#: Teto de linhas do CSV. Acima disso a rota recusa e pede um periodo, em vez de
+#: cortar: a exportacao e para apuracao fiscal, e um arquivo sem as negociacoes
+#: mais antigas, sem nada dizendo que faltam, e pior do que nenhum arquivo.
+LIMITE_DA_EXPORTACAO = 100_000
+
+#: Primeiros caracteres que fazem o Excel/LibreOffice tratar a celula como
+#: formula (OWASP, "CSV injection"); tab e CR entram pelo mesmo motivo.
+_INICIO_DE_FORMULA = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _em_utc(valor: datetime | None) -> datetime | None:
+    """`start`/`end` em UTC: sem fuso vale UTC, com fuso e convertido.
+
+    O banco guarda UTC. No SQLite o parametro e comparado como hora de parede, e
+    `10:00-03:00` (13:00 UTC) passava por 10:00 -- o trade das 12:00 UTC entrava
+    num filtro que comeca depois dele. No Postgres o caso sem fuso dependia do
+    fuso da sessao.
+    """
+    if valor is None:
+        return None
+    return valor.replace(tzinfo=UTC) if valor.tzinfo is None else valor.astimezone(UTC)
+
+
+def _texto_seguro(valor: str | None) -> str:
+    """Texto livre do CSV sem virar formula na planilha.
+
+    A observacao do lancamento manual e digitada (ou colada) pelo operador:
+    `=HYPERLINK(...)` nela virava formula ao abrir o CSV fiscal. O apostrofo na
+    frente e a convencao das planilhas para "isto e texto".
+    """
+    texto = (valor or "").replace("\n", " ")
+    return "'" + texto if texto.startswith(_INICIO_DE_FORMULA) else texto
+
 
 @router.get("/trades", response_model=TradePage)
 async def list_trades(
@@ -36,7 +69,13 @@ async def list_trades(
 ) -> TradePage:
     """Historico consolidado: operacoes dos agentes E lancamentos manuais."""
     repository = TradeRepository(session)
-    filters = {"origin": origin, "symbol": symbol, "side": side, "start": start, "end": end}
+    filters = {
+        "origin": origin,
+        "symbol": symbol,
+        "side": side,
+        "start": _em_utc(start),
+        "end": _em_utc(end),
+    }
     rows = await repository.list(limit=limit, offset=offset, **filters)
     total = await repository.count(**filters)
     return TradePage(
@@ -205,7 +244,18 @@ async def export_trades(
     Pensado para apuracao fiscal: inclui taxa, moeda da taxa, origem e o modo de
     operacao, para que simulacao nunca seja confundida com dinheiro real.
     """
-    rows = await TradeRepository(session).list(limit=100_000, start=start, end=end)
+    repository = TradeRepository(session)
+    inicio, fim = _em_utc(start), _em_utc(end)
+    total = await repository.count(start=inicio, end=fim)
+    if total > LIMITE_DA_EXPORTACAO:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"o periodo tem {total} negociacoes, acima do teto de "
+                f"{LIMITE_DA_EXPORTACAO} por arquivo; exporte por partes com start/end"
+            ),
+        )
+    rows = await repository.list(limit=LIMITE_DA_EXPORTACAO, start=inicio, end=fim)
 
     buffer = io.StringIO()
     writer = csv.writer(buffer, delimiter=";")
@@ -221,9 +271,9 @@ async def export_trades(
             [
                 row.executed_at.isoformat(), row.exchange, row.symbol, row.side,
                 row.quantity, row.price, row.notional, row.fee, row.fee_currency or "",
-                row.origin, row.strategy or "", row.mode,
+                row.origin, _texto_seguro(row.strategy), row.mode,
                 row.realized_pnl if row.realized_pnl is not None else "",
-                (row.notes or "").replace("\n", " "),
+                _texto_seguro(row.notes),
             ]
         )
 

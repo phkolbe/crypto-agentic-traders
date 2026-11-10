@@ -8,6 +8,7 @@
 
 import { useQueryClient } from '@tanstack/react-query'
 import { useEffect, useRef, useState } from 'react'
+import { instanteDoEvento, type ItemDoFeed } from '../api/atividade'
 import { RAIZ } from '../api/raiz'
 
 export type LiveEvent =
@@ -34,7 +35,7 @@ const MAX_FEED = 50
 export function useLiveEvents() {
   const queryClient = useQueryClient()
   const [connected, setConnected] = useState(false)
-  const [feed, setFeed] = useState<{ event: string; data: any; at: string }[]>([])
+  const [feed, setFeed] = useState<ItemDoFeed[]>([])
   const socketRef = useRef<WebSocket | null>(null)
   const timerRef = useRef<number | null>(null)
 
@@ -64,12 +65,12 @@ export function useLiveEvents() {
           for (const key of INVALIDATES[payload.event] ?? []) {
             queryClient.invalidateQueries({ queryKey: [key] })
           }
-          setFeed((current) =>
-            [{ event: payload.event, data: payload.data, at: new Date().toISOString() }, ...current].slice(
-              0,
-              MAX_FEED,
-            ),
-          )
+          const item = {
+            event: payload.event,
+            data: payload.data,
+            at: instanteDoEvento(payload.data, new Date()),
+          }
+          setFeed((current) => [item, ...current].slice(0, MAX_FEED))
         } catch {
           /* mensagem malformada: ignorar em vez de derrubar a conexao */
         }

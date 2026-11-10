@@ -29,6 +29,18 @@ export function toNumber(value: Money | null | undefined): number {
 }
 
 /**
+ * Valor que nao e numero: nulo, vazio ou texto que nao converte.
+ *
+ * `toNumber` devolve 0 nesses casos (os graficos precisam de numero), e os
+ * formatadores herdavam isso: campo de dinheiro nulo aparecia como "0,00 USDC",
+ * afirmando um zero que ninguem mediu. Os formatadores mostram "—".
+ */
+function semValor(value: Money | number | null | undefined): boolean {
+  if (typeof value === 'number') return !Number.isFinite(value)
+  return value === null || value === undefined || value === '' || !Number.isFinite(Number(value))
+}
+
+/**
  * Valor monetario formatado, com a moeda passada explicitamente.
  *
  * `currency` e OBRIGATORIO de proposito. Enquanto havia um padrao (`'USDT'`),
@@ -37,6 +49,7 @@ export function toNumber(value: Money | null | undefined): number {
  * Para numero sem unidade (coluna que ja tem a moeda no cabecalho), passe `''`.
  */
 export function money(value: Money | number | null | undefined, currency: string): string {
+  if (semValor(value)) return '—'
   const amount = typeof value === 'number' ? value : toNumber(value)
   const formatted = amount.toLocaleString(LOCALE_PT_BR, {
     minimumFractionDigits: 2,
@@ -104,6 +117,7 @@ export function quoteOf(symbol: string | null | undefined): string {
 
 /** Quantidades de cripto precisam de mais casas: 0.00 esconderia a posicao. */
 export function quantity(value: Money | number | null | undefined): string {
+  if (semValor(value)) return '—'
   const amount = typeof value === 'number' ? value : toNumber(value)
   const digits = amount !== 0 && Math.abs(amount) < 1 ? 8 : 4
   return amount.toLocaleString(LOCALE_PT_BR, {
@@ -120,6 +134,7 @@ export function quantity(value: Money | number | null | undefined): string {
  * como estava em Posicoes) virava "0,00" — preco medio e atual iguais a zero.
  */
 export function price(value: Money | number | null | undefined): string {
+  if (semValor(value)) return '—'
   const amount = typeof value === 'number' ? value : toNumber(value)
   const absoluto = Math.abs(amount)
   let casas = absoluto < 10 ? 6 : 2
@@ -538,6 +553,43 @@ export function alteracoesDeNegocio(
 }
 
 /**
+ * O que um PUT de `/risk/config` muda, campo a campo, para a confirmacao de Risco.
+ *
+ * A confirmacao dizia sempre a mesma frase ("Estes limites controlam quanto
+ * dinheiro real..."), inclusive para esvaziar o "Capital autorizado" — que
+ * `clear_authorized_capital` transforma em "libera o patrimonio inteiro e todo
+ * deposito futuro", o maior afrouxamento possivel da tela. As linhas saem do
+ * pedido que vai ser enviado, como em `alteracoesDeNegocio`.
+ *
+ * `base` e o formulario como o servidor o entregou (texto; `''` = vazio).
+ */
+export function alteracoesDeRisco(
+  campos: { key: string; label: string; nullable?: boolean }[],
+  base: Record<string, string>,
+  pedido: Record<string, unknown>,
+): Alteracao[] {
+  const ROTULOS_EXTRAS: Record<string, string> = {
+    asset_whitelist: 'Ativos permitidos',
+    symbol_whitelist: 'Pares permitidos',
+  }
+  return Object.keys(pedido).map((chave) => {
+    const limpa = chave.startsWith('clear_')
+    const alvo = limpa ? chave.slice('clear_'.length) : chave
+    const campo = campos.find((c) => c.key === alvo)
+    const rotulo = campo?.label ?? ROTULOS_EXTRAS[alvo] ?? alvo
+    const vazio = campo?.nullable ? '(sem limite)' : '(vazio)'
+    const antes = (base[alvo] ?? '') === '' ? vazio : textoDoValor(base[alvo])
+    let aviso: string | undefined
+    if (limpa && alvo === 'authorized_capital') {
+      aviso = 'libera todo o patrimônio para operar, inclusive depósitos futuros, sem novo aval'
+    } else if (limpa) {
+      aviso = 'remove o teto: passa a valer só o que os outros limites permitirem'
+    }
+    return { campo: rotulo, antes, depois: limpa ? '(sem limite)' : textoDoValor(pedido[chave]), aviso }
+  })
+}
+
+/**
  * Rotulo de um campo de configuracao, com a unidade quando ele e dinheiro.
  *
  * "Piso de liquidez em 24h = 9760000" e "Saldo inicial simulado = 29.29"
@@ -553,6 +605,26 @@ export function rotuloDeCampo(
   if (campo.kind === 'money' && moeda) return `${campo.label} (${moeda})`
   if (campo.kind === 'percent') return `${campo.label} (0–1)`
   return campo.label
+}
+
+/**
+ * Deslocamento de pagina que existe para `total` itens.
+ *
+ * Excluir o unico lancamento da ultima pagina deixava o deslocamento depois do
+ * fim: a tela dizia "26–25 de 25" sobre uma pagina vazia. Volta para a ultima
+ * pagina que tem item.
+ */
+export function paginaValida(offset: number, tamanho: number, total: number): number {
+  if (total <= 0) return 0
+  if (offset < total) return offset
+  return Math.floor((total - 1) / tamanho) * tamanho
+}
+
+/** "26–50 de 80", sempre sobre uma pagina que existe (ver `paginaValida`). */
+export function rotuloDaPagina(offset: number, tamanho: number, total: number): string {
+  if (total <= 0) return 'nenhum registro'
+  const inicio = paginaValida(offset, tamanho, total)
+  return `${inicio + 1}–${Math.min(inicio + tamanho, total)} de ${total}`
 }
 
 export function relativeTime(value: string | null): string {

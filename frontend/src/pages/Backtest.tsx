@@ -182,7 +182,7 @@ export default function Backtest() {
           </div>
 
           {summary.total_return_pct < summary.buy_and_hold_pct && (
-            <div className="form-message err" style={{ marginTop: 14 }}>
+            <div className="form-message err" style={{ marginTop: 14 }} role="status">
               A estratégia rendeu menos do que simplesmente comprar e segurar no período. Retorno
               positivo abaixo do mercado ainda é destruição de valor.
             </div>

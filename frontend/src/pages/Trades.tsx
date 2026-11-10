@@ -1,8 +1,18 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Fragment, useState, useId } from 'react'
+import { Fragment, useEffect, useState, useId } from 'react'
 
 import { api, ApiError } from '../api/client'
-import { MODE_LABEL, dateTime, money, price, quantity, quoteOf, taxa } from '../api/format'
+import {
+  MODE_LABEL,
+  dateTime,
+  money,
+  paginaValida,
+  price,
+  quantity,
+  quoteOf,
+  rotuloDaPagina,
+  taxa,
+} from '../api/format'
 import type { TradePage } from '../api/types'
 import {
   Card,
@@ -16,6 +26,9 @@ import {
 
 const PAGE_SIZE = 25
 
+/** Espera depois da ultima tecla no filtro "Par" antes de consultar. */
+const ESPERA_DO_FILTRO_MS = 300
+
 export default function Trades() {
   // Rotulo ligado ao campo (leitor de tela e clique no rotulo).
   const uid = useId()
@@ -24,6 +37,8 @@ export default function Trades() {
   const [offset, setOffset] = useState(0)
   const [origin, setOrigin] = useState('')
   const [symbol, setSymbol] = useState('')
+  /** O que esta no campo "Par"; vira filtro quando a digitacao para. */
+  const [parDigitado, setParDigitado] = useState('')
   const [side, setSide] = useState('')
   const [expanded, setExpanded] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -58,8 +73,27 @@ export default function Trades() {
     setOffset(0) // trocar filtro sem voltar para a primeira pagina confundiria
   }
 
+  // Uma consulta por tecla: "BTC/USDC" eram oito pedidos, sete deles para
+  // pares que nao existem.
+  useEffect(() => {
+    if (parDigitado === symbol) return
+    const timer = window.setTimeout(() => {
+      setSymbol(parDigitado)
+      setOffset(0)
+    }, ESPERA_DO_FILTRO_MS)
+    return () => window.clearTimeout(timer)
+  }, [parDigitado, symbol])
+
   const total = trades.data?.total ?? 0
   const items = trades.data?.items ?? []
+
+  // Depois de excluir o unico item da ultima pagina, o deslocamento ficava
+  // depois do fim ("26–25 de 25" e pagina vazia): volta para a ultima.
+  useEffect(() => {
+    if (!trades.data) return
+    const valido = paginaValida(offset, PAGE_SIZE, trades.data.total)
+    if (valido !== offset) setOffset(valido)
+  }, [trades.data, offset])
 
   return (
     <>
@@ -68,8 +102,10 @@ export default function Trades() {
           <h1>Negociações</h1>
           <p>Histórico consolidado: operações dos agentes e lançamentos manuais.</p>
         </div>
-        <a href={api.exportUrl()} download>
-          <button>Exportar CSV</button>
+        {/* Link com cara de botao: `<a><button>` aninhados sao dois alvos de
+            foco para um clique so, e HTML invalido. */}
+        <a className="botao" href={api.exportUrl()} download>
+          Exportar CSV
         </a>
       </div>
 
@@ -94,17 +130,18 @@ export default function Trades() {
           <div className="field" style={{ maxWidth: 180 }}>
             <label htmlFor={`${uid}-3`}>Par</label>
             <input id={`${uid}-3`}
-              value={symbol}
-              onChange={(e) => resetFilter(setSymbol)(e.target.value.toUpperCase())}
+              value={parDigitado}
+              onChange={(e) => setParDigitado(e.target.value.toUpperCase())}
               placeholder={moeda ? `BTC/${moeda}` : ''}
             />
           </div>
-          {(origin || side || symbol) && (
+          {(origin || side || symbol || parDigitado) && (
             <button
               onClick={() => {
                 setOrigin('')
                 setSide('')
                 setSymbol('')
+                setParDigitado('')
                 setOffset(0)
               }}
             >
@@ -113,7 +150,7 @@ export default function Trades() {
           )}
         </div>
 
-        {error && <div className="form-message err" style={{ marginBottom: 12 }}>{error}</div>}
+        {error && <div className="form-message err" style={{ marginBottom: 12 }} role="alert">{error}</div>}
 
         {/* Falha ao carregar era "Nenhuma negociação encontrada": o operador
             não distinguia histórico vazio de API fora do ar. */}
@@ -156,7 +193,17 @@ export default function Trades() {
                   <Fragment key={trade.id}>
                     <tr
                       className="expandable"
+                      tabIndex={0}
+                      aria-expanded={expanded === trade.id}
                       onClick={() => setExpanded(expanded === trade.id ? null : trade.id)}
+                      onKeyDown={(event) => {
+                        // So pelo mouse, o detalhe (taxa, observacoes, excluir)
+                        // era inalcancavel pelo teclado.
+                        if (event.target !== event.currentTarget) return
+                        if (event.key !== 'Enter' && event.key !== ' ') return
+                        event.preventDefault()
+                        setExpanded(expanded === trade.id ? null : trade.id)
+                      }}
                     >
                       <td className="muted">{dateTime(trade.executed_at)}</td>
                       <td><strong>{trade.symbol}</strong></td>
@@ -251,9 +298,7 @@ export default function Trades() {
 
         <div className="pagination">
           <span>
-            {total === 0
-              ? 'nenhum registro'
-              : `${offset + 1}–${Math.min(offset + PAGE_SIZE, total)} de ${total}`}
+            {rotuloDaPagina(offset, PAGE_SIZE, total)}
           </span>
           <div className="row-tight">
             <button disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - PAGE_SIZE))}>
