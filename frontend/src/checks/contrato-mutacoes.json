@@ -1,0 +1,96 @@
+{
+  "_leia": "Pedidos que as telas enviam para mudar estado. O `npm run check` confere que `api/mutacoes.ts` monta EXATAMENTE estes pedidos; o `backend/tests/test_api.py` (TestContratoDasTelas) os repete contra a API e exige o status. Mudou um lado, este arquivo muda junto -- e o outro lado reprova se nao acompanhar. Existe porque Rearmar e Autorizar capital mandaram POST sem corpo de 10/09 a 09/11/2026 e a API respondeu 400 o tempo todo, sem nenhum teste perceber.",
+  "pedidos": [
+    {
+      "nome": "rearmar_circuit_breaker",
+      "metodo": "POST",
+      "caminho": "/risk/circuit-breaker/reset",
+      "corpo": { "confirm": true },
+      "status_esperado": 200
+    },
+    {
+      "nome": "autorizar_capital",
+      "metodo": "POST",
+      "caminho": "/risk/capital/authorize",
+      "corpo": { "confirm": true, "expected_total_value": "5000" },
+      "status_esperado": 200
+    },
+    {
+      "nome": "alterar_limites",
+      "metodo": "PUT",
+      "caminho": "/risk/config",
+      "corpo": { "cooldown_seconds": 300, "confirm": true },
+      "status_esperado": 200
+    },
+    {
+      "nome": "alterar_negocio",
+      "metodo": "PUT",
+      "caminho": "/trading/config",
+      "corpo": { "timeframe": "4h", "confirm": true },
+      "status_esperado": 200
+    },
+    {
+      "nome": "lancar_manual",
+      "metodo": "POST",
+      "caminho": "/trades/manual",
+      "corpo": {
+        "executed_at": "2026-11-09T15:00:00.000Z",
+        "exchange": "binance",
+        "symbol": "BTC/USDT",
+        "side": "buy",
+        "quantity": "0.01",
+        "price": "95000",
+        "fee": "0",
+        "fee_currency": "USDT",
+        "notes": null,
+        "confirm": true,
+        "aceitar_preco_fora_do_mercado": false
+      },
+      "status_esperado": 201
+    },
+    {
+      "nome": "lancar_manual_preco_fora_sem_aceitar",
+      "metodo": "POST",
+      "caminho": "/trades/manual",
+      "corpo": {
+        "executed_at": "2026-11-09T15:00:00.000Z",
+        "exchange": "binance",
+        "symbol": "BTC/USDT",
+        "side": "buy",
+        "quantity": "0.01",
+        "price": "9500",
+        "fee": "0",
+        "fee_currency": "USDT",
+        "notes": null,
+        "confirm": true,
+        "aceitar_preco_fora_do_mercado": false
+      },
+      "status_esperado": 409
+    },
+    {
+      "nome": "lancar_manual_preco_fora_aceito",
+      "metodo": "POST",
+      "caminho": "/trades/manual",
+      "corpo": {
+        "executed_at": "2026-11-09T15:00:00.000Z",
+        "exchange": "binance",
+        "symbol": "BTC/USDT",
+        "side": "buy",
+        "quantity": "0.01",
+        "price": "9500",
+        "fee": "0",
+        "fee_currency": "USDT",
+        "notes": null,
+        "confirm": true,
+        "aceitar_preco_fora_do_mercado": true
+      },
+      "status_esperado": 201
+    },
+    {
+      "nome": "excluir_lancamento",
+      "metodo": "DELETE",
+      "caminho": "/trades/ID_DO_LANCAMENTO?confirm=true",
+      "status_esperado": 204
+    }
+  ]
+}

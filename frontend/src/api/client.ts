@@ -17,7 +17,9 @@ import type {
   CapitalStatus,
   TradePage,
   TradingConfig,
+  Money,
 } from './types'
+import { pedidos, type LancamentoManual, type Pedido } from './mutacoes'
 import { RAIZ } from './raiz'
 
 const BASE = `${RAIZ}/api`
@@ -59,6 +61,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>
 }
 
+/** Envia um pedido montado em `mutacoes.ts` — o unico jeito de mudar estado daqui. */
+function enviar<T>(pedido: Pedido): Promise<T> {
+  return request<T>(pedido.caminho, {
+    method: pedido.metodo,
+    ...(pedido.corpo !== undefined ? { body: JSON.stringify(pedido.corpo) } : {}),
+  })
+}
+
 export const api = {
   health: () => request<Health>('/health'),
 
@@ -75,9 +85,16 @@ export const api = {
     }
     return request<TradePage>(`/trades?${query}`)
   },
-  createManualTrade: (payload: Record<string, unknown>) =>
-    request<unknown>('/trades/manual', { method: 'POST', body: JSON.stringify(payload) }),
-  deleteTrade: (id: string) => request<void>(`/trades/${id}`, { method: 'DELETE' }),
+  // As mutacoes abaixo levam `confirm: true` (ver `mutacoes.ts`): so podem ser
+  // chamadas depois do passo de confirmacao na tela, que diz o que vai mudar.
+  createManualTrade: ({
+    lancamento,
+    aceitarPrecoForaDoMercado,
+  }: {
+    lancamento: LancamentoManual
+    aceitarPrecoForaDoMercado: boolean
+  }) => enviar<unknown>(pedidos.lancarManual(lancamento, aceitarPrecoForaDoMercado)),
+  deleteTrade: (id: string) => enviar<void>(pedidos.excluirLancamento(id)),
   exportUrl: () => `${BASE}/trades/export`,
 
   signals: (limit = 50) => request<Signal[]>(`/signals?limit=${limit}`),
@@ -87,26 +104,17 @@ export const api = {
 
   riskConfig: () => request<RiskConfig>('/risk/config'),
   updateRiskConfig: (payload: Record<string, unknown>) =>
-    request<RiskConfig>('/risk/config', {
-      method: 'PUT',
-      // `confirm` e obrigatorio no backend: alterar limites afeta dinheiro real.
-      body: JSON.stringify({ ...payload, confirm: true }),
-    }),
+    enviar<RiskConfig>(pedidos.alterarLimites(payload)),
   capitalStatus: () => request<CapitalStatus>('/risk/capital'),
-  authorizeCapital: () =>
-    request<CapitalStatus>('/risk/capital/authorize', { method: 'POST' }),
+  /** `patrimonioVisto`: o total que a tela mostrou no dialogo de confirmacao. */
+  authorizeCapital: (patrimonioVisto: Money) =>
+    enviar<CapitalStatus>(pedidos.autorizarCapital(patrimonioVisto)),
 
-  resetCircuitBreaker: () =>
-    request<RiskConfig>('/risk/circuit-breaker/reset', { method: 'POST' }),
+  resetCircuitBreaker: () => enviar<RiskConfig>(pedidos.rearmarCircuitBreaker()),
 
   tradingConfig: () => request<TradingConfig>('/trading/config'),
   updateTradingConfig: (payload: Record<string, unknown>) =>
-    request<TradingConfig>('/trading/config', {
-      method: 'PUT',
-      // `confirm` e obrigatorio no backend: trocar pares, moeda ou estrategias
-      // muda o que o sistema negocia com dinheiro real.
-      body: JSON.stringify({ ...payload, confirm: true }),
-    }),
+    enviar<TradingConfig>(pedidos.alterarNegocio(payload)),
 
   strategies: () => request<StrategyInfo[]>('/strategies'),
   pauseAgent: (name: string) => request<unknown>(`/agents/${name}/pause`, { method: 'POST' }),

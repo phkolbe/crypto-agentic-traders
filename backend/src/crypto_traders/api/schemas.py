@@ -8,11 +8,18 @@ precisa e formata para exibicao.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    field_validator,
+)
 
 
 class MoneyModel(BaseModel):
@@ -153,9 +160,19 @@ class ManualTradeIn(BaseModel):
     Entra na mesma tabela `trades` com `origin=manual`, mantendo um historico
     unico -- e alimentando o calculo de preco medio junto com as operacoes dos
     agentes.
+
+    Esse preco medio e a base do stop e do alvo. Por isso o lancamento tem as
+    travas de uma mutacao de dinheiro (auditoria de 09/11/2026, P0 #12): um
+    zero a menos no preco levava o stop do BTC de ~92 mil para ~51 mil sem
+    aviso. `extra="forbid"` pelo mesmo motivo dos outros `*In`: um typo em
+    `aceitar_preco_fora_do_mercado` nao pode virar "nao enviei".
     """
 
-    executed_at: datetime
+    model_config = ConfigDict(extra="forbid")
+
+    # `AwareDatetime`: sem fuso, "15:00" de Brasilia seria gravado como 15:00 UTC,
+    # tres horas fora de lugar na ordem que reapura o custo medio.
+    executed_at: AwareDatetime
     exchange: str = Field(min_length=1, max_length=32)
     symbol: str = Field(pattern=r"^[A-Z0-9]{2,12}/[A-Z0-9]{2,12}$")
     side: str = Field(pattern="^(buy|sell)$")
@@ -164,6 +181,30 @@ class ManualTradeIn(BaseModel):
     fee: Decimal = Field(default=Decimal(0), ge=0)
     fee_currency: str | None = None
     notes: str | None = Field(default=None, max_length=500)
+
+    confirm: bool = Field(
+        default=False,
+        description=(
+            "Confirmacao explicita: o lancamento entra no preco medio, que define "
+            "o stop e o alvo da posicao."
+        ),
+    )
+    aceitar_preco_fora_do_mercado: bool = Field(
+        default=False,
+        description=(
+            "Registra mesmo com o preco longe do ultimo preco conhecido do par "
+            "(operacao antiga, de outra epoca de preco). Sem isto a rota devolve 409."
+        ),
+    )
+
+    @field_validator("executed_at")
+    @classmethod
+    def _nao_no_futuro(cls, valor: datetime) -> datetime:
+        # Folga de alguns minutos para relogios desalinhados entre o aparelho
+        # do operador e o servidor; mais que isso e digitacao errada.
+        if valor > datetime.now(UTC) + timedelta(minutes=5):
+            raise ValueError("executed_at esta no futuro")
+        return valor
 
 
 # ---------------------------------------------------------------------------

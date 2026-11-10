@@ -1,11 +1,31 @@
 /** Componentes reutilizados pelas paginas. */
 
 import { useQuery } from '@tanstack/react-query'
-import type { ReactNode } from 'react'
+import { useState, type ReactNode } from 'react'
 
-import { api } from '../api/client'
+import { api, ApiError } from '../api/client'
 import { MODE_LABEL, money, rodapeDoStat, toNumber } from '../api/format'
-import type { CapitalStatus, Health, TradingConfig } from '../api/types'
+import type { CapitalStatus, Health, Money, TradingConfig } from '../api/types'
+
+/** Texto de erro de uma query ou mutacao, com o `detail` da API quando houver. */
+export function mensagemDeErro(error: unknown): string {
+  return error instanceof ApiError ? error.message : String(error)
+}
+
+/**
+ * Falha ao carregar, dita como falha.
+ *
+ * Sem isto, `/trades` com 500 aparecia como "Nenhuma negociação encontrada" e o
+ * log de auditoria como "Nenhuma ação administrativa registrada": o operador nao
+ * distinguia "vazio" de "falhou".
+ */
+export function ErroDeCarga({ error, oQue }: { error: unknown; oQue: string }) {
+  return (
+    <div className="form-message err" role="alert">
+      Não foi possível carregar {oQue}: {mensagemDeErro(error)}
+    </div>
+  )
+}
 
 export function useHealth() {
   return useQuery<Health>({
@@ -176,16 +196,24 @@ export function SizingBanner({ health }: { health: Health | undefined }) {
  * conta por qualquer motivo não deveria virar exposição sozinho. Mas dinheiro
  * autorizado e parado é o problema oposto — e é por isso que este aviso pede
  * ação em vez de apenas informar.
+ *
+ * Autorizar e afrouxar um limite de risco, entao pede um segundo passo que diz
+ * o valor. O valor do dialogo fica congelado no clique: e ele que vai para a API
+ * (`expected_total_value`), e se um deposito chegou nesse meio-tempo a API
+ * recusa com 409 em vez de autorizar o que apareceu na hora.
  */
 export function CapitalGateBanner({
   status,
   onAuthorize,
   authorizing,
+  erro,
 }: {
   status: CapitalStatus | undefined
-  onAuthorize: () => void
+  onAuthorize: (patrimonioVisto: Money) => void
   authorizing?: boolean
+  erro?: string | null
 }) {
+  const [visto, setVisto] = useState<Money | null>(null)
   if (!status || !status.gate_active) return null
   if (!(toNumber(status.unauthorized_value) > 0)) return null
 
@@ -203,28 +231,67 @@ export function CapitalGateBanner({
           {money(status.authorized_capital ?? '0', moeda)}. O sistema{' '}
           <strong>não vai usar a diferença</strong> até você autorizar.
         </span>
+        {visto !== null && (
+          <div style={{ marginTop: 8 }}>
+            <strong>Autorizar {money(visto, moeda)} a operar?</strong>{' '}
+            <span className="muted">
+              O sistema passa a poder pôr esse valor inteiro para trabalhar, com dinheiro de
+              verdade se estiver em modo real. Depósitos futuros continuam esperando novo aval.
+            </span>
+          </div>
+        )}
+        {erro && <div className="form-message err" style={{ marginTop: 8 }}>{erro}</div>}
       </div>
       {/* `primary`, nao `btn btn-primary`: nao existe regra `.btn` nem
           `.btn-primary` no CSS, e este botao — o que libera capital para operar —
           renderizava com a aparencia de um botao secundario qualquer. */}
-      <button className="primary" onClick={onAuthorize} disabled={authorizing}>
-        {authorizing ? 'Autorizando…' : 'Autorizar todo o saldo'}
-      </button>
+      {visto === null ? (
+        <button
+          className="primary"
+          onClick={() => setVisto(status.total_value)}
+          disabled={authorizing}
+        >
+          {authorizing ? 'Autorizando…' : 'Autorizar todo o saldo'}
+        </button>
+      ) : (
+        <div className="row-tight">
+          <button
+            className="primary"
+            onClick={() => {
+              onAuthorize(visto)
+              setVisto(null)
+            }}
+          >
+            Sim, autorizar {money(visto, moeda)}
+          </button>
+          <button onClick={() => setVisto(null)}>Cancelar</button>
+        </div>
+      )}
     </div>
   )
 }
 
+/**
+ * Trava acionada, com o rearme em dois passos.
+ *
+ * Era um clique: o botão vermelho no topo do Dashboard (a tela inicial)
+ * rearmava a trava logo depois da perda que a disparou. Agora o primeiro clique
+ * só abre a pergunta, que diz o que o rearme faz.
+ */
 export function CircuitBreakerBanner({
   active,
   reason,
   onReset,
   resetting,
+  erro,
 }: {
   active: boolean
   reason?: string | null
   onReset?: () => void
   resetting?: boolean
+  erro?: string | null
 }) {
+  const [confirmando, setConfirmando] = useState(false)
   if (!active) return null
   return (
     <div className="alert-banner">
@@ -234,12 +301,36 @@ export function CircuitBreakerBanner({
           {reason ?? 'Os agentes de decisão estão pausados.'} O rearme é manual e propositalmente
           exige revisão antes de voltar a operar.
         </span>
+        {confirmando && (
+          <div style={{ marginTop: 8 }}>
+            <strong>Rearmar devolve ao sistema a permissão de abrir posições.</strong>{' '}
+            <span className="muted">
+              Os agentes são retomados e podem comprar já no próximo sinal. Confira antes o que
+              disparou a trava.
+            </span>
+          </div>
+        )}
+        {erro && <div className="form-message err" style={{ marginTop: 8 }}>{erro}</div>}
       </div>
-      {onReset && (
-        <button className="danger" onClick={onReset} disabled={resetting}>
-          {resetting ? 'Rearmando…' : 'Rearmar e retomar'}
-        </button>
-      )}
+      {onReset &&
+        (!confirmando ? (
+          <button className="danger" onClick={() => setConfirmando(true)} disabled={resetting}>
+            {resetting ? 'Rearmando…' : 'Rearmar e retomar'}
+          </button>
+        ) : (
+          <div className="row-tight">
+            <button
+              className="danger"
+              onClick={() => {
+                onReset()
+                setConfirmando(false)
+              }}
+            >
+              Sim, rearmar e retomar
+            </button>
+            <button onClick={() => setConfirmando(false)}>Cancelar</button>
+          </div>
+        ))}
     </div>
   )
 }

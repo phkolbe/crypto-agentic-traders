@@ -7,6 +7,7 @@ import type { TradePage } from '../api/types'
 import {
   Card,
   Empty,
+  ErroDeCarga,
   Loading,
   OriginBadge,
   SideBadge,
@@ -24,6 +25,12 @@ export default function Trades() {
   const [side, setSide] = useState('')
   const [expanded, setExpanded] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  /**
+   * Lancamento cuja exclusao esta sendo confirmada. Era um clique: um erro de
+   * mira na linha vizinha apagava uma compra, e o preco medio (base do stop) e
+   * o PnL eram reapurados sem ela.
+   */
+  const [excluindo, setExcluindo] = useState<string | null>(null)
 
   const filters = { limit: PAGE_SIZE, offset, origin, symbol, side }
   const trades = useQuery<TradePage>({
@@ -35,7 +42,11 @@ export default function Trades() {
     mutationFn: api.deleteTrade,
     onSuccess: () => {
       setError(null)
+      setExcluindo(null)
       queryClient.invalidateQueries({ queryKey: ['trades'] })
+      // O lancamento saiu do preco medio: carteira e analise mudam junto.
+      queryClient.invalidateQueries({ queryKey: ['portfolio'] })
+      queryClient.invalidateQueries({ queryKey: ['portfolioAnalise'] })
     },
     onError: (err) => setError(err instanceof ApiError ? err.message : String(err)),
   })
@@ -102,9 +113,13 @@ export default function Trades() {
 
         {error && <div className="form-message err" style={{ marginBottom: 12 }}>{error}</div>}
 
+        {/* Falha ao carregar era "Nenhuma negociação encontrada": o operador
+            não distinguia histórico vazio de API fora do ar. */}
+        {trades.isError && <ErroDeCarga error={trades.error} oQue="as negociações" />}
+
         {trades.isLoading ? (
           <Loading />
-        ) : items.length === 0 ? (
+        ) : trades.isError && !trades.data ? null : items.length === 0 ? (
           <Empty>
             Nenhuma negociação encontrada.
             {total === 0 && !origin && !symbol && !side && (
@@ -173,7 +188,7 @@ export default function Trades() {
                             className="small danger"
                             onClick={(event) => {
                               event.stopPropagation()
-                              remove.mutate(trade.id)
+                              setExcluindo(trade.id)
                             }}
                             disabled={remove.isPending}
                             title="Remover lançamento manual"
@@ -183,6 +198,35 @@ export default function Trades() {
                         )}
                       </td>
                     </tr>
+                    {excluindo === trade.id && (
+                      <tr>
+                        <td colSpan={11}>
+                          <div className="row-tight">
+                            <span>
+                              <strong>
+                                Excluir a {trade.side === 'buy' ? 'compra' : 'venda'} de{' '}
+                                {quantity(trade.quantity)} {trade.symbol} a {price(trade.price)}{' '}
+                                {quoteOf(trade.symbol)}?
+                              </strong>{' '}
+                              <span className="muted">
+                                O lançamento sai do preço médio, e o stop e o alvo da posição são
+                                recalculados sem ele. A exclusão fica no log de auditoria.
+                              </span>
+                            </span>
+                            <button
+                              className="small danger"
+                              onClick={() => remove.mutate(trade.id)}
+                              disabled={remove.isPending}
+                            >
+                              {remove.isPending ? 'Excluindo…' : 'Sim, excluir'}
+                            </button>
+                            <button className="small" onClick={() => setExcluindo(null)}>
+                              Cancelar
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    )}
                     {expanded === trade.id && (
                       <tr>
                         <td colSpan={11} style={{ background: 'var(--bg)' }}>
