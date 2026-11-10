@@ -397,10 +397,11 @@ class TestSaldoInsuficienteNoBrokerDeVerdade:
     `except ExchangeError` no adaptador -- a ordem dos blocos era o defeito. O
     `xfail(strict=True)` que morava aqui virou XPASS e foi removido.
 
-    O que estes testes fixam agora: os formatos continuam diferentes de
-    proposito (o adaptador LEVANTA, o `PaperBroker` devolve REJECTED, cada um
-    coerente com sua camada), mas o desfecho no ExecutionAgent e o mesmo nos
-    dois. E o desfecho que o cooldown le, e portanto o que precisa concordar.
+    O que estes testes fixam agora: os dois LEVANTAM `InsufficientFunds` e o
+    desfecho no ExecutionAgent e o mesmo nos dois. E o desfecho que o cooldown
+    le, e portanto o que precisa concordar. Ate 09/11/2026 o `PaperBroker`
+    devolvia REJECTED: o desfecho coincidia, mas o caminho do dry_run nao era o
+    do live (auditoria de 09/11/2026, M3 de exchanges).
     """
 
     async def test_o_adaptador_real_levanta_em_vez_de_devolver_failed(self):
@@ -410,13 +411,20 @@ class TestSaldoInsuficienteNoBrokerDeVerdade:
             with pytest.raises(InsufficientFunds, match="insuficiente"):
                 await adaptador.place_order(_pedido())
 
-    async def test_o_paper_broker_devolve_REJECTED_e_nao_levanta(self, settings):
-        """O outro broker real: formato diferente, mesmo desfecho."""
+    async def test_o_paper_broker_levanta_como_o_adaptador(self, settings):
+        """O outro broker real: mesmo formato e mesmo desfecho no agente."""
+        from crypto_traders.agents.execution import ExecutionAgent
+        from crypto_traders.bus import InMemoryEventBus
         from crypto_traders.exchanges.paper import PaperBroker
 
         broker = PaperBroker(quote_currency="USDC", initial_balance=Decimal("1"))
         broker.set_price("BTC", Decimal("50000"))
-        resultado = await broker.place_order(_pedido())
+        with pytest.raises(InsufficientFunds, match="insuficiente"):
+            await broker.place_order(_pedido())
+
+        agente = ExecutionAgent(InMemoryEventBus(), broker, settings)
+        resultado = await agente._execute(_pedido())
+        assert resultado is not None
         assert resultado.status is OrderStatus.REJECTED
 
     async def test_chega_ao_agente_como_recusa_definitiva(self, settings):

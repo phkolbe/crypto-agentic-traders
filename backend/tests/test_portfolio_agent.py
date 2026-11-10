@@ -861,3 +861,155 @@ class TestOQueAAncoraNaoPodeCongelar:
         # de saldo (1 * (20 - 10) = 10), que aqui seria contar duas vezes.
         assert depois.realized_pnl == Decimal("3")
         assert depois.unrealized_pnl == Decimal("10")
+
+
+# ----------------------------------------------------------------------
+# Taxa cobrada no ativo comprado (Binance spot sem BNB)
+# ----------------------------------------------------------------------
+class TestTaxaNoAtivoBase:
+    """Na Binance sem BNB a taxa da COMPRA sai do ativo recebido.
+
+    Comprar 0,001 BTC grava `filled=0,001` e taxa de 0,000001 BTC, mas o saldo
+    sobe so 0,000999. Tratar essa taxa como "outra moeda" (descartada) deixava a
+    quantidade bruta no historico: a diferenca de 0,000001 virava um fantasma
+    sem saida de saldo, que `_sustentar` lia como edicao retroativa e usava para
+    apagar o prejuizo realizado do mesmo dia (auditoria de 09/11/2026, H2).
+    """
+
+    @pytest.fixture
+    def producao(self, settings):
+        """Ensaio em /USDC com 29,29 autorizados e trava diaria de 5%."""
+        return settings.model_copy(
+            update={
+                "trading": settings.trading.model_copy(update={"quote_currency": "USDC"}),
+                "risk": settings.risk.model_copy(
+                    update={"authorized_capital": Decimal("29.29")}
+                ),
+            }
+        )
+
+    async def test_compra_entra_liquida_da_taxa_e_com_o_custo_cheio(self, producao):
+        await registrar(
+            producao, Side.BUY, "1", "100", minuto=0, taxa="0.001",
+            moeda_da_taxa="BTC", simbolo="BTC/USDC",
+        )
+        broker = PaperBroker(quote_currency="USDC", initial_balance=Decimal("900"))
+        broker.credit("BTC", Decimal("0.999"))
+
+        snapshot = await agente(producao, broker, {"BTC": "100"}).build_snapshot()
+        btc = next(p for p in snapshot.positions if p.asset == "BTC")
+
+        # Pagou 100 USDC e recebeu 0,999 BTC: o medio e 100 / 0,999.
+        assert btc.average_price == Decimal("100") / Decimal("0.999")
+        # A taxa (0,001 BTC x 100 = 0,10 USDC) aparece como perda nao realizada.
+        assert snapshot.unrealized_pnl == pytest.approx(Decimal("-0.1"), abs=Decimal("1e-20"))
+        acoes = await acoes_de_auditoria(producao)
+        assert "portfolio_saldo_divergente_do_historico" not in acoes
+        assert "portfolio_taxa_descartada" not in acoes
+
+    async def test_venda_com_taxa_no_ativo_tira_a_taxa_da_posicao(self, producao):
+        """Raro na Binance, mas a conta tem de fechar: saem 0,501 BTC, entram 60."""
+        await registrar(producao, Side.BUY, "1", "100", minuto=0, simbolo="BTC/USDC")
+        await registrar(
+            producao, Side.SELL, "0.5", "120", minuto=1, taxa="0.001",
+            moeda_da_taxa="BTC", simbolo="BTC/USDC",
+        )
+        broker = PaperBroker(quote_currency="USDC", initial_balance=Decimal("960"))
+        broker.credit("BTC", Decimal("0.499"))
+
+        snapshot = await agente(producao, broker, {"BTC": "100"}).build_snapshot()
+
+        # 0,5 x 120 recebidos contra 0,501 x 100 de custo.
+        assert snapshot.realized_pnl == Decimal("9.9")
+        btc = next(p for p in snapshot.positions if p.asset == "BTC")
+        assert btc.average_price == Decimal("100")
+
+    async def test_vender_sol_com_perda_e_comprar_btc_no_mesmo_dia(self, producao):
+        """O cenario da auditoria: o realizado TEM de cair, e a trava tem de ver.
+
+        No fechamento diario a estrategia vende SOL com prejuizo e compra BTC no
+        mesmo ciclo. Antes, a poeira de taxa do BTC (0,0000005) virava pendente
+        e recebia a `falta` inteira do ciclo: o realizado publicado ficava em
+        zero e a trava nao via a perda de 1,6 USDC (5,5% dos 29,29).
+        """
+        agora = datetime.now(UTC).replace(hour=12, minute=0, second=0, microsecond=0)
+        bus = InMemoryEventBus()
+        await bus.start()
+        risco = RiskManagerAgent(bus, producao)
+
+        # Ontem: 2 SOL a 10, taxa de 0,002 SOL descontada do recebido.
+        await registrar(
+            producao, Side.BUY, "2", "10", quando=agora - timedelta(days=1),
+            taxa="0.002", moeda_da_taxa="SOL", simbolo="SOL/USDC",
+        )
+        broker = PaperBroker(quote_currency="USDC", initial_balance=Decimal("9.29"))
+        broker.credit("SOL", Decimal("1.998"))
+        primeiro = await agente(producao, broker, {"SOL": "10"}).build_snapshot()
+        async with session_scope(producao) as session:
+            await session.execute(
+                update(orm.PortfolioSnapshot)
+                .where(orm.PortfolioSnapshot.id == primeiro.id)
+                .values(timestamp=agora.replace(hour=0, minute=1))
+            )
+
+        # Hoje: vende o SOL a 9,20 (taxa na cotacao) e compra 0,0005 BTC a 9.000.
+        venda_bruta = Decimal("1.998") * Decimal("9.2")
+        taxa_venda = venda_bruta * Decimal("0.001")
+        await registrar(
+            producao, Side.SELL, "1.998", "9.2", quando=agora - timedelta(minutes=10),
+            taxa=str(taxa_venda), moeda_da_taxa="USDC", simbolo="SOL/USDC",
+        )
+        await registrar(
+            producao, Side.BUY, "0.0005", "9000", quando=agora - timedelta(minutes=9),
+            taxa="0.0000005", moeda_da_taxa="BTC", simbolo="BTC/USDC",
+        )
+        caixa = Decimal("9.29") + venda_bruta - taxa_venda - Decimal("4.5")
+        broker = PaperBroker(quote_currency="USDC", initial_balance=caixa)
+        broker.credit("BTC", Decimal("0.0004995"))
+
+        depois = (
+            await agente(producao, broker, {"SOL": "9.2", "BTC": "9000"}).build_snapshot()
+        ).model_copy(update={"timestamp": agora})
+
+        # 1,998 x 9,20 contra 20 de custo, menos a taxa da venda.
+        assert depois.realized_pnl == venda_bruta - Decimal("20") - taxa_venda
+        assert depois.realized_pnl < Decimal("-1.6")
+        motivo = await risco.check_circuit_breaker(depois)
+        assert motivo is not None and "perda diaria" in motivo
+        acoes = await acoes_de_auditoria(producao)
+        assert "portfolio_saldo_divergente_do_historico" not in acoes
+        assert "portfolio_saldo_reconciliado" not in acoes
+
+
+class _VendaNaJanela(PaperBroker):
+    """A exchange responde o saldo de ANTES; o trade e gravado logo em seguida.
+
+    Reproduz a janela de `fetch_balance`: o saldo sai da exchange antes do
+    preenchimento, e o Execution Agent grava o trade antes de o Portfolio abrir
+    a sessao do banco.
+    """
+
+    def __init__(self, settings, **kwargs):
+        super().__init__(**kwargs)
+        self._settings = settings
+
+    async def fetch_positions(self, prices):
+        posicoes = await super().fetch_positions(prices)
+        await registrar(self._settings, Side.SELL, "1", "9.80", minuto=5)
+        return posicoes
+
+
+class TestOrdemDeLeituraSaldoEHistorico:
+    """M1 da auditoria: o retrato lia o saldo antes do historico."""
+
+    async def test_venda_gravada_na_janela_nao_conta_o_prejuizo_duas_vezes(self, settings):
+        await registrar(settings, Side.BUY, "2", "10", minuto=0)
+        broker = _VendaNaJanela(settings, initial_balance=Decimal("0"))
+        broker.credit("BTC", Decimal("2"))
+
+        snapshot = await agente(settings, broker, {"BTC": "9.80"}).build_snapshot()
+
+        # Vendido ou nao, 2 BTC comprados a 10 valem 2 x (9,80 - 10) = -0,40.
+        # Lendo o saldo primeiro, o realizado (-0,20) somava ao nao realizado dos
+        # 2 BTC do saldo velho (-0,40): -0,60.
+        assert snapshot.realized_pnl + snapshot.unrealized_pnl == Decimal("-0.40")

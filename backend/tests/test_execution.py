@@ -205,7 +205,9 @@ class TestPaperBroker:
         result = await paper_broker.place_order(make_request())
         assert result.status is OrderStatus.FILLED
         balances = await paper_broker.fetch_balances()
-        assert balances["BTC"] == Decimal("0.001")
+        # Recebe 0,001 menos a taxa de 0,1% cobrada no proprio BTC, como a
+        # Binance sem BNB. Antes creditava 0,001 cheio e cobrava a taxa em USDT.
+        assert balances["BTC"] == Decimal("0.000999")
         assert balances["USDT"] < Decimal("1000")
 
     async def test_slippage_always_works_against_the_operator(self, paper_broker):
@@ -220,18 +222,58 @@ class TestPaperBroker:
         assert sell.average_price < Decimal("50000")
 
     async def test_charges_a_fee(self, paper_broker):
-        result = await paper_broker.place_order(make_request())
-        assert result.fee > 0
-        assert result.fee_currency == "USDT"
+        """A taxa sai da moeda RECEBIDA, como na Binance spot sem BNB.
+
+        Antes o teste exigia `fee_currency == "USDT"` na compra: era o papel
+        cobrando tudo na cotacao, o que escondia do dry_run o saldo de BTC menor
+        que `filled` que o live produz em toda compra (auditoria de 09/11/2026).
+        """
+        compra = await paper_broker.place_order(make_request())
+        assert compra.fee == Decimal("0.000001")
+        assert compra.fee_currency == "BTC"
+        # A compra debita so o bruto: a taxa nao sai do caixa.
+        caixa = (await paper_broker.fetch_balances())["USDT"]
+        assert caixa == Decimal("1000") - Decimal("0.001") * compra.average_price
+
+        venda = await paper_broker.place_order(
+            make_request(client_order_id="cat-teste-002", side=Side.SELL, quantity="0.0005")
+        )
+        assert venda.fee == Decimal("0.0005") * venda.average_price * Decimal("0.001")
+        assert venda.fee_currency == "USDT"
+
+    async def test_truncates_the_quantity_to_the_lot_step(self, paper_broker):
+        """O ccxt envia `amount_to_precision`: a Binance executa o truncado.
+
+        Preencher a quantidade crua fazia o dry_run nunca deixar a poeira que o
+        live deixa ao vender um saldo inteiro.
+        """
+        paper_broker.set_market_filter(
+            MarketFilter(
+                symbol="BTC/USDT",
+                min_amount=Decimal("0.00001"),
+                amount_step=Decimal("0.00001"),
+                min_cost=Decimal("5"),
+            )
+        )
+        result = await paper_broker.place_order(make_request(quantity="0.0012345"))
+
+        assert result.filled_quantity == Decimal("0.00123")
+        balances = await paper_broker.fetch_balances()
+        assert balances["BTC"] == Decimal("0.00123") - result.fee
 
     async def test_rejects_when_cash_is_insufficient(self, paper_broker):
-        result = await paper_broker.place_order(make_request(quantity="10"))
-        assert result.status is OrderStatus.REJECTED
-        assert "insuficiente" in (result.error or "")
+        """Levanta `InsufficientFunds`, como o `CcxtExchange`.
+
+        Antes devolvia REJECTED: o `except InsufficientFunds` do Execution Agent
+        so rodava no live, e o dry_run nao exercitava o caminho real.
+        """
+        with pytest.raises(InsufficientFunds, match="insuficiente"):
+            await paper_broker.place_order(make_request(quantity="10"))
 
     async def test_rejected_order_does_not_move_balances(self, paper_broker):
         before = await paper_broker.fetch_balances()
-        await paper_broker.place_order(make_request(quantity="10"))
+        with pytest.raises(InsufficientFunds):
+            await paper_broker.place_order(make_request(quantity="10"))
         assert await paper_broker.fetch_balances() == before
 
     async def test_fails_without_a_reference_price(self):
@@ -246,7 +288,7 @@ class TestPaperBroker:
         first = await paper_broker.place_order(make_request())
         second = await paper_broker.place_order(make_request())
         assert first.status is OrderStatus.FILLED
-        assert (await paper_broker.fetch_balances())["BTC"] == Decimal("0.001")
+        assert (await paper_broker.fetch_balances())["BTC"] == Decimal("0.000999")
         # A resposta do reenvio e a ORIGINAL, nao uma rejeicao: e o que a
         # exchange devolve quando consultada pelo `clientOrderId`. Dizer
         # "rejeitada" a quem reenviou depois de um timeout faria o sistema
@@ -268,8 +310,8 @@ class TestPaperBroker:
         Memorizar a recusa faria uma nova tentativa legitima -- depois de um
         aporte, por exemplo -- receber para sempre a recusa antiga.
         """
-        recusada = await paper_broker.place_order(make_request(quantity="10"))
-        assert recusada.status is OrderStatus.REJECTED
+        with pytest.raises(InsufficientFunds):
+            await paper_broker.place_order(make_request(quantity="10"))
         paper_broker.credit("USDT", Decimal("1000000"))
         agora = await paper_broker.place_order(make_request(quantity="10"))
         assert agora.status is OrderStatus.FILLED
@@ -421,8 +463,9 @@ class TestIdempotencia:
 
         assert broker.envios == 2, "o retry precisa ter acontecido de verdade"
         saldos = await paper_broker.fetch_balances()
-        # UMA compra, nao duas: 0.001 e nao 0.002. E o `client_order_id` agindo.
-        assert saldos["BTC"] == Decimal("0.001")
+        # UMA compra, nao duas: 0.000999 e nao 0.001998 (o papel desconta a
+        # taxa de 0,1% do BTC recebido, como a Binance). E o `client_order_id`.
+        assert saldos["BTC"] == Decimal("0.000999")
 
     async def test_timeout_depois_de_aceitar_nao_perde_o_trade(
         self, settings, paper_broker
@@ -547,7 +590,8 @@ class TestIdempotencia:
             trades = await TradeRepository(session).list()
         assert len(ordens) == 1
         assert len(trades) == 1
-        assert (await paper_broker.fetch_balances())["BTC"] == Decimal("0.001")
+        # Uma compra so: 0,001 menos a taxa cobrada no BTC recebido.
+        assert (await paper_broker.fetch_balances())["BTC"] == Decimal("0.000999")
 
 
 class TestPreenchimentoParcial:
@@ -879,9 +923,10 @@ class TestDinheiroEmDecimal:
         assert Decimal(str(trade.quantity)) == Decimal("0.003")
         # 50000 * 1.0005 = 50025 exatos; em float o produto nao fecha.
         assert Decimal(str(trade.price)) == Decimal("50025")
-        assert Decimal(str(trade.fee)) == Decimal("0.003") * Decimal(
-            "50025"
-        ) * Decimal("0.001")
+        # A taxa da compra e cobrada no BTC recebido (como a Binance sem BNB):
+        # 0,003 x 0,1%, e nao mais 0,003 x 50025 x 0,1% em USDT.
+        assert Decimal(str(trade.fee)) == Decimal("0.003") * Decimal("0.001")
+        assert trade.fee_currency == "BTC"
 
 
 class TestOFiltroAgeNoSistemaComoEleSobe:
