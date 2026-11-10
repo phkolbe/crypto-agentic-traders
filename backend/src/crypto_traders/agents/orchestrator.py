@@ -29,7 +29,7 @@ from ..exchanges import build_broker, build_market_data_source
 from ..exchanges.base import Broker, MarketDataSource
 from ..logging_setup import get_logger
 from ..notifications import Notifier, build_notifier
-from ..onchain import OnChainProvider
+from ..onchain import IDADE_MAXIMA_MVRV, OnChainProvider
 from ..risk.rules import SizingFeasibility, assess_sizing_feasibility
 from ..strategies import build_strategies
 from .base import BaseAgent
@@ -218,6 +218,17 @@ class Orchestrator:
 
         self._alert_path_alerted = False
         """Se o operador ja foi avisado de que o caminho de alertas caiu."""
+
+        self._mvrv_velho_alertado = False
+        """Aviso de serie MVRV envelhecida sai uma vez por episodio (D19)."""
+
+        self.entrega_de_alertas: dict[str, Any] = {
+            "entregues": 0,
+            "falhas": 0,
+            "falhas_por_canal": {},
+            "ultima_falha": None,
+        }
+        """Resultado dos canais desde a subida (ver `_conferir_entrega`)."""
 
         self._conexao_da_trava: Any = None
         """Conexao dedicada que segura o bloqueio de instancia unica (Postgres)."""
@@ -893,13 +904,27 @@ class Orchestrator:
         await self._audit("all_agents_paused", "system", actor, reason)
         log.warning("orchestrator.paused_all", reason=reason)
 
-    async def resume_all(self, actor: str = "user") -> None:
+    async def resume_all(self, actor: str = "user") -> bool:
         """Retoma todos, inclusive os que o watchdog desistiu (ver `_reabilitar`).
 
         So o desistido quebrado e reiniciado aqui. O que nao foi desistido segue
         com o watchdog, que o reinicia no proprio ciclo -- e um agente que nunca
         subiu (API sem os agentes) nao pode ser posto para rodar por um rearme.
+
+        Com o circuit breaker armado, RECUSA e devolve `False`: retomar a
+        decisao e soltar a abertura e o desarme da trava com outro nome. A regra
+        morava so na rota `POST /agents/resume-all`; quem chamasse o
+        orquestrador por outro caminho desarmava a trava sem rearme (auditoria de
+        09/11/2026, orquestracao L6). O rearme de verdade
+        (`/risk/circuit-breaker/reset`) desarma ANTES e por isso passa.
         """
+        if self._circuit_breaker_active():
+            log.warning(
+                "orchestrator.resume_all_refused",
+                actor=actor,
+                detail="circuit breaker armado; rearme-o antes de retomar",
+            )
+            return False
         agents = self.agents
         for name, agent in agents.items():
             desistido = name in self._given_up
@@ -921,6 +946,7 @@ class Orchestrator:
             unblocker()
 
         await self._audit("all_agents_resumed", "system", actor)
+        return True
 
     async def health(self) -> dict[str, Any]:
         now = datetime.now(UTC)
@@ -968,6 +994,12 @@ class Orchestrator:
             # (alertas) apaga o unico caminho de notificacao: precisa ser
             # visivel onde o operador olha, e nao so no log.
             "tasks": self._own_tasks_alive(),
+            # Canal que recusa nao levanta: sem isto, "alerta enviado" e "alerta
+            # recebido" pareciam a mesma coisa (ver `_conferir_entrega`).
+            "alert_delivery": {
+                **self.entrega_de_alertas,
+                "falhas_por_canal": dict(self.entrega_de_alertas["falhas_por_canal"]),
+            },
         }
 
     def vitalidade(self) -> list[str]:
@@ -1407,9 +1439,50 @@ class Orchestrator:
     async def _notify_directly(self, title: str, message: str) -> None:
         """Fala com o operador sem passar pelo bus, para quando o bus e o problema."""
         try:
-            await self.notifier.send(title, message)
+            resultados = await self.notifier.send(title, message)
         except Exception as exc:
             log.error("orchestrator.direct_notify_failed", error=str(exc))
+            self._registrar_falha_de_entrega(title, "notificador", str(exc))
+            return
+        self._conferir_entrega(title, resultados)
+
+    def _conferir_entrega(self, title: str, resultados: Any) -> None:
+        """Le o `DeliveryResult` de cada canal, que antes era descartado.
+
+        O canal que RECUSA (SMTP 535, token do WhatsApp vencido) nao levanta:
+        devolve `ok=False`. Descartando a lista, o stop-loss e o circuit breaker
+        eram "avisados" sem ninguem receber, e so o log de INFO do canal sabia.
+        Lista vazia (nenhum canal ligado) e escolha do operador, nao falha: o
+        log continua sendo a fonte de verdade.
+        """
+        for resultado in resultados or ():
+            if getattr(resultado, "ok", True):
+                self.entrega_de_alertas["entregues"] += 1
+                continue
+            canal = str(getattr(resultado, "channel", "?"))
+            self._registrar_falha_de_entrega(
+                title, canal, str(getattr(resultado, "detail", ""))
+            )
+
+    def _registrar_falha_de_entrega(self, title: str, canal: str, detalhe: str) -> None:
+        """ERROR no log e o estado em `health()["alert_delivery"]`.
+
+        Avisar a falha PELO bus seria pedir socorro pelo telefone que caiu: o
+        canal quebrado e o mesmo que levaria o aviso. Por isso o estado fica onde
+        o dashboard e a telemetria leem.
+        """
+        log.error(
+            "orchestrator.alert_delivery_failed", channel=canal, detail=detalhe, title=title
+        )
+        estado = self.entrega_de_alertas
+        estado["falhas"] += 1
+        estado["falhas_por_canal"][canal] = estado["falhas_por_canal"].get(canal, 0) + 1
+        estado["ultima_falha"] = {
+            "canal": canal,
+            "detalhe": detalhe,
+            "titulo": title,
+            "quando": datetime.now(UTC).isoformat(),
+        }
 
     async def _drain_alerts(self) -> None:
         assinatura = self.bus.subscribe(Topics.ALERTS)
@@ -1430,11 +1503,13 @@ class Orchestrator:
                 alert.get("message") or alert.get("detail") or alert.get("reason") or ""
             )
             try:
-                await self.notifier.send(title, message)
+                resultados = await self.notifier.send(title, message)
             except Exception as exc:
                 # Falha ao notificar nunca pode derrubar o loop de alertas: o
                 # evento já está no log, que é a fonte de verdade da auditoria.
-                log.error("orchestrator.alert_delivery_failed", error=str(exc))
+                self._registrar_falha_de_entrega(title, "notificador", str(exc))
+                continue
+            self._conferir_entrega(title, resultados)
 
     async def _refresh_onchain_forever(self) -> None:
         """Mantem a serie MVRV atualizada enquanto o sistema roda.
@@ -1453,6 +1528,46 @@ class Orchestrator:
                 # Provedor externo instavel nao derruba o refresher: na proxima
                 # volta tenta de novo, e o filtro nao depende disto para operar.
                 log.warning("orchestrator.onchain_refresh_failed", error=str(exc))
+            try:
+                await self._avisar_mvrv_envelhecido()
+            except Exception as exc:
+                log.warning("orchestrator.onchain_age_check_failed", error=str(exc))
+
+    async def _avisar_mvrv_envelhecido(self) -> None:
+        """Alerta UMA vez por episodio quando a serie passa da idade maxima.
+
+        `OnChainProvider.mvrv_reading` ja devolve `None` com o ponto velho (o
+        filtro se desliga), mas isso so aparece no log. Com o filtro LIGADO o
+        operador escolheu essa protecao, e precisa saber que ela parou -- com o
+        filtro desligado nao ha nada que tenha deixado de agir.
+        """
+        risco = getattr(self, "risk_manager", None)
+        limites = risco.limits if risco is not None else self.settings.risk
+        ultimo = await self.onchain.ultimo_ponto_mvrv()
+        hoje = datetime.now(UTC).date()
+        velho = ultimo is None or hoje - ultimo > IDADE_MAXIMA_MVRV
+        if not velho or limites.mvrv_max_percentile >= 1.0:
+            self._mvrv_velho_alertado = False
+            return
+        if self._mvrv_velho_alertado:
+            return
+        self._mvrv_velho_alertado = True
+        idade = f"{(hoje - ultimo).days} dias" if ultimo is not None else "sem serie"
+        await self.bus.publish(
+            Topics.ALERTS,
+            {
+                "type": "mvrv_stale",
+                "title": "Filtro MVRV desligado: serie on-chain velha",
+                "message": (
+                    f"O ultimo ponto do MVRV Z-Score em cache e de "
+                    f"{ultimo if ultimo is not None else '(nenhum)'} ({idade}; limite de "
+                    f"{IDADE_MAXIMA_MVRV.days} dias). O provedor nao esta respondendo ou "
+                    "mudou o formato. Enquanto isso o filtro de regime NAO se aplica: "
+                    "compras passam sem a checagem de mercado caro."
+                ),
+                "timestamp": datetime.now(UTC).isoformat(),
+            },
+        )
 
     async def _watch_health(self) -> None:
         """Reinicia agentes que morreram ou pararam de dar sinal de vida.

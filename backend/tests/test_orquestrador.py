@@ -19,7 +19,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
-from helpers import make_candles
+from helpers import esperar_ate, make_candles
 
 from crypto_traders.agents import base as base_mod
 from crypto_traders.agents import orchestrator as orch_mod
@@ -113,6 +113,18 @@ async def _escuta_alertas(bus: InMemoryEventBus) -> tuple[list[dict], asyncio.Ta
     return alertas, tarefa
 
 
+async def _vendas_gravadas(settings) -> list:
+    """Ordens de venda no banco: a condicao de espera dos testes de stop-loss.
+
+    Antes era `sleep(0.3)`/`sleep(0.5)` e torcer para a execucao ter consumido o
+    pedido nesse tempo -- num executor de CI lento, falha sem defeito.
+    """
+    from crypto_traders.db.repositories import OrderRepository
+
+    async with session_scope(settings) as session:
+        return [o for o in await OrderRepository(session).list() if o.side == "sell"]
+
+
 @pytest.fixture
 def relogio_apertado(monkeypatch):
     """Encolhe os prazos do watchdog para caberem num teste.
@@ -140,12 +152,12 @@ class TestOciosoOuTravado:
         alertas, escuta = await _escuta_alertas(bus)
 
         await agente.start()
-        await asyncio.sleep(0.05)
+        await esperar_ate(lambda: agente.subscriptions_ready)
 
         # Um evento no inicio, como na subida real (o priming publica candles),
         # e depois o silencio legitimo do timeframe diario.
         await bus.publish(Topics.CANDLES, make_candles([100.0])[0])
-        await asyncio.sleep(0.05)
+        await esperar_ate(lambda: agente.recebidos)
         assert agente.recebidos, "o agente precisa ter recebido o primeiro evento"
 
         tarefa_original = agente._task
@@ -186,9 +198,9 @@ class TestOciosoOuTravado:
         alertas, escuta = await _escuta_alertas(bus)
 
         await agente.start()
-        await asyncio.sleep(0.05)
+        await esperar_ate(lambda: agente.subscriptions_ready)
         await bus.publish(Topics.CANDLES, make_candles([100.0])[0])
-        await asyncio.sleep(0.05)
+        await esperar_ate(lambda: agente.recebidos)
 
         tarefa_original = agente._task
         assert not agente.is_idle, "pendurado no processamento nao e ocioso"
@@ -249,7 +261,7 @@ class TestPerdaDeMensagem:
         orquestrador = BancadaOrquestrador(settings, {"consumidor": agente}, bus)
 
         await agente.start()
-        await asyncio.sleep(0.05)
+        await esperar_ate(lambda: agente.subscriptions_ready)
 
         rajada = make_candles([100.0 + i for i in range(16)])
         subida_original = agente.start
@@ -268,7 +280,7 @@ class TestPerdaDeMensagem:
         agente.started_at = datetime.now(UTC) - timedelta(hours=1)
 
         await orquestrador._check_health_once()
-        await asyncio.sleep(0.2)
+        await esperar_ate(lambda: len(agente.recebidos) >= 16)
 
         await agente.stop()
 
@@ -290,7 +302,7 @@ class TestPerdaDeMensagem:
         agente = AgenteDeEvento(bus)
 
         await agente.start()
-        await asyncio.sleep(0.05)
+        await esperar_ate(lambda: agente.subscriptions_ready)
 
         await agente.stop()
         for candle in make_candles([100.0 + i for i in range(16)]):
@@ -318,9 +330,9 @@ class TestPerdaDeMensagem:
         alertas, escuta = await _escuta_alertas(bus)
 
         await agente.start()
-        await asyncio.sleep(0.05)
+        await esperar_ate(lambda: agente.subscriptions_ready)
         await bus.publish(Topics.CANDLES, make_candles([100.0], symbol="ETH/USDT")[0])
-        await asyncio.sleep(0.05)
+        await esperar_ate(lambda: agente.recebidos)
 
         await asyncio.sleep(0.5)
         await orquestrador._check_health_once()
@@ -347,7 +359,7 @@ class TestPerdaDeMensagem:
         orquestrador = BancadaOrquestrador(settings, {"consumidor": agente}, bus)
 
         await agente.start()
-        await asyncio.sleep(0.05)
+        await esperar_ate(lambda: agente.subscriptions_ready)
         assert bus.subscriber_count[Topics.CANDLES] == 1
 
         agente.last_beat = datetime.now(UTC) - timedelta(hours=1)
@@ -411,7 +423,7 @@ class TestRuidoDeAlerta:
 
         await morto.start()
         await vivo.start()
-        await asyncio.sleep(0.05)
+        await esperar_ate(lambda: vivo.subscriptions_ready)
 
         for _ in range(8):
             await orquestrador._check_health_once()
@@ -449,11 +461,11 @@ class TestRuidoDeAlerta:
         alertas, escuta = await _escuta_alertas(bus)
 
         await agente.start()
-        await asyncio.sleep(0.05)
+        await esperar_ate(lambda: agente.subscriptions_ready)
 
         # Primeiro episodio: travado no processamento.
         await bus.publish(Topics.CANDLES, make_candles([100.0])[0])
-        await asyncio.sleep(0.05)
+        await esperar_ate(lambda: agente.recebidos)
         await asyncio.sleep(0.5)
         await orquestrador._check_health_once()
         trava.set()
@@ -539,7 +551,7 @@ class TestAgentesReais:
         orquestrador = BancadaOrquestrador(settings, {"strategy": agente}, bus)
 
         await agente.start()
-        await asyncio.sleep(0.05)
+        await esperar_ate(lambda: agente.subscriptions_ready)
         await bus.publish(Topics.CANDLES, make_candles([100.0], timeframe="1d")[0])
         await asyncio.sleep(0.05)
 
@@ -565,7 +577,7 @@ class TestAgentesReais:
         orquestrador.risk_manager = _FalsoRisk()
 
         await agente.start()
-        await asyncio.sleep(0.05)
+        await esperar_ate(lambda: agente.subscriptions_ready)
 
         saude = await orquestrador.health()
         await agente.stop()
@@ -646,7 +658,7 @@ class TestControlePeloOperador:
         orquestrador = BancadaOrquestrador(settings, {"consumidor": agente}, bus)
 
         await agente.start()
-        await asyncio.sleep(0.05)
+        await esperar_ate(lambda: agente.subscriptions_ready)
         await agente._cancel_task()
         assert not agente.is_running
 
@@ -662,7 +674,7 @@ class TestControlePeloOperador:
         agente = AgenteDeEvento(bus)
 
         await agente.start()
-        await asyncio.sleep(0.05)
+        await esperar_ate(lambda: agente.subscriptions_ready)
         agente.pause()
 
         await agente.restart()
@@ -680,7 +692,7 @@ class TestControlePeloOperador:
         orquestrador = BancadaOrquestrador(settings, {"consumidor": agente}, bus)
 
         await agente.start()
-        await asyncio.sleep(0.05)
+        await esperar_ate(lambda: agente.subscriptions_ready)
         agente.pause()
         agente.last_beat = datetime.now(UTC) - timedelta(hours=1)
 
@@ -811,7 +823,7 @@ class TestParadaGeralNaoBloqueiaFechamento:
         assert not execucao.is_paused, "a execucao nao pode parar: ela e quem fecha"
 
         await risco.enforce_protective_exits(self._snapshot_furado())
-        await asyncio.sleep(0.3)
+        await esperar_ate(lambda: _vendas_gravadas(settings), prazo=5)
 
         async with session_scope(settings) as session:
             ordens = await OrderRepository(session).list()
@@ -1336,7 +1348,7 @@ class TestExecucaoAbandonada:
         alertas, escuta = await _escuta_alertas(bus)
 
         await execucao.start()
-        await asyncio.sleep(0.05)
+        await esperar_ate(lambda: execucao.subscriptions_ready)
         await execucao._cancel_task()
         orquestrador._given_up.add("execution")
 
@@ -1361,9 +1373,9 @@ class TestExecucaoAbandonada:
         # Com a execucao de volta, a protecao volta a ser emitida de verdade.
         orquestrador._given_up.discard("execution")
         await execucao.start()
-        await asyncio.sleep(0.05)
+        await esperar_ate(lambda: execucao.subscriptions_ready)
         await orquestrador._on_snapshot(self._snapshot_furado())
-        await asyncio.sleep(0.3)
+        await esperar_ate(lambda: _vendas_gravadas(settings), prazo=5)
         escuta.cancel()
 
         async with session_scope(settings) as session:
@@ -1538,7 +1550,7 @@ class TestPausarAExecucaoNaoDesligaOStopLoss:
         _, execucao, orquestrador = await _bancada_execucao(settings, bus)
         alertas, escuta = await _escuta_alertas(bus)
         await execucao.start()
-        await asyncio.sleep(0.05)
+        await esperar_ate(lambda: execucao.subscriptions_ready)
 
         # Exatamente o que a rota da interface faz.
         assert await orquestrador.pause_agent("execution", actor="user")
@@ -1551,7 +1563,7 @@ class TestPausarAExecucaoNaoDesligaOStopLoss:
         )
 
         await orquestrador._on_snapshot(_snapshot_com_stop_rompido())
-        await asyncio.sleep(0.5)
+        await esperar_ate(lambda: _vendas_gravadas(settings), prazo=5)
 
         async with session_scope(settings) as session:
             ordens = await OrderRepository(session).list()
@@ -1594,7 +1606,7 @@ class TestPausarAExecucaoNaoDesligaOStopLoss:
         risco, execucao, orquestrador = await _bancada_execucao(settings, bus)
         alertas, escuta = await _escuta_alertas(bus)
         await execucao.start()
-        await asyncio.sleep(0.05)
+        await esperar_ate(lambda: execucao.subscriptions_ready)
 
         execucao.pause()  # sem passar pelo orquestrador
         assert execucao.is_running and not execucao.deaf_topics, (
@@ -1626,7 +1638,7 @@ class TestPausarAExecucaoNaoDesligaOStopLoss:
         risco, execucao, orquestrador = await _bancada_execucao(settings, bus)
         alertas, escuta = await _escuta_alertas(bus)
         await execucao.start()
-        await asyncio.sleep(0.05)
+        await esperar_ate(lambda: execucao.subscriptions_ready)
 
         execucao.state = AgentState.ERROR
         execucao.last_error = "assinatura de order.requests caiu"
@@ -1659,6 +1671,30 @@ class TestPausarAExecucaoNaoDesligaOStopLoss:
         risco._circuit_breaker_active = False
         await orquestrador.resume_agent("execution", actor="user")
         assert execucao.openings_blocked is None
+
+    async def test_retomar_tudo_nao_desarma_o_circuit_breaker(self, settings):
+        """`resume_all` soltava decisao e abertura sem olhar a trava.
+
+        So a rota `POST /agents/resume-all` conferia o circuit breaker: quem
+        chamasse o orquestrador por outro caminho desarmava a trava sem rearme
+        (auditoria de 09/11/2026, orquestracao L6). A regra mora agora no
+        orquestrador, junto de `_allow_openings_for`.
+        """
+        bus = InMemoryEventBus()
+        await bus.start()
+        risco, execucao, orquestrador = await _bancada_execucao(settings, bus)
+
+        await orquestrador.pause_all(actor="circuit_breaker", reason="perda diaria")
+        risco._circuit_breaker_active = True
+
+        assert await orquestrador.resume_all(actor="user") is False
+        assert execucao.openings_blocked is not None
+        assert risco.is_paused
+
+        risco._circuit_breaker_active = False
+        assert await orquestrador.resume_all(actor="user") is True
+        assert execucao.openings_blocked is None
+        assert not risco.is_paused
 
 
 class TestTarefasDoOrquestrador:
@@ -1853,7 +1889,7 @@ class TestRetomarODesistido:
         await bus.start()
         _, execucao, orquestrador = await _bancada_execucao(settings, bus)
         await execucao.start()
-        await asyncio.sleep(0.05)
+        await esperar_ate(lambda: execucao.subscriptions_ready)
         await _desistir_de_verdade(orquestrador, "execution", execucao)
 
         assert await orquestrador.resume_agent("execution", actor="user")
@@ -1867,7 +1903,7 @@ class TestRetomarODesistido:
         )
 
         await orquestrador._on_snapshot(_snapshot_com_stop_rompido())
-        await asyncio.sleep(0.5)
+        await esperar_ate(lambda: _vendas_gravadas(settings), prazo=5)
         async with session_scope(settings) as session:
             ordens = await OrderRepository(session).list()
         await execucao.stop()
@@ -1884,7 +1920,7 @@ class TestRetomarODesistido:
         agente = AgenteDeEvento(bus)
         orquestrador = BancadaOrquestrador(settings, {"consumidor": agente}, bus)
         await agente.start()
-        await asyncio.sleep(0.05)
+        await esperar_ate(lambda: agente.subscriptions_ready)
         await _desistir_de_verdade(orquestrador, "consumidor", agente)
 
         await orquestrador.resume_all(actor="user")
@@ -1909,7 +1945,7 @@ class TestRetomarODesistido:
         agente = AgenteDeEvento(bus)
         orquestrador = BancadaOrquestrador(settings, {"consumidor": agente}, bus)
         await agente.start()
-        await asyncio.sleep(0.05)
+        await esperar_ate(lambda: agente.subscriptions_ready)
         agente.state = AgentState.ERROR
         agente.last_error = "tarefa interna morreu"
         antes = agente.restarts
@@ -2222,9 +2258,9 @@ class TestParadaDrena:
         trava = asyncio.Event()
         agente = AgenteDeEvento(bus, trava=trava)
         await agente.start()
-        await asyncio.sleep(0.05)
+        await esperar_ate(lambda: agente.subscriptions_ready)
         await bus.publish(Topics.CANDLES, make_candles([100.0])[0])
-        await asyncio.sleep(0.05)
+        await esperar_ate(lambda: agente.recebidos)
         assert agente.recebidos, "o cenario depende do evento em processamento"
         return bus, agente, trava
 

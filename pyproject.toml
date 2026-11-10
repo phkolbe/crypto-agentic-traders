@@ -38,6 +38,7 @@ dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.25",
     "pytest-cov>=6.0",
+    "pytest-timeout>=2.3",
     "ruff>=0.9",
 ]
 
@@ -56,6 +57,10 @@ testpaths = ["backend/tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 filterwarnings = ["ignore::DeprecationWarning"]
+# Um `await` pendurado morria so no limite de 20 min do job do CI, sem dizer qual
+# teste era. O mais lento da suite leva poucos segundos; 120 s e folga para um
+# executor de CI lento sem esconder um teste travado.
+timeout = 120
 markers = [
     "cenario: sistema real contra o mercado simulado (crypto_traders.simulacao); roda na suite padrao",
 ]

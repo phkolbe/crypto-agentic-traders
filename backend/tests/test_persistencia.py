@@ -1730,10 +1730,10 @@ class TestOSchemaPermiteHypertable:
 #: Postgres de verdade, quando houver um. Sem servidor a suite nao tem como
 #: exercitar o dialeto real -- os testes acima medem os processadores e o DDL,
 #: que e o que da para medir sem banco. Com
-#: `POSTGRES_TEST_URL=postgresql+asyncpg://...` apontando para um banco
-#: DESCARTAVEL (o `docker compose up` do projeto serve), esta classe fecha a
-#: prova de ponta a ponta: ida e volta de 18 casas, hypertables criadas e
-#: auditoria imutavel no dialeto de producao.
+#: `POSTGRES_TEST_URL=postgresql+asyncpg://...` apontando para um servidor
+#: DESCARTAVEL (README, secao Testes -- NAO o Postgres do compose, que guarda o
+#: historico do ensaio), esta classe fecha a prova de ponta a ponta: ida e volta
+#: de 18 casas, hypertables criadas e auditoria imutavel no dialeto de producao.
 POSTGRES_TEST_URL = os.getenv("POSTGRES_TEST_URL")
 
 
@@ -1742,9 +1742,12 @@ class TestPostgresDeVerdade:
     """Opcional por falta de servidor na maquina, nao por ser menos importante."""
 
     @pytest.fixture
-    async def pg(self):
+    async def pg(self, postgres_descartavel):
+        # Database proprio por teste (`conftest.postgres_descartavel`): gravar no
+        # database do POSTGRES_TEST_URL deixava trades e auditoria append-only
+        # para sempre a cada execucao.
         await dispose_engine()
-        configurado = Settings(database_url=POSTGRES_TEST_URL)
+        configurado = Settings(database_url=postgres_descartavel)
         await init_db(configurado)
         yield configurado
         await dispose_engine()

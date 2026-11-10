@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
+import uuid
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
-from helpers import make_candles
+from helpers import (
+    LIBERACAO_DO_BANCO_DO_SISTEMA,
+    e_o_banco_do_sistema,
+    make_candles,
+    recusa_do_banco_do_sistema,
+)
+from sqlalchemy import text
 from sqlalchemy.engine import make_url
 
 from crypto_traders.config import DEFAULT_DB_PATH, RiskSettings, Settings, TradingSettings
@@ -22,6 +30,23 @@ BANCO_DO_ENSAIO = DEFAULT_DB_PATH
 
 class BancoDoEnsaioTocado(RuntimeError):
     """A suite tentou abrir o banco do ensaio. Nao existe caso legitimo disso."""
+
+
+def pytest_configure(config):
+    """Recusa a suite inteira se o ambiente aponta para o Postgres do sistema.
+
+    A barreira abaixo so via o SQLite do ensaio, e desde 24/10/2026 o dinheiro
+    do ensaio esta no Postgres `crypto`. `isolate_from_dotenv` desliga o `.env`,
+    mas `DATABASE_URL` e `POSTGRES_TEST_URL` exportados no shell continuam
+    valendo -- e o `README.md` mandava a suite para o mesmo servidor, com o
+    superusuario. `TestPostgresDeVerdade` grava trades e `audit_log`, que sao
+    append-only: uma venda falsa de ETH no historico real move o preco medio e o
+    stop para sempre (auditoria de 09/11/2026, testes, foco 3). Recusar antes de
+    coletar e melhor que descobrir depois do primeiro `INSERT`.
+    """
+    motivo = recusa_do_banco_do_sistema(dict(os.environ))
+    if motivo is not None:
+        raise pytest.UsageError(motivo)
 
 
 def _e_o_banco_do_ensaio(alvo: object) -> bool:
@@ -94,6 +119,15 @@ def banco_do_ensaio_e_intocavel(monkeypatch):
             raise BancoDoEnsaioTocado(
                 f"a suite tentou abrir um engine sobre o banco do ensaio ({url}). "
                 "Use a fixture `settings`, que aponta para tmp_path."
+            )
+        # A mesma porta para o Postgres: `Settings()` sem `database_url` le a
+        # `DATABASE_URL` do ambiente, e o engine nao conecta ao ser criado -- o
+        # primeiro `session_scope` ja gravaria.
+        if e_o_banco_do_sistema(url) and os.environ.get(LIBERACAO_DO_BANCO_DO_SISTEMA) != "1":
+            raise BancoDoEnsaioTocado(
+                "a suite tentou abrir um engine sobre o Postgres do sistema "
+                f"({make_url(str(url)).render_as_string(hide_password=True)}). Use um "
+                "Postgres descartavel (README, secao Testes)."
             )
         return engine_original(url, *args, **kwargs)
 
@@ -172,3 +206,36 @@ async def settings(tmp_path, risk_limits) -> Settings:
 @pytest.fixture
 def candle_factory():
     return make_candles
+
+
+@pytest.fixture
+async def postgres_descartavel():
+    """URL de um database NOVO no servidor do `POSTGRES_TEST_URL`, apagado no fim.
+
+    `TestPostgresDeVerdade` gravava no proprio database do `POSTGRES_TEST_URL`,
+    sem limpar, em tabelas append-only: cada execucao deixava trades
+    (`DEZOITO/USDC`, `ETH/USDC`) e linhas de auditoria para sempre, e "a ultima
+    trade" de um teste ja leu a de outro. Um database por teste nao herda nada
+    e some junto com o que gravou.
+    """
+    base_url = os.environ.get("POSTGRES_TEST_URL")
+    if not base_url:
+        pytest.skip("POSTGRES_TEST_URL nao definida")
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    base = make_url(base_url)
+    nome = f"crypto_t_{uuid.uuid4().hex[:8]}"
+    admin = create_async_engine(base, isolation_level="AUTOCOMMIT")
+    try:
+        async with admin.connect() as conn:
+            await conn.execute(text(f'CREATE DATABASE "{nome}"'))
+    except Exception as exc:  # pragma: no cover - servidor sem permissao
+        await admin.dispose()
+        pytest.skip(f"sem permissao para criar database de teste: {exc}")
+    try:
+        yield base.set(database=nome).render_as_string(hide_password=False)
+    finally:
+        await dispose_engine()
+        async with admin.connect() as conn:
+            await conn.execute(text(f'DROP DATABASE IF EXISTS "{nome}" WITH (FORCE)'))
+        await admin.dispose()

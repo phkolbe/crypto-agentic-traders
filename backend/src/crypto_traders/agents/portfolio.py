@@ -47,8 +47,9 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 
 from ..bus import EventBus, Topics
@@ -82,6 +83,18 @@ ACAO_TAXA = "portfolio_taxa_descartada"
 ACAO_SEM_BASE = "portfolio_venda_sem_base_de_custo"
 ACAO_RECONCILIADO = "portfolio_saldo_reconciliado"
 ACAO_DIVERGENTE = "portfolio_saldo_divergente_do_historico"
+ACAO_SALDO_SEM_BASE = "portfolio_saldo_sem_base_de_custo"
+
+#: O que `DELETE /trades/{id}` grava, com o lancamento inteiro no `before`. E a
+#: evidencia de edicao retroativa que `_sustentar` exige (ver la).
+ACAO_LANCAMENTO_APAGADO = "manual_trade_deleted"
+
+#: Folga entre o carimbo do retrato anterior e a exclusao. O carimbo e posto
+#: DEPOIS da leitura do historico e do saldo (a latencia do `fetch_balance`):
+#: uma exclusao gravada nessa janela nao foi vista pelo retrato anterior, mas tem
+#: horario anterior ao dele. Sem a folga, a correcao do digito seria lida como
+#: prejuizo -- a direcao segura, mas e a trava armando por um typo.
+FOLGA_DA_ANCORA = timedelta(minutes=5)
 
 #: As duas acoes que formam o **razao de fantasmas**: quantidade reconhecida como
 #: fora do saldo e credito ja atribuido a ela. O razao mora no `audit_log` porque
@@ -198,6 +211,12 @@ class PortfolioAgent(BaseAgent):
             razao = _ler_razao(
                 await PortfolioLedgerRepository(session).movements(ACOES_DO_RAZAO), modo
             )
+            apagadas = _vendas_apagadas(
+                await PortfolioLedgerRepository(session).movements(
+                    (ACAO_LANCAMENTO_APAGADO,)
+                ),
+                ancora,
+            )
 
         positions = await self._broker.fetch_positions(prices)
 
@@ -213,15 +232,19 @@ class PortfolioAgent(BaseAgent):
             )
 
         apuracao = self._apurar(trades)
+        # O historico como era antes das exclusoes recentes: so ele diz quanto
+        # realizado e quanta quantidade a correcao do operador tirou.
+        antes_da_edicao = self._apurar([*trades, *apagadas]) if apagadas else None
         saldos = {p.asset: p.quantity for p in positions}
         creditos, avisos_razao = self._reconciliar(
-            apuracao, saldos, prices, ancora, razao
+            apuracao, saldos, prices, ancora, razao, antes_da_edicao
         )
 
         cash = Decimal(0)
         positions_value = Decimal(0)
         priced: list[Position] = []
         unpriced: list[str] = []
+        avisos_saldo: list[_Aviso] = []
 
         for position in positions:
             if position.asset == quote:
@@ -240,11 +263,37 @@ class PortfolioAgent(BaseAgent):
 
             value = position.quantity * price
             positions_value += value
+            medio = apuracao.custo_medio(position.asset)
+            com_base: Decimal | None = None
+            historico = apuracao.quantidades.get(position.asset, Decimal(0))
+            if medio is not None and position.quantity > historico:
+                # Saldo acima do historico: o excedente entrou de fora (deposito)
+                # e nao tem custo conhecido. Fica no patrimonio, mas fora do nao
+                # realizado -- senao o medio do historico aplicado ao deposito
+                # move o numero que a trava obedece (auditoria de 09/11/2026,
+                # dados M2). O saque ja era coberto pelo razao de fantasmas.
+                com_base = historico
+                excedente = position.quantity - historico
+                avisos_saldo.append(
+                    _Aviso(
+                        ACAO_SALDO_SEM_BASE,
+                        position.asset,
+                        f"{excedente} {position.asset} no saldo alem do historico "
+                        f"(deposito externo?): sem base de custo, fora do resultado "
+                        f"de negociacao; lance a compra para dar base a eles",
+                        {
+                            "asset": position.asset,
+                            "saldo": str(position.quantity),
+                            "historico": str(historico),
+                        },
+                    )
+                )
             priced.append(
                 position.model_copy(
                     update={
                         "current_price": price,
-                        "average_price": apuracao.custo_medio(position.asset),
+                        "average_price": medio,
+                        "cost_basis_quantity": com_base,
                     }
                 )
             )
@@ -269,7 +318,7 @@ class PortfolioAgent(BaseAgent):
         )
 
         async with session_scope(self._settings) as session:
-            await self._registrar(session, apuracao.avisos + avisos_razao)
+            await self._registrar(session, apuracao.avisos + avisos_razao + avisos_saldo)
             await PortfolioSnapshotRepository(session).save(snapshot, modo)
             await AgentRunRepository(session).heartbeat(
                 self.name, str(self.state), f"patrimonio {total:.2f} {quote}"
@@ -427,6 +476,7 @@ class PortfolioAgent(BaseAgent):
         precos: dict[str, Decimal],
         ancora: Any,
         razao: dict[str, tuple[Decimal, Decimal]],
+        antes_da_edicao: _Apuracao | None = None,
     ) -> tuple[Decimal, list[_Aviso]]:
         """Credito acumulado dos fantasmas, e o movimento do razao desta volta.
 
@@ -445,11 +495,13 @@ class PortfolioAgent(BaseAgent):
            interface oferece para corrigir digitacao). O saldo nao mudou, mas o
            realizado derivado caiu -- e a trava leria a correcao de um digito
            como prejuizo. O fantasma que sobrou sustenta o nivel que o retrato
-           anterior JA publicou.
+           anterior JA publicou, ate o realizado que a venda apagada produzia
+           (`antes_da_edicao`, ver `_sustentar`).
         3. **O historico nunca foi confirmado pela exchange** (divergencia
-           herdada, ativo que nunca apareceu no saldo). Nao ha evidencia de que a
-           quantidade tenha saido de lugar nenhum, entao nao ha o que reconciliar:
-           fica registrada com credito zero e pede acao humana.
+           herdada, ativo que nunca apareceu no saldo, compra manual de um ativo
+           que esta em outra corretora). Nao ha evidencia de que a quantidade
+           tenha saido de lugar nenhum, entao nao ha o que reconciliar: fica
+           registrada com credito zero e pede acao humana.
 
         E o credito e DESFEITO quando o fantasma deixa de existir -- o trade
         verdadeiro chegou (e o realizado derivado, com o preco real do
@@ -521,7 +573,7 @@ class PortfolioAgent(BaseAgent):
             )
 
         creditos, sustentacao = self._sustentar(
-            apuracao, publicado, creditos, pendentes
+            apuracao, publicado, creditos, pendentes, antes_da_edicao
         )
         for asset, retroativo, credito_novo, sustentado in sustentacao:
             avisos.append(
@@ -548,6 +600,7 @@ class PortfolioAgent(BaseAgent):
         publicado: Decimal | None,
         creditos: Decimal,
         pendentes: list[tuple[str, Decimal, Decimal]],
+        antes_da_edicao: _Apuracao | None = None,
     ) -> tuple[Decimal, list[tuple[str, Decimal, Decimal, Decimal]]]:
         """Sustenta o realizado ja publicado quando o historico foi editado atras.
 
@@ -556,21 +609,45 @@ class PortfolioAgent(BaseAgent):
         acumulado -- seria a trava lendo a correcao de um digito como prejuizo, e
         exigindo rearme manual por causa de um typo.
 
-        A sustentacao vale somente para a parte do fantasma que apareceu SEM que
-        o saldo mudasse (a assinatura da edicao retroativa) e somente ate o nivel
-        que o retrato anterior publicou. Ela e liberada junto com o fantasma: se o
-        lancamento voltar, ou se a venda de verdade for gravada, o realizado
-        derivado assume.
+        "Fantasma que apareceu sem o saldo mudar" NAO basta como assinatura da
+        edicao: uma compra manual de XRP que a exchange nao tem (operacao em
+        outra corretora) tem a mesma cara, e recebia a `falta` inteira do ciclo
+        -- no dia em que o stop vendia SOL com -1,60, o realizado publicado nao
+        caia e a trava nao via a perda. Por isso a sustentacao exige a evidencia
+        da edicao, `antes_da_edicao`: o historico com as VENDAS manuais apagadas
+        depois do retrato anterior (o `manual_trade_deleted` guarda o lancamento
+        inteiro). E vale somente:
+
+        * para a quantidade que a exclusao devolveu ao ativo (o resto do
+          pendente fica com credito zero, como divergencia);
+        * ate o realizado que as vendas apagadas produziam -- a perda de verdade
+          no mesmo ciclo nao pode pegar carona na correcao;
+        * ate o nivel que o retrato anterior publicou.
+
+        Ela e liberada junto com o fantasma: se o lancamento voltar, ou se a
+        venda de verdade for gravada, o realizado derivado assume.
         """
         if not pendentes:
             return creditos, []
         falta = Decimal(0)
-        if publicado is not None:
+        elegivel: dict[str, Decimal] = {}
+        if publicado is not None and antes_da_edicao is not None:
             falta = max(Decimal(0), publicado - (apuracao.realizado + creditos))
-        total = sum((quantidade for _, quantidade, _ in pendentes), start=Decimal(0))
+            produzido = antes_da_edicao.realizado - apuracao.realizado
+            falta = min(falta, max(Decimal(0), produzido))
+            for asset, _, _ in pendentes:
+                devolvido = apuracao.quantidades.get(
+                    asset, Decimal(0)
+                ) - antes_da_edicao.quantidades.get(asset, Decimal(0))
+                elegivel[asset] = max(Decimal(0), devolvido)
+        pesos = {
+            asset: min(quantidade, elegivel.get(asset, Decimal(0)))
+            for asset, quantidade, _ in pendentes
+        }
+        total = sum(pesos.values(), start=Decimal(0))
         movimentos: list[tuple[str, Decimal, Decimal, Decimal]] = []
         for asset, quantidade, credito_novo in pendentes:
-            sustentado = falta * quantidade / total if total > 0 else Decimal(0)
+            sustentado = falta * pesos[asset] / total if total > 0 else Decimal(0)
             creditos += sustentado
             movimentos.append((asset, quantidade, credito_novo, sustentado))
         return creditos, movimentos
@@ -687,6 +764,45 @@ def _ler_razao(
             credito + _decimal(dados.get("credito")),
         )
     return razao
+
+
+def _vendas_apagadas(entries: Iterable[Any], ancora: Any) -> list[Any]:
+    """VENDAS manuais apagadas depois do retrato anterior, como trades de novo.
+
+    O `before` do `manual_trade_deleted` e o lancamento inteiro
+    (`api/routes/trades.py`), entao da para reapurar o historico como ele era
+    antes da correcao. Exclusao antiga nao entra: o retrato que a viu ja
+    publicou o realizado sem ela. Linha sem os campos (o registro antigo
+    guardava so o id) fica de fora -- sem ela a sustentacao nao acontece, que e
+    a direcao segura.
+    """
+    if ancora is None:
+        return []
+    desde = _instante(ancora.timestamp) - FOLGA_DA_ANCORA
+    vendas: list[Any] = []
+    for entry in entries:
+        if _instante(entry.timestamp) <= desde:
+            continue
+        dados = entry.before or {}
+        if dados.get("side") != str(Side.SELL):
+            continue
+        try:
+            vendas.append(
+                SimpleNamespace(
+                    id=str(dados.get("id") or entry.target or ""),
+                    symbol=str(dados["symbol"]),
+                    side=str(Side.SELL),
+                    quantity=dados["quantity"],
+                    price=dados["price"],
+                    fee=dados.get("fee"),
+                    fee_currency=dados.get("fee_currency"),
+                    mode=dados.get("mode"),
+                    executed_at=datetime.fromisoformat(str(dados["executed_at"])),
+                )
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    return vendas
 
 
 def _quantidades_do_retrato(ancora: Any) -> dict[str, Decimal]:

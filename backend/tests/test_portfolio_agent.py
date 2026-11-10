@@ -690,8 +690,10 @@ class TestReconciliacaoDeSaldoComHistorico:
         assert primeiro.realized_pnl == Decimal("3")
         await self._referencia_do_dia(producao, primeiro, agora.replace(hour=0, minute=1))
 
-        async with session_scope(producao) as session:
-            assert await TradeRepository(session).delete(venda_id)
+        # Pelo mesmo caminho da API, que grava o `manual_trade_deleted`: apagar
+        # direto no repositorio era aceito como edicao retroativa, e por isso uma
+        # compra manual sem saldo tambem era (ver TestCompraManualQueAExchangeNaoTem).
+        await apagar_como_a_api(producao, venda_id)
 
         depois = (
             await agente(producao, carteira("32"), {"BTC": "13"}).build_snapshot()
@@ -1013,3 +1015,187 @@ class TestOrdemDeLeituraSaldoEHistorico:
         # Lendo o saldo primeiro, o realizado (-0,20) somava ao nao realizado dos
         # 2 BTC do saldo velho (-0,40): -0,60.
         assert snapshot.realized_pnl + snapshot.unrealized_pnl == Decimal("-0.40")
+
+
+# ----------------------------------------------------------------------
+# Deposito externo e compra manual que a exchange nao confirma
+# ----------------------------------------------------------------------
+@pytest.fixture
+def producao_usdt(settings):
+    """29,29 autorizados e trava diaria de 5%: a configuracao do ensaio."""
+    return settings.model_copy(
+        update={
+            "risk": settings.risk.model_copy(update={"authorized_capital": Decimal("29.29")})
+        }
+    )
+
+
+async def _vira_referencia_do_dia(settings, snapshot, agora) -> None:
+    async with session_scope(settings) as session:
+        await session.execute(
+            update(orm.PortfolioSnapshot)
+            .where(orm.PortfolioSnapshot.id == snapshot.id)
+            .values(timestamp=agora.replace(hour=0, minute=1))
+        )
+
+
+async def apagar_como_a_api(settings, trade_id: str) -> None:
+    """O que `DELETE /trades/{id}` faz: apaga e grava o lancamento inteiro no
+    `before` do `manual_trade_deleted` -- a evidencia que `_sustentar` exige."""
+    from crypto_traders.api.schemas import TradeOut
+
+    async with session_scope(settings) as session:
+        repositorio = TradeRepository(session)
+        trade = await repositorio.get(trade_id)
+        antes = TradeOut.model_validate(trade).model_dump(mode="json")
+        assert await repositorio.delete(trade_id)
+        await AuditLogRepository(session).append(
+            action="manual_trade_deleted", actor="user", target=trade_id, before=antes
+        )
+
+
+class TestDepositoExterno:
+    """M2 da auditoria (dados): o nao realizado multiplicava o SALDO pelo medio
+    do HISTORICO.
+
+    1 BTC comprado pelo sistema a 100, mercado a 90: -10 de nao realizado. O
+    operador deposita mais 1 BTC vindo de fora e o retrato seguinte dava -20: o
+    resultado de negociacao caia 10 sem perda nenhuma e a trava armava (34% dos
+    29,29 autorizados). O BTC depositado nao tem base de custo conhecida, e
+    quantidade sem base nao tem resultado a declarar -- a mesma regra da venda
+    sem base.
+    """
+
+    async def test_deposito_de_ativo_ja_em_carteira_nao_move_a_trava(self, producao_usdt):
+        agora = datetime.now(UTC).replace(hour=12, minute=0, second=0, microsecond=0)
+        bus = InMemoryEventBus()
+        await bus.start()
+        risco = RiskManagerAgent(bus, producao_usdt)
+
+        await registrar(producao_usdt, Side.BUY, "1", "100", quando=agora - timedelta(days=1))
+        primeiro = await agente(
+            producao_usdt, carteira("0", BTC="1"), {"BTC": "90"}
+        ).build_snapshot()
+        assert primeiro.unrealized_pnl == Decimal("-10")
+        await _vira_referencia_do_dia(producao_usdt, primeiro, agora)
+
+        depois = (
+            await agente(producao_usdt, carteira("0", BTC="2"), {"BTC": "90"}).build_snapshot()
+        ).model_copy(update={"timestamp": agora})
+
+        assert depois.unrealized_pnl == Decimal("-10")
+        btc = next(p for p in depois.positions if p.asset == "BTC")
+        assert btc.quantity == Decimal("2")
+        assert btc.average_price == Decimal("100")
+        assert btc.cost_basis_quantity == Decimal("1")
+        assert depois.total_value == Decimal("180")
+        assert await risco.check_circuit_breaker(depois) is None
+        assert not risco.circuit_breaker_active
+        assert "portfolio_saldo_sem_base_de_custo" in await acoes_de_auditoria(producao_usdt)
+
+    async def test_saldo_igual_ao_historico_segue_inteiro_no_nao_realizado(self, settings):
+        """Contraprova: sem deposito, a quantidade inteira tem base e conta."""
+        await registrar(settings, Side.BUY, "1", "100", minuto=0)
+
+        snapshot = await agente(settings, carteira("0", BTC="1"), {"BTC": "90"}).build_snapshot()
+
+        assert snapshot.unrealized_pnl == Decimal("-10")
+        assert "portfolio_saldo_sem_base_de_custo" not in await acoes_de_auditoria(settings)
+
+
+class TestCompraManualQueAExchangeNaoTem:
+    """`_sustentar` existe para a correcao de um digito (venda manual apagada).
+
+    Mas ele aceitava QUALQUER fantasma sem saida de saldo como "edicao
+    retroativa": uma compra manual de XRP que a exchange nao tem (operacao em
+    outra corretora, lancamento errado) virava pendente e recebia toda a
+    `falta` do ciclo. No mesmo dia em que um stop vendia SOL com -1,60, o
+    realizado publicado nao caia e a trava nao via a perda (nota da frente G3 da
+    rodada anterior). A sustentacao agora exige a evidencia da edicao: um
+    `manual_trade_deleted` de VENDA daquele ativo depois do retrato anterior, e
+    so ate o realizado que a venda apagada tinha produzido.
+    """
+
+    async def test_compra_manual_sem_saldo_nao_absorve_a_perda_do_dia(self, producao_usdt):
+        agora = datetime.now(UTC).replace(hour=12, minute=0, second=0, microsecond=0)
+        bus = InMemoryEventBus()
+        await bus.start()
+        risco = RiskManagerAgent(bus, producao_usdt)
+
+        await registrar(
+            producao_usdt, Side.BUY, "2", "10", quando=agora - timedelta(days=1),
+            simbolo="SOL/USDT",
+        )
+        primeiro = await agente(
+            producao_usdt, carteira("9.29", SOL="2"), {"SOL": "10"}
+        ).build_snapshot()
+        await _vira_referencia_do_dia(producao_usdt, primeiro, agora)
+
+        # Hoje: o stop vende o SOL a 9,20 (-1,60) e o operador lanca uma compra
+        # de XRP feita em outra corretora -- a exchange daqui nunca viu esse XRP.
+        await registrar(
+            producao_usdt, Side.SELL, "2", "9.2", quando=agora - timedelta(minutes=10),
+            simbolo="SOL/USDT",
+        )
+        await registrar(
+            producao_usdt, Side.BUY, "10", "0.5", quando=agora - timedelta(minutes=5),
+            simbolo="XRP/USDT", origem=TradeOrigin.MANUAL, modo="manual",
+        )
+        depois = (
+            await agente(
+                producao_usdt, carteira("27.69"), {"SOL": "9.2", "XRP": "0.5"}
+            ).build_snapshot()
+        ).model_copy(update={"timestamp": agora})
+
+        assert depois.realized_pnl == Decimal("-1.6")
+        motivo = await risco.check_circuit_breaker(depois)
+        assert motivo is not None and "perda diaria" in motivo
+        acoes = await acoes_de_auditoria(producao_usdt)
+        assert "portfolio_saldo_divergente_do_historico" in acoes
+
+    async def test_venda_apagada_sustenta_so_o_que_ela_tinha_produzido(self, producao_usdt):
+        """A correcao do digito e a perda de verdade no MESMO ciclo.
+
+        Apagar a venda manual de BTC (+3) e legitimo e segue sustentado; o -1,60
+        do SOL vendido no mesmo ciclo nao pode ir junto. Antes, a `falta`
+        inteira (3 + 1,60) ia para o fantasma do BTC e o realizado ficava em 3.
+        """
+        agora = datetime.now(UTC).replace(hour=12, minute=0, second=0, microsecond=0)
+
+        await registrar(producao_usdt, Side.BUY, "1", "10", quando=agora - timedelta(days=2))
+        await registrar(
+            producao_usdt, Side.BUY, "2", "10", quando=agora - timedelta(days=1),
+            simbolo="SOL/USDT",
+        )
+        async with session_scope(producao_usdt) as session:
+            venda = await TradeRepository(session).record(
+                executed_at=agora - timedelta(days=1),
+                exchange="paper",
+                symbol="BTC/USDT",
+                side=str(Side.SELL),
+                quantity=Decimal("1"),
+                price=Decimal("13"),
+                origin=TradeOrigin.MANUAL,
+                mode="manual",
+            )
+            venda_id = venda.id
+
+        primeiro = await agente(
+            producao_usdt, carteira("12", SOL="2"), {"BTC": "13", "SOL": "10"}
+        ).build_snapshot()
+        assert primeiro.realized_pnl == Decimal("3")
+        await _vira_referencia_do_dia(producao_usdt, primeiro, agora)
+
+        await apagar_como_a_api(producao_usdt, venda_id)
+        await registrar(
+            producao_usdt, Side.SELL, "2", "9.2", quando=agora - timedelta(minutes=10),
+            simbolo="SOL/USDT",
+        )
+        depois = (
+            await agente(
+                producao_usdt, carteira("30.4"), {"BTC": "13", "SOL": "9.2"}
+            ).build_snapshot()
+        ).model_copy(update={"timestamp": agora})
+
+        # 3 sustentados pela correcao + (-1,60) do SOL.
+        assert depois.realized_pnl == Decimal("1.4")
