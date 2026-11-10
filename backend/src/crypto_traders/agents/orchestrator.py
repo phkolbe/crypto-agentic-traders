@@ -1663,7 +1663,8 @@ class Orchestrator:
         assinatura = self.bus.subscribe(Topics.ALERTS)
         # Antes do primeiro `anext`: o gerador do bus registra a assinatura antes
         # da primeira suspensao, entao quem espera este evento (a subida) so volta
-        # a rodar com ela no lugar.
+        # a rodar com ela no lugar. No bus em memoria; no Redis a assinatura so
+        # nasce no primeiro `anext` (ver `bus/redis_streams.py`).
         self._alertas_assinados.set()
         async for alert in assinatura:
             # Alerta chegando de verdade e a prova de que o caminho voltou: e o

@@ -1,7 +1,8 @@
 """Contrato do event bus interno.
 
 Os agentes conversam exclusivamente por este contrato. Trocar o backend
-(in-process hoje, Redis Streams quando o Docker entrar) nao toca em nenhum agente.
+(in-process, o padrao; Redis Streams, opcional e recusado em `live` -- ver
+`bus.build_event_bus`) nao toca em nenhum agente.
 """
 
 from __future__ import annotations

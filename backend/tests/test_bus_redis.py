@@ -98,6 +98,26 @@ class TestCursorFixado:
         assert await asyncio.wait_for(proximo, timeout=1) == {"type": "novo"}
 
 
+class TestAlertaComDecimal:
+    async def test_alerta_com_decimal_e_data_e_publicado(self):
+        """Alerta e `dict` montado a mao; no Redis ele vira JSON.
+
+        `json.dumps` puro levantava `TypeError` com `Decimal` ou `datetime` no
+        payload -- so no modo Redis, e no publicador: quem avisava morria em vez
+        de avisar. No bus em memoria o mesmo alerta passava.
+        """
+        from datetime import UTC, datetime
+        from decimal import Decimal
+
+        redis = RedisFalso()
+        bus = await _bus_com(redis)
+        await bus.publish(
+            Topics.ALERTS,
+            {"type": "x", "preco": Decimal("1.5"), "quando": datetime(2026, 11, 10, tzinfo=UTC)},
+        )
+        assert '"preco": "1.5"' in redis.entradas[-1][1]["data"]
+
+
 class TestRedisNaoSobeEmLive:
     def test_live_com_redis_e_recusado_com_o_motivo(self, settings):
         configurado = settings.model_copy(

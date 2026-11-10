@@ -163,7 +163,9 @@ class _Inbox:
         # a assinatura antes da sua primeira suspensao, entao quem esperava por
         # este evento so volta a rodar com a assinatura ja no lugar. E o que
         # torna "os consumidores antes dos produtores" verificavel em vez de
-        # depender de um `sleep(0)` bem colocado.
+        # depender de um `sleep(0)` bem colocado. Vale para o bus em memoria; no
+        # Redis a assinatura so existe depois do primeiro `XREVRANGE`, e o que for
+        # publicado antes dele se perde (ver `bus/redis_streams.py`).
         self.ready.set()
         assert self._stream is not None
         iterator = self._stream.__aiter__()
