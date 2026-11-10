@@ -21,9 +21,27 @@ depois do `handled` da caixa de entrada (`agents/base._Inbox`) e
 idempotencia em todo consumidor -- o Execution tem (`client_order_id`), o Risk
 e a Strategy nao deduplicam sinal reavaliado.
 
-Lacuna que continua: o cursor so e fixado no primeiro `anext`, e
-`_Inbox.ready` e marcado antes dele -- o que for publicado nessa janela da
-subida nao e entregue (no bus em memoria a assinatura nasce sem `await`).
+Lacunas que continuam, todas da mesma raiz (no bus em memoria a assinatura
+nasce sem `await`; aqui ela so existe depois do `XREVRANGE` do primeiro
+`anext`):
+
+* **Subida dos agentes.** `_Inbox.ready` e marcado antes do primeiro `anext`,
+  entao `Orchestrator._wait_for_subscriptions` libera o Market Data antes de o
+  cursor existir: candle publicado nessa janela fica antes do cursor e nao e
+  entregue.
+* **Alertas da subida.** O mesmo vale para `Orchestrator._alertas_assinados`: o
+  alerta publicado pelo primeiro retrato (dimensionamento inviavel, stop
+  disparado, posicao sem stop) pode cair antes do cursor do `_listen_alerts`, e a
+  marca de episodio impede o reenvio. A correcao P0 #9 so vale por inteiro no
+  bus em memoria.
+* **Reassinatura.** Depois de queda da conexao ou reinicio da caixa, a
+  assinatura nova comeca do ultimo ID do stream: o intervalo e pulado.
+
+`consumer_group` e guardado e nao e usado: nao ha `XREADGROUP`. Ele fica na
+assinatura do construtor so para nao quebrar quem o passa.
+
+Alerta e `dict` montado a mao, e pode levar `Decimal`/`datetime`: o JSON usa
+`str` para o que nao sabe serializar, em vez de levantar no publicador.
 """
 
 from __future__ import annotations
@@ -44,7 +62,7 @@ MAX_STREAM_LENGTH = 100_000
 class RedisStreamsEventBus(EventBus):
     def __init__(self, url: str, consumer_group: str = "crypto-traders") -> None:
         self._url = url
-        self._group = consumer_group
+        self._group = consumer_group  # nao usado: sem XREADGROUP (ver docstring)
         self._redis: Any = None
 
     async def start(self) -> None:
@@ -70,7 +88,9 @@ class RedisStreamsEventBus(EventBus):
         body = (
             payload.model_dump_json()
             if hasattr(payload, "model_dump_json")
-            else json.dumps(payload)
+            # `default=str`: `json.dumps` puro levantava TypeError com Decimal ou
+            # datetime num alerta, e quem avisava morria em vez de avisar.
+            else json.dumps(payload, default=str)
         )
         await self._redis.xadd(topic, {"data": body}, maxlen=MAX_STREAM_LENGTH, approximate=True)
         self._notificar_observadores(topic, payload)

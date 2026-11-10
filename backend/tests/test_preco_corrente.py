@@ -337,3 +337,88 @@ class TestAberturaSemPrecoCorrente:
         rm.definir_precos_de_mercado(dict)
         avaliacao = await self._avaliar(rm, self._sinal(SignalDirection.FLAT))
         assert avaliacao.decision is RiskDecision.APPROVED
+
+
+class TestConfirmacaoDoSaltoPorProximidade:
+    """Auditoria de 09/11/2026 (dados, low): o salto era confirmado so pelo LADO.
+
+    Duas leituras absurdas, 0,01x e 0,3x da referencia, distam 30x uma da outra e
+    se "confirmavam" por estarem ambas abaixo. E o suspeito nunca expirava: um
+    suspeito de horas atras confirmava a leitura nova.
+    """
+
+    async def test_leituras_distantes_entre_si_nao_se_confirmam(self, settings):
+        dados, _, fonte = await montar(settings, {"ADA/USDT": "1.0"}, {"ADA/USDT": "1.0"})
+        await dados.refresh()
+        fonte.precos["ADA/USDT"] = Decimal("0.01")
+        await dados.refresh()
+        fonte.precos["ADA/USDT"] = Decimal("0.3")
+        await dados.refresh()
+        assert dados.precos_correntes["ADA"] == Decimal("1.0"), (
+            "0,3 confirmou 0,01 so por estar do mesmo lado"
+        )
+
+    async def test_suspeito_velho_nao_confirma(self, settings):
+        dados, _, fonte = await montar(settings, {"SOL/USDT": "1.0"}, {"SOL/USDT": "1.0"})
+        await dados.refresh()
+        fonte.precos["SOL/USDT"] = Decimal("0.09")
+        await dados.refresh()
+        preco, em = dados._suspeitos["SOL"]
+        dados._suspeitos["SOL"] = (preco, em - dados.idade_maxima_do_preco() - timedelta(seconds=1))
+        fonte.precos["SOL/USDT"] = Decimal("0.085")
+        await dados.refresh()
+        assert dados.precos_correntes["SOL"] == Decimal("1.0")
+        # A leitura nova virou o suspeito vigente: a seguinte confirma.
+        fonte.precos["SOL/USDT"] = Decimal("0.086")
+        await dados.refresh()
+        assert dados.precos_correntes["SOL"] == Decimal("0.086")
+
+
+class TestFrescorPeloCarimboDoTicker:
+    """O frescor era medido pela hora de RECEBIMENTO: ticker velho servido por
+    cache/proxy, ou de par com negociacao suspensa, contava como fresco."""
+
+    async def test_ticker_com_carimbo_velho_nao_vale_para_stop(self, settings):
+        from datetime import UTC, datetime
+
+        dados, _, fonte = await montar(settings, {"BTC/USDT": "100"}, {"BTC/USDT": "101"})
+        velho = datetime.now(UTC) - timedelta(hours=1)
+
+        async def ticker_velho(symbol):
+            return Ticker(
+                exchange=ExchangeName.BINANCE, symbol=symbol, price=Decimal("101"),
+                timestamp=velho,
+            )
+
+        fonte.fetch_ticker = ticker_velho
+        await dados.refresh()
+        assert "BTC" not in dados.precos_de_mercado()
+        assert dados.pares_sem_preco_corrente == ["BTC"]
+        # Continua valendo para a valorizacao (foi o mercado de verdade).
+        assert dados.precos_para_avaliacao()["BTC"] == Decimal("101")
+
+    async def test_carimbo_no_futuro_vale_como_agora(self, settings):
+        from datetime import UTC, datetime
+
+        dados, _, fonte = await montar(settings, {"BTC/USDT": "100"}, {"BTC/USDT": "101"})
+        adiantado = datetime.now(UTC) + timedelta(hours=1)
+
+        async def ticker_adiantado(symbol):
+            return Ticker(
+                exchange=ExchangeName.BINANCE, symbol=symbol, price=Decimal("101"),
+                timestamp=adiantado,
+            )
+
+        fonte.fetch_ticker = ticker_adiantado
+        await dados.refresh()
+        assert dados._precos_correntes_em["BTC"] <= datetime.now(UTC)
+
+
+class TestListaSemPrecoNaoEMutadaPorGetter:
+    async def test_pares_sem_preco_acompanha_o_envelhecimento(self, settings):
+        """Era gravada por `precos_para_avaliacao` (um getter) e pelo frescor."""
+        dados, _, _ = await montar(settings, {"XRP/USDT": "1.30"}, {"XRP/USDT": "1.31"})
+        await dados.refresh()
+        assert dados.pares_sem_preco_corrente == []
+        _envelhecer(dados, "XRP")
+        assert dados.pares_sem_preco_corrente == ["XRP"]

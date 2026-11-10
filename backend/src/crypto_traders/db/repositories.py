@@ -138,6 +138,51 @@ class CandleRepository:
             for row in reversed(rows)
         ]
 
+    async def ultimo_fechamento_ate(
+        self, symbol: str, instante: datetime
+    ) -> tuple[datetime, Decimal] | None:
+        """(quando fechou, fechamento) do candle mais recente FECHADO ate `instante`.
+
+        Olha todos os timeframes e exchanges gravados do par: o que se quer e o
+        ultimo preco conhecido no instante (a cotacao da taxa em BNB de um trade),
+        nao a serie da estrategia. Candle que ainda estava aberto no instante fica
+        de fora: o fechamento dele e preco do futuro, e a escolha mudaria quando o
+        candle chegasse -- o realizado ja publicado se moveria sozinho.
+        """
+        # Import tardio: o pacote `exchanges` carrega o ccxt, e o repositorio e
+        # usado por comandos (migrar, copiar-sqlite) que nao falam com exchange.
+        from ..exchanges.base import timeframe_seconds
+
+        timeframes = (
+            await self._session.execute(
+                select(orm.Candle.timeframe).where(orm.Candle.symbol == symbol).distinct()
+            )
+        ).scalars().all()
+        melhor: tuple[datetime, Decimal] | None = None
+        for timeframe in timeframes:
+            try:
+                duracao = timedelta(seconds=timeframe_seconds(timeframe))
+            except ValueError:
+                continue
+            linha = (
+                await self._session.execute(
+                    select(orm.Candle.open_time, orm.Candle.close)
+                    .where(
+                        orm.Candle.symbol == symbol,
+                        orm.Candle.timeframe == timeframe,
+                        orm.Candle.open_time <= instante - duracao,
+                    )
+                    .order_by(orm.Candle.open_time.desc())
+                    .limit(1)
+                )
+            ).first()
+            if linha is None:
+                continue
+            fechou = _aware(linha.open_time) + duracao
+            if melhor is None or fechou > melhor[0]:
+                melhor = (fechou, _as_decimal(linha.close))
+        return melhor
+
 
 class SignalRepository:
     def __init__(self, session: AsyncSession) -> None:
@@ -254,6 +299,19 @@ class OrderRepository:
         order = await self._session.get(orm.Order, result.order_request_id)
         if order is None:
             return None
+        filled = str(OrderStatus.FILLED)
+        if order.status == filled and str(result.status) != filled:
+            # Sem maquina de estados, um resultado tardio (`open`, `pending`, ou a
+            # consulta de reconciliacao vendo a ordem antes do preenchimento)
+            # REGREDIA a ordem preenchida -- e o que decide "ha ordem viva" volta
+            # a ver uma ordem que ja executou (auditoria de 09/11/2026, banco).
+            # Preenchida e fato consumado: o resultado tardio fica so no log.
+            log.warning(
+                "db.ordem_preenchida_nao_regride",
+                order_id=order.id,
+                status_recebido=str(result.status),
+            )
+            return order
         order.status = str(result.status)
         order.exchange_order_id = result.exchange_order_id
         order.filled_quantity = result.filled_quantity

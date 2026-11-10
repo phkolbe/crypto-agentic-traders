@@ -1274,6 +1274,54 @@ class TestCircuitBreakerBloqueiaAbertura:
         )
         assert "perda diaria" in execucao.openings_blocked
 
+    async def test_estado_ilegivel_da_trava_falha_fechado(self, settings, monkeypatch):
+        """Banco sem responder na leitura do circuit breaker: a abertura ficava solta.
+
+        Auditoria de 09/11/2026, orquestracao L5: sem saber se a trava estava
+        armada, o padrao nao pode ser "solta".
+        """
+        from crypto_traders.agents.execution import ExecutionAgent
+        from crypto_traders.exchanges.paper import PaperBroker
+
+        def banco_fora(_settings=None):
+            raise OSError("connection refused")
+
+        monkeypatch.setattr(orch_mod, "session_scope", banco_fora)
+        bus = InMemoryEventBus()
+        await bus.start()
+        alertas: list[dict] = []
+        bus.observar(lambda topico, p: alertas.append(p) if topico == Topics.ALERTS else None)
+        execucao = ExecutionAgent(bus, PaperBroker(initial_balance=Decimal("100")), settings)
+        orquestrador = BancadaOrquestrador(settings, {"execution": execucao}, bus)
+
+        await orquestrador._apply_persisted_circuit_breaker()
+
+        assert execucao.openings_blocked is not None
+        assert "ilegivel" in execucao.openings_blocked
+        assert [a["type"] for a in alertas] == ["circuit_breaker_ilegivel"]
+
+
+class TestCrashComBusFora:
+    async def test_a_excecao_do_agente_nao_e_trocada_pela_do_bus(self, settings):
+        """Auditoria de 09/11/2026, orquestracao L9: no caminho do crash a batida
+        levantava (bus fora) e a tarefa morria com a falha do BUS."""
+
+        class Quebra(BaseAgent):
+            name = "quebra"
+
+            async def _run(self):
+                raise ValueError("a causa de verdade")
+
+            async def heartbeat(self, detail=None):
+                raise ConnectionResetError("bus fora")
+
+        agente = Quebra(InMemoryEventBus())
+        await agente.start()
+        await esperar_ate(lambda: not agente.is_running)
+        assert isinstance(agente._task.exception(), ValueError)
+        assert agente.last_error == "a causa de verdade"
+        await agente.stop()
+
 
 # ---------------------------------------------------------------------------
 class TestExecucaoAbandonada:
@@ -2236,6 +2284,221 @@ async def test_postgres_real_recusa_a_segunda_instancia():
     await segunda._tomar_instancia_unica()
     await segunda._soltar_instancia_unica()
     await dispose_engine()
+
+
+# ---------------------------------------------------------------------------
+# Trava de instancia unica perdida com o processo vivo
+# ---------------------------------------------------------------------------
+class _ConexaoDaTrava:
+    """Conexao dedicada falsa: o `pg_locks` responde `mantida` ou a conexao caiu."""
+
+    def __init__(self, *, livre: bool = True, mantida: bool = True, caiu: bool = False):
+        self.livre = livre
+        self.mantida = mantida
+        self.caiu = caiu
+        self.sql: list[str] = []
+        self.fechada = False
+
+    async def execute(self, clausula, parametros=None):
+        sql = str(clausula)
+        self.sql.append(sql)
+        if self.caiu:
+            raise ConnectionResetError("conexao com o servidor perdida")
+        if "try_advisory" in sql:
+            return _ResultadoFalso(self.livre)
+        if "pg_locks" in sql:
+            return _ResultadoFalso(self.mantida)
+        return _ResultadoFalso(True)
+
+    async def commit(self):
+        return None
+
+    async def invalidate(self):
+        return None
+
+    async def close(self):
+        self.fechada = True
+
+
+class _MotorEmSequencia:
+    """Cada `connect()` entrega a proxima conexao; `None` na lista = banco fora."""
+
+    dialect = type("Dialeto", (), {"name": "postgresql"})()
+
+    def __init__(self, *conexoes):
+        self.conexoes = list(conexoes)
+
+    async def connect(self):
+        conexao = self.conexoes.pop(0)
+        if conexao is None:
+            raise OSError("connection refused")
+        return conexao
+
+
+class _ExecucaoComTrava:
+    """So a trava de abertura do Execution Agent."""
+
+    name = "execution"
+
+    def __init__(self) -> None:
+        self.openings_blocked: str | None = None
+
+    def block_openings(self, reason: str) -> None:
+        self.openings_blocked = reason
+
+    def allow_openings(self) -> None:
+        self.openings_blocked = None
+
+
+class TestTravaPerdidaComOProcessoVivo:
+    """A trava mora na conexao dedicada; se ela cai, a trava cai junto.
+
+    Postgres reiniciado ou rede piscando com o processo vivo: a trava sumia em
+    silencio e um segundo `crypto-traders run` subia sem ser recusado -- ordem
+    dobrada com dinheiro real. O watchdog agora confere a trava a cada ciclo.
+    """
+
+    async def _montar(self, settings, monkeypatch, *conexoes):
+        motor = _MotorEmSequencia(*conexoes)
+        monkeypatch.setattr(orch_mod, "get_engine", lambda _settings=None: motor)
+        bus = InMemoryEventBus()
+        await bus.start()
+        execucao = _ExecucaoComTrava()
+        orquestrador = BancadaOrquestrador(settings, {"execution": execucao}, bus)
+        alertas: list[dict] = []
+        bus.observar(lambda topico, p: alertas.append(p) if topico == Topics.ALERTS else None)
+        await orquestrador._tomar_instancia_unica()
+        return orquestrador, execucao, alertas
+
+    async def test_trava_mantida_nao_faz_nada(self, settings, monkeypatch):
+        primeira = _ConexaoDaTrava()
+        orquestrador, execucao, alertas = await self._montar(settings, monkeypatch, primeira)
+
+        await orquestrador._conferir_instancia_unica()
+
+        assert any("pg_locks" in sql for sql in primeira.sql)
+        assert orquestrador._conexao_da_trava is primeira
+        assert execucao.openings_blocked is None
+        assert alertas == []
+
+    async def test_conexao_caida_e_retomada_avisa(self, settings, monkeypatch):
+        primeira, nova = _ConexaoDaTrava(), _ConexaoDaTrava()
+        orquestrador, execucao, alertas = await self._montar(
+            settings, monkeypatch, primeira, nova
+        )
+        primeira.caiu = True
+
+        await orquestrador._conferir_instancia_unica()
+
+        assert orquestrador._conexao_da_trava is nova
+        assert primeira.fechada
+        assert execucao.openings_blocked is None
+        assert [a["type"] for a in alertas] == ["instancia_unica_retomada"]
+
+    async def test_sessao_nova_sem_a_trava_conta_como_perdida(self, settings, monkeypatch):
+        """A conexao responde, mas de uma sessao que nao segura a trava."""
+        primeira, nova = _ConexaoDaTrava(), _ConexaoDaTrava()
+        orquestrador, _, alertas = await self._montar(settings, monkeypatch, primeira, nova)
+        primeira.mantida = False
+
+        await orquestrador._conferir_instancia_unica()
+
+        assert orquestrador._conexao_da_trava is nova
+        assert [a["type"] for a in alertas] == ["instancia_unica_retomada"]
+
+    async def test_trava_tomada_por_outra_barra_a_abertura_ate_voltar(
+        self, settings, monkeypatch
+    ):
+        primeira = _ConexaoDaTrava()
+        ocupada = _ConexaoDaTrava(livre=False)
+        de_novo_ocupada = _ConexaoDaTrava(livre=False)
+        livre = _ConexaoDaTrava()
+        orquestrador, execucao, alertas = await self._montar(
+            settings, monkeypatch, primeira, ocupada, de_novo_ocupada, livre
+        )
+        primeira.caiu = True
+
+        await orquestrador._conferir_instancia_unica()
+        assert execucao.openings_blocked is not None
+        assert "instancia unica" in execucao.openings_blocked
+        assert [a["type"] for a in alertas] == ["instancia_unica_perdida"]
+        assert orquestrador._trava_perdida
+
+        # Um aviso por episodio: o segundo ciclo ainda perdido nao repete.
+        await orquestrador._conferir_instancia_unica()
+        assert [a["type"] for a in alertas] == ["instancia_unica_perdida"]
+
+        # A outra instancia saiu: a trava volta e a abertura e liberada.
+        await orquestrador._conferir_instancia_unica()
+        assert orquestrador._conexao_da_trava is livre
+        assert execucao.openings_blocked is None
+        assert [a["type"] for a in alertas][-1] == "instancia_unica_retomada"
+        assert not orquestrador._trava_perdida
+
+    async def test_banco_fora_barra_a_abertura(self, settings, monkeypatch):
+        primeira = _ConexaoDaTrava()
+        orquestrador, execucao, alertas = await self._montar(
+            settings, monkeypatch, primeira, None
+        )
+        primeira.caiu = True
+
+        await orquestrador._conferir_instancia_unica()
+
+        assert execucao.openings_blocked is not None
+        assert "connection refused" in alertas[0]["message"]
+
+    async def test_trava_de_outro_motivo_nao_e_solta_na_retomada(
+        self, settings, monkeypatch
+    ):
+        """A abertura barrada pela interface nao e da trava: a retomada nao a solta."""
+        primeira, ocupada, livre = (
+            _ConexaoDaTrava(), _ConexaoDaTrava(livre=False), _ConexaoDaTrava()
+        )
+        orquestrador, execucao, _ = await self._montar(
+            settings, monkeypatch, primeira, ocupada, livre
+        )
+        execucao.block_openings("pausa pedida pela interface")
+        primeira.caiu = True
+
+        await orquestrador._conferir_instancia_unica()
+        await orquestrador._conferir_instancia_unica()
+
+        assert execucao.openings_blocked == "pausa pedida pela interface"
+
+    async def test_sqlite_nao_confere_nada(self, settings):
+        orquestrador = Orchestrator(settings)
+        await orquestrador._tomar_instancia_unica()
+        await orquestrador._conferir_instancia_unica()
+        assert orquestrador._conexao_da_trava is None
+
+
+@pytest.mark.skipif(
+    not __import__("os").getenv("POSTGRES_TEST_URL"), reason="POSTGRES_TEST_URL nao definida"
+)
+async def test_postgres_real_confere_a_trava_pelo_pg_locks():
+    """A consulta ao `pg_locks` acha a trava da propria sessao, e so dela."""
+    import os
+
+    from sqlalchemy import text
+
+    from crypto_traders.config import Settings
+    from crypto_traders.db.session import dispose_engine
+
+    await dispose_engine()
+    configurado = Settings(database_url=os.environ["POSTGRES_TEST_URL"])
+    orquestrador = Orchestrator(configurado)
+    await orquestrador._tomar_instancia_unica()
+    try:
+        assert await orquestrador._trava_mantida()
+        # Solta por baixo, na mesma sessao: o `pg_locks` tem de dizer que nao ha.
+        await orquestrador._conexao_da_trava.execute(
+            text("SELECT pg_advisory_unlock(:chave)"),
+            {"chave": orch_mod.CHAVE_INSTANCIA_UNICA},
+        )
+        assert not await orquestrador._trava_mantida()
+    finally:
+        await orquestrador._soltar_instancia_unica()
+        await dispose_engine()
 
 
 # ---------------------------------------------------------------------------

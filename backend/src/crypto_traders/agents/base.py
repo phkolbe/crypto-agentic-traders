@@ -163,7 +163,9 @@ class _Inbox:
         # a assinatura antes da sua primeira suspensao, entao quem esperava por
         # este evento so volta a rodar com a assinatura ja no lugar. E o que
         # torna "os consumidores antes dos produtores" verificavel em vez de
-        # depender de um `sleep(0)` bem colocado.
+        # depender de um `sleep(0)` bem colocado. Vale para o bus em memoria; no
+        # Redis a assinatura so existe depois do primeiro `XREVRANGE`, e o que for
+        # publicado antes dele se perde (ver `bus/redis_streams.py`).
         self.ready.set()
         assert self._stream is not None
         iterator = self._stream.__aiter__()
@@ -764,5 +766,11 @@ class BaseAgent(abc.ABC):
             self.state = AgentState.ERROR
             self.last_error = str(exc)
             self.log.exception("agent.crashed", error=str(exc))
-            await self.heartbeat(detail=f"crash: {exc}")
+            try:
+                await self.heartbeat(detail=f"crash: {exc}")
+            except Exception as falha_da_batida:
+                # Com o bus fora, a batida levantava aqui e o `raise` abaixo
+                # relancava a falha do BUS: a tarefa morria com a causa errada e
+                # a original so ficava no log (auditoria de 09/11/2026, L9).
+                self.log.warning("agent.crash_beat_failed", error=str(falha_da_batida))
             raise

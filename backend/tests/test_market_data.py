@@ -1093,3 +1093,66 @@ class TestRuidoComMensagemVariavel:
         await agente.refresh()
         await agente.refresh()
         assert espiao.eventos("market_data.symbol_failed") == 2
+
+
+class TestMarcaDePublicacaoPorTimeframe:
+    """`_last_published` era por simbolo, nao por (simbolo, timeframe).
+
+    Trocar o timeframe de 4h para 1d pela tela (D15) deixava a ultima marca
+    (20:00 de ontem) mais nova que o candle diario (00:00 de ontem): nenhum
+    candle publicado e `latest_prices` parado por ate um dia, sem aviso.
+    """
+
+    async def test_troca_de_timeframe_publica_o_candle_do_novo(self, settings):
+        ontem = fechado_em(1)
+        respostas = {
+            "BTC/USDT": [[candle(open_time=ontem + timedelta(hours=20), timeframe="4h")]]
+        }
+        agente, bus, fonte = await montar(settings, respostas, timeframe="4h")
+        await agente.refresh()
+        assert len(bus.candles) == 1
+
+        agente._settings = com_negocio(agente._settings, timeframe="1d")
+        fonte._respostas["BTC/USDT"] = [[candle(open_time=ontem, close="200", timeframe="1d")]]
+        await agente.refresh()
+
+        assert len(bus.candles) == 2, "o candle diario ficou atras da marca do 4h"
+        assert bus.candles[-1].timeframe == "1d"
+        assert agente.latest_prices["BTC"] == Decimal("200")
+
+
+class TestSerieComBuraco:
+    """Candle recusado de forma persistente deixava o furo no banco em silencio:
+    SMA/EMA "de 21" sao sobre linhas, nao sobre tempo."""
+
+    async def test_buraco_na_janela_e_avisado(self, settings):
+        from crypto_traders.db.repositories import CandleRepository
+        from crypto_traders.db.session import session_scope
+
+        agente, _, _ = await montar(settings, {"BTC/USDT": [[]]})
+        async with session_scope(agente._settings) as session:
+            await CandleRepository(session).upsert_many(
+                [candle(open_time=fechado_em(d)) for d in (5, 4, 2, 1)]
+            )
+        espiao = LogEspiao()
+        agente.log = espiao
+
+        janela = await agente.history("BTC/USDT")
+        assert len(janela) == 4
+        assert espiao.eventos("market_data.serie_com_buracos") == 1
+        await agente.history("BTC/USDT")
+        assert espiao.eventos("market_data.serie_com_buracos") == 1, "repetiu o aviso"
+
+    async def test_serie_continua_nao_avisa(self, settings):
+        from crypto_traders.db.repositories import CandleRepository
+        from crypto_traders.db.session import session_scope
+
+        agente, _, _ = await montar(settings, {"BTC/USDT": [[]]})
+        async with session_scope(agente._settings) as session:
+            await CandleRepository(session).upsert_many(
+                [candle(open_time=fechado_em(d)) for d in (3, 2, 1)]
+            )
+        espiao = LogEspiao()
+        agente.log = espiao
+        await agente.history("BTC/USDT")
+        assert espiao.eventos("market_data.serie_com_buracos") == 0

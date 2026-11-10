@@ -12,6 +12,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from itertools import pairwise
 
 from ..bus import EventBus, Topics
 from ..config import Settings
@@ -22,7 +23,7 @@ from ..db.repositories import (
 )
 from ..db.session import session_scope
 from ..discovery import DEFAULT_EXCLUDED_ASSETS, DiscoveryCriteria, DiscoveryResult, discover
-from ..domain.models import Candle
+from ..domain.models import Candle, Ticker
 from ..exchanges.base import MarketDataSource, timeframe_seconds
 from .base import BaseAgent
 
@@ -76,9 +77,12 @@ TICKER_MAX_AGE_MIN = timedelta(minutes=3)
 
 #: Salto, contra o ultimo preco valido, a partir do qual UMA leitura nao basta
 #: (fator multiplicativo, nos dois sentidos). Fica guardada como suspeita e so
-#: vale se a leitura seguinte confirmar o mesmo lado. Assim um numero corrompido
-#: (decimal trocado, preco de outro par) nao dispara stop, e um colapso de
-#: verdade -- que persiste -- e aceito um ciclo depois, em vez de ser mascarado.
+#: vale se uma leitura seguinte, ainda dentro da validade do suspeito
+#: (`idade_maxima_do_preco`), ficar a menos deste mesmo fator DELA. Assim um
+#: numero corrompido (decimal trocado, preco de outro par) nao dispara stop, e um
+#: colapso de verdade -- que persiste -- e aceito um ciclo depois, em vez de ser
+#: mascarado. Confirmar so pelo LADO deixava 0,01x e 0,3x da referencia, que distam
+#: 30x entre si, se confirmarem uma a outra (auditoria de 09/11/2026, dados).
 TICKER_SALTO_SUSPEITO = Decimal(3)
 
 
@@ -98,6 +102,9 @@ class MarketDataAgent(BaseAgent):
         self._last_published: dict[str, datetime] = {}
         """Ultimo `open_time` publicado por simbolo, para nao reprocessar candles.
 
+        Vale para o timeframe de `_timeframe_das_marcas`; trocado o timeframe, as
+        marcas recomecam (ver `_fetch_symbol`).
+
         A comparacao contra este valor e por MAIOR QUE, nunca por diferente, e a
         entrada so permanece se a publicacao realmente acontecer -- publicacao
         interrompida desfaz a marca, mas SO se a marca ainda for a dela: desfazer
@@ -106,7 +113,12 @@ class MarketDataAgent(BaseAgent):
         """
 
         self.latest_prices: dict[str, Decimal] = {}
-        """Preco corrente do par, consumido pelo Risk e pelo Portfolio.
+        """Fechamento do ultimo candle FECHADO do par, no timeframe da estrategia.
+
+        NAO e o preco corrente (desde D41 e o ticker, `precos_correntes`): com `1d`
+        ele anda uma vez por dia. Quem o le e o fallback de
+        `precos_para_avaliacao` (par que nunca teve ticker) e a referencia do
+        salto da primeira leitura do ticker. Stop e alvo nunca o usam.
 
         A chave e o ativo base ("BTC") para o par cotado em `quote_currency` e o
         nome completo do par para qualquer outra cotacao -- ver
@@ -129,12 +141,13 @@ class MarketDataAgent(BaseAgent):
         """
 
         self._precos_correntes_em: dict[str, datetime] = {}
-        self.pares_sem_preco_corrente: list[str] = []
-        """Pares vigiados (universo e carteira) sem preco corrente recente: stop e
-        alvo deles nao sao avaliados."""
+        """Instante do preco corrente: o carimbo do ticker (nunca no futuro)."""
 
-        self._suspeitos: dict[str, Decimal] = {}
-        """Leitura com salto grande, a espera da confirmacao do ciclo seguinte."""
+        self._suspeitos: dict[str, tuple[Decimal, datetime]] = {}
+        """Leitura com salto grande (e quando), a espera da confirmacao."""
+
+        self._timeframe_das_marcas: str | None = None
+        """Timeframe a que as marcas de `_last_published` se referem."""
 
         self._pendentes: dict[str, tuple[str, Decimal, datetime]] = {}
         """Ticker sem referencia nenhuma ainda (primeira leitura do processo): julgado
@@ -385,7 +398,9 @@ class MarketDataAgent(BaseAgent):
                 self._condicao.pop("*|preco_corrente", None)
                 agora = datetime.now(UTC)
                 for symbol, ticker in tickers.items():
-                    self._receber_ticker(symbol, ticker.price, agora)
+                    self._receber_ticker(
+                        symbol, ticker.price, self._instante_do_ticker(ticker, agora)
+                    )
                 return
         await self._ler_tickers_par_a_par(symbols)
 
@@ -405,7 +420,9 @@ class MarketDataAgent(BaseAgent):
                 )
                 continue
             self._condicao.pop(f"{symbol}|ticker_par", None)
-            self._receber_ticker(symbol, ticker.price, datetime.now(UTC))
+            self._receber_ticker(
+                symbol, ticker.price, self._instante_do_ticker(ticker, datetime.now(UTC))
+            )
 
     def _receber_ticker(self, symbol: str, preco: Decimal, agora: datetime) -> None:
         chave = self._chave_de_preco(symbol)
@@ -432,6 +449,22 @@ class MarketDataAgent(BaseAgent):
             return
         self._julgar(chave, symbol, preco, referencia, agora)
 
+    @staticmethod
+    def _instante_do_ticker(ticker: Ticker, recebido: datetime) -> datetime:
+        """Quando o preco era o mercado: o carimbo do ticker, nunca no futuro.
+
+        O frescor era medido pela hora de RECEBIMENTO: um ticker velho servido por
+        cache ou proxy, ou de par com negociacao suspensa, contava como fresco e
+        decidia stop (auditoria de 09/11/2026, dados). Carimbo a frente do relogio
+        local e diferenca de relogio, e vale como agora.
+        """
+        carimbo = getattr(ticker, "timestamp", None)
+        if carimbo is None:
+            return recebido
+        if carimbo.tzinfo is None:
+            carimbo = carimbo.replace(tzinfo=UTC)
+        return min(carimbo, recebido)
+
     def _julgar(
         self, chave: str, symbol: str, preco: Decimal, referencia: Decimal | None, agora: datetime
     ) -> None:
@@ -440,14 +473,22 @@ class MarketDataAgent(BaseAgent):
             referencia / TICKER_SALTO_SUSPEITO <= preco <= referencia * TICKER_SALTO_SUSPEITO
         )
         if not dentro:
-            anterior = self._suspeitos.get(chave)
-            mesmo_lado = (
-                anterior is not None
-                and referencia is not None
-                and (anterior > referencia) == (preco > referencia)
-            ) or (anterior is not None and referencia is None)
-            if not mesmo_lado:
-                self._suspeitos[chave] = preco
+            suspeito = self._suspeitos.get(chave)
+            confirma = False
+            if suspeito is not None:
+                anterior, visto_em = suspeito
+                # Perto da leitura suspeita, e nao so do mesmo lado da referencia;
+                # e o suspeito vale por pouco tempo -- um de horas atras nao
+                # confirma nada.
+                recente = agora - visto_em <= self.idade_maxima_do_preco()
+                perto = (
+                    anterior / TICKER_SALTO_SUSPEITO
+                    <= preco
+                    <= anterior * TICKER_SALTO_SUSPEITO
+                )
+                confirma = recente and perto
+            if not confirma:
+                self._suspeitos[chave] = (preco, agora)
                 self._log_de_estado(
                     symbol,
                     "ticker",
@@ -508,14 +549,22 @@ class MarketDataAgent(BaseAgent):
         """
         precos = dict(self.latest_prices)
         precos.update(self.precos_correntes)
-        frescos = self.precos_de_mercado()
-        self.pares_sem_preco_corrente = sorted(self._chaves_ativas() - set(frescos))
         return precos
+
+    @property
+    def pares_sem_preco_corrente(self) -> list[str]:
+        """Pares vigiados (universo e carteira) sem preco corrente recente: stop e
+        alvo deles nao sao avaliados.
+
+        Calculado na hora, e nao gravado: era escrito em dois lugares, um deles
+        dentro de um getter (`precos_para_avaliacao`), e entre um ciclo e outro a
+        lista ficava atras do envelhecimento real dos precos.
+        """
+        return sorted(self._chaves_ativas() - set(self.precos_de_mercado()))
 
     async def _avisar_frescor(self) -> None:
         """Alerta (nao so log) quando pares ativos ficam sem preco corrente."""
-        sem = frozenset(self._chaves_ativas() - set(self.precos_de_mercado()))
-        self.pares_sem_preco_corrente = sorted(sem)
+        sem = frozenset(self.pares_sem_preco_corrente)
         anteriores = self._alertados_sem_preco
         novos = sorted(sem - anteriores)
         try:
@@ -860,6 +909,22 @@ class MarketDataAgent(BaseAgent):
         # `max` e nao `[-1]`: a lista pode chegar fora de ordem, e "o ultimo da
         # lista" nao e necessariamente o mais recente no tempo.
         latest = max(closed, key=lambda candle: candle.open_time)
+        timeframe = self._settings.trading.timeframe
+        if self._timeframe_das_marcas != timeframe:
+            # As marcas sao de UM timeframe. Trocar 4h por 1d pela tela (D15)
+            # deixava a marca das 20:00 mais nova que o candle diario das 00:00:
+            # nada publicado e `latest_prices` parado por ate um dia, sem aviso
+            # (auditoria de 09/11/2026, dados). Sincrono de proposito: nenhum
+            # `await` entre esta limpeza, a leitura e a escrita da marca abaixo.
+            if self._timeframe_das_marcas is not None:
+                self.log.info(
+                    "market_data.timeframe_trocado",
+                    antes=self._timeframe_das_marcas,
+                    depois=timeframe,
+                    detail="marcas de publicacao recomecam no timeframe novo",
+                )
+            self._last_published.clear()
+            self._timeframe_das_marcas = timeframe
         anterior = self._last_published.get(symbol)
 
         # Publicamos apenas quando o candle fechado e MAIS NOVO que o ultimo
@@ -981,14 +1046,53 @@ class MarketDataAgent(BaseAgent):
         )
 
     async def history(self, symbol: str, limit: int | None = None) -> list[Candle]:
-        """Janela historica do banco, usada pelo Strategy Agent e pelo backtest."""
+        """Janela historica do banco, usada pelo Strategy Agent e pelo backtest.
+
+        Avisa (uma vez por mudanca) quando a janela tem buraco no tempo. Os
+        indicadores contam LINHAS: uma SMA "de 21" sobre uma serie com um dia
+        faltando cobre 22 dias. Hoje o buraco se cura porque cada coleta pede a
+        janela inteira, mas candle recusado de forma persistente (`fora_da_faixa`,
+        `futuro`) deixava o furo no banco em silencio. So avisa: decidir com a
+        janela continua sendo da estrategia.
+        """
+        timeframe = self._settings.trading.timeframe
         async with session_scope(self._settings) as session:
-            return await CandleRepository(session).recent(
+            janela = await CandleRepository(session).recent(
                 self._settings.exchange,
                 symbol,
-                self._settings.trading.timeframe,
+                timeframe,
                 limit or self._settings.trading.candle_history_limit,
             )
+        self._conferir_continuidade(symbol, timeframe, janela)
+        return janela
+
+    def _conferir_continuidade(self, symbol: str, timeframe: str, janela: list[Candle]) -> None:
+        try:
+            duracao = timedelta(seconds=timeframe_seconds(timeframe))
+        except ValueError:
+            return
+        buracos = [
+            (antes.open_time, depois.open_time)
+            for antes, depois in pairwise(janela)
+            if depois.open_time - antes.open_time > duracao
+        ]
+        if not buracos:
+            self._condicao.pop(f"{symbol}|serie", None)
+            return
+        faltando = sum(
+            round((depois - antes) / duracao) - 1 for antes, depois in buracos
+        )
+        self._log_de_estado(
+            symbol,
+            "serie",
+            f"buracos:{buracos[-1][0].isoformat()}:{faltando}",
+            "warning",
+            "market_data.serie_com_buracos",
+            timeframe=timeframe,
+            candles_faltando=faltando,
+            ultimo_buraco_depois_de=buracos[-1][0].isoformat(),
+            detail="a janela dos indicadores pula periodos; medias contam linhas, nao tempo",
+        )
 
     async def on_stop(self) -> None:
         await self._source.close()

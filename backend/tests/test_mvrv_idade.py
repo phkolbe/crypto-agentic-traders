@@ -137,3 +137,36 @@ class TestOrquestradorAvisaOOperador:
         alertas = await self._rodar_loop(orch, monkeypatch, voltas=2)
 
         assert not [a for a in alertas if a.get("type") == "mvrv_stale"]
+
+
+class TestDiaUtcESerieForaDeOrdem:
+    """Auditoria de 09/11/2026 (dados, low): `moment.date()` sem normalizar para
+    UTC e `reading_from_series` supondo a serie ordenada."""
+
+    def test_instante_em_outro_fuso_le_o_dia_utc(self):
+        from datetime import date, timezone
+
+        from crypto_traders.onchain import reading_from_series
+
+        serie = [(date(2026, 11, 1), 1.0), (date(2026, 11, 2), 5.0)]
+        # 22:00 de 01/11 em Brasilia ja e 02/11 em UTC: o ponto de 02/11 vale.
+        brasilia = timezone(timedelta(hours=-3))
+        leitura = reading_from_series(serie, datetime(2026, 11, 1, 22, tzinfo=brasilia))
+        assert leitura is not None and leitura.value == 5.0
+        # E o mesmo instante em UTC da o mesmo dia.
+        em_utc = datetime(2026, 11, 2, 1, tzinfo=UTC)
+        assert reading_from_series(serie, em_utc).value == leitura.value
+
+    def test_serie_fora_de_ordem_usa_o_ponto_mais_novo(self):
+        from datetime import date
+
+        from crypto_traders.onchain import reading_from_series
+
+        ordenada = [(date(2026, 11, d), float(d)) for d in range(1, 11)]
+        embaralhada = list(reversed(ordenada))
+        momento = datetime(2026, 11, 10, 12, tzinfo=UTC)
+        assert (
+            reading_from_series(embaralhada, momento).value
+            == reading_from_series(ordenada, momento).value
+            == 10.0
+        )
