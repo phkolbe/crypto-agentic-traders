@@ -138,6 +138,14 @@ class TimeoutDepoisDeAceitar(Broker):
     cliente recebe `RequestTimeout`; a tentativa 2 vai com o MESMO
     `clientOrderId` e a Binance responde `-2010 Duplicate order sent`
     (`ccxt.InvalidOrder` -> `ExchangeError` -> `OrderResult` FAILED).
+
+    ATENCAO (auditoria de 09/11/2026): a premissa da tentativa 2 so vale contra
+    o `PaperBroker`, que deduplica para sempre. Na Binance o id so e unico entre
+    ordens ABERTAS e a MARKET ja preenchida compraria de novo -- por isso o
+    adaptador real nao reenvia mais depois de timeout (consulta pelo
+    `clientOrderId`). Este dublê fica como prova do lado do agente (resultado
+    ja preenchido nao perde o trade); a cadeia real esta em
+    `test_ordem_real_binance.py`.
     """
 
     name = "timeout-apos-aceitar"
@@ -470,6 +478,29 @@ class TestIdempotencia:
         assert ordem.status == str(OrderStatus.PENDING)
         assert bus.alertas("order_outcome_unknown")
         assert "order_outcome_unknown" in await audit_actions(settings)
+
+    async def test_minus_2010_sem_duplicata_e_recusa_e_nao_desconhecido(self, settings):
+        """`-2010` e o NEW_ORDER_REJECTED generico: "Market is closed" e recusa.
+
+        Antes o padrao casava o codigo e gravava PENDING "a ordem FOI criada",
+        com alerta de reconciliacao para uma ordem que nunca existiu.
+        """
+        broker = BrokerProgramado(
+            lambda rq: OrderResult(
+                order_request_id=rq.id,
+                client_order_id=rq.client_order_id,
+                exchange_order_id=None,
+                status=OrderStatus.FAILED,
+                error='binance.create_order: binance {"code":-2010,"msg":"Market is closed."}',
+            )
+        )
+        bus = BusEspiao()
+        agent = ExecutionAgent(bus, broker, settings)
+
+        result = await agent._execute(make_request(client_order_id="cat-2010-1"))
+
+        assert result is not None and result.status is OrderStatus.REJECTED
+        assert not bus.alertas("order_outcome_unknown")
 
     async def test_duplicata_com_preenchimento_conhecido_nao_pede_reconciliacao(
         self, settings

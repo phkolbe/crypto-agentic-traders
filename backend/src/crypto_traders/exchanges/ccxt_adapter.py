@@ -19,7 +19,14 @@ from ..config import ExchangeCredentials
 from ..domain.enums import ExchangeName, OrderStatus, OrderType, Side
 from ..domain.models import Candle, OrderRequest, OrderResult, Position, Ticker
 from ..logging_setup import get_logger
-from .base import ApiAccessDenied, Broker, ExchangeError, InsufficientFunds, MarketDataSource
+from .base import (
+    ApiAccessDenied,
+    Broker,
+    DesfechoDesconhecido,
+    ExchangeError,
+    InsufficientFunds,
+    MarketDataSource,
+)
 from .filters import MarketFilter, baseline_market_filter
 
 log = get_logger(__name__)
@@ -34,7 +41,8 @@ _STATUS_MAP = {
     "rejected": OrderStatus.REJECTED,
 }
 
-#: Erros de rede/limite: transitorios, valem retry com backoff.
+#: Erros de rede/limite: transitorios, valem retry com backoff -- nas LEITURAS. O
+#: envio de ordem tem regra propria (`_criar_ordem`).
 _RETRYABLE = (
     ccxt.NetworkError,
     ccxt.RequestTimeout,
@@ -48,6 +56,28 @@ _ACCESS_DENIED = (
     ccxt.AuthenticationError,
     ccxt.PermissionDenied,
 )
+
+#: `-2015` ("Invalid API-key, IP, or permissions for action") e classificado pelo
+#: CODIGO, nao pela classe. No ccxt 4.5.78 a classe muda no meio do processo:
+#: depois da primeira chamada privada que deu certo (`hasAlreadyAuthenticated
+#: Successfully`, `async_support/binance.py:12433`), o `-2015` chega como
+#: `DDoSProtection` -- que esta em `_RETRYABLE`. Cenario da auditoria de
+#: 09/11/2026: o Portfolio le o saldo, o IP residencial muda de madrugada, o stop
+#: dispara e recebia 3 retries e um FAILED generico, sem o alerta de acesso negado.
+_CODIGO_ACESSO_NEGADO = re.compile(r"(?<!\d)-2015(?!\d)")
+
+#: Recusas na porta: a Binance devolveu 429/418 sem processar o pedido. Sao as
+#: unicas falhas transitorias em que REENVIAR uma ordem e seguro -- nada entrou no
+#: motor. (`InvalidNonce`, o `-1021`, tambem e recusa na porta, mas pede
+#: ressincronizar o relogio antes; ver `_criar_ordem`.)
+_RECUSA_NA_PORTA = (
+    ccxt.RateLimitExceeded,
+    ccxt.DDoSProtection,
+)
+
+#: Espera antes de consultar o desfecho de um envio sem resposta: da ao motor da
+#: exchange tempo de processar a mensagem que ainda pode estar na fila.
+_ESPERA_ANTES_DA_CONSULTA = 1.0
 
 #: Sinais de que o problema e o IP, e nao a chave em si. Na Binance, `-2015`
 #: cobre "chave invalida, IP ou permissao" -- os tres casos caem na mesma
@@ -136,6 +166,13 @@ class CcxtExchange(MarketDataSource, Broker):
             "options": {"defaultType": "spot"},
         }
         if credentials and credentials.configured:
+            # Chamada assinada leva o relogio local; com mais de `recvWindow` (10 s)
+            # de diferenca a Binance devolve `-1021`. O host Windows volta da
+            # suspensao com a VM do Docker atrasada (SEGURANCA §17.3), e ai toda
+            # chamada assinada falhava, inclusive a saida protetora. Ligado so com
+            # credencial: a fonte publica nao assina nada, e o `load_markets` dela
+            # nao precisa de uma chamada a mais ao `/time`.
+            config["options"]["adjustForTimeDifference"] = True
             config["apiKey"] = credentials.api_key.get_secret_value()
             config["secret"] = credentials.api_secret.get_secret_value()
             if credentials.passphrase is not None:
@@ -156,6 +193,11 @@ class CcxtExchange(MarketDataSource, Broker):
     async def _with_retry(self, operation: str, func: Any, *args: Any, **kwargs: Any) -> Any:
         """Retry com backoff exponencial, apenas para erros transitorios.
 
+        So para LEITURA (candles, tickers, saldo, consulta de ordem): repetir uma
+        leitura nao muda nada na exchange. O envio de ordem NAO passa por aqui --
+        tem regra propria em `_criar_ordem`, porque reenviar uma MARKET que ja
+        preencheu compra de novo.
+
         Erros de negocio (saldo insuficiente, ordem invalida) sobem na hora:
         repetir nao muda o resultado e so atrasa o diagnostico.
         """
@@ -164,15 +206,12 @@ class CcxtExchange(MarketDataSource, Broker):
         for attempt in range(1, self._max_retries + 1):
             try:
                 return await func(*args, **kwargs)
-            except ccxt.InsufficientFunds as exc:
-                raise InsufficientFunds(str(exc)) from exc
-            except _ACCESS_DENIED as exc:
-                raise ApiAccessDenied(
-                    _access_denied_message(self.name, operation, str(exc)),
-                    exchange=self.name,
-                    operation=operation,
-                ) from exc
-            except _RETRYABLE as exc:
+            except ccxt.BaseError as exc:
+                self._levantar_se_definitivo(operation, exc)
+                if not isinstance(exc, _RETRYABLE):
+                    raise ExchangeError(f"{self.name}.{operation}: {exc}") from exc
+                if isinstance(exc, ccxt.InvalidNonce):
+                    await self._ressincronizar_relogio(operation)
                 last_error = exc
                 log.warning(
                     "exchange.retry",
@@ -184,11 +223,169 @@ class CcxtExchange(MarketDataSource, Broker):
                 if attempt < self._max_retries:
                     await asyncio.sleep(delay)
                     delay *= 2
-            except ccxt.BaseError as exc:
-                raise ExchangeError(f"{self.name}.{operation}: {exc}") from exc
         raise ExchangeError(
             f"{self.name}.{operation} falhou apos {self._max_retries} tentativas: {last_error}"
         )
+
+    def _levantar_se_definitivo(self, operation: str, exc: Exception) -> None:
+        """Traduz as respostas que nenhum retry resolve, qualquer que seja a operacao.
+
+        O acesso negado vem PRIMEIRO e e decidido pelo codigo `-2015` alem da
+        classe: ver `_CODIGO_ACESSO_NEGADO`.
+        """
+        if isinstance(exc, _ACCESS_DENIED) or _CODIGO_ACESSO_NEGADO.search(str(exc)):
+            raise ApiAccessDenied(
+                _access_denied_message(self.name, operation, str(exc)),
+                exchange=self.name,
+                operation=operation,
+            ) from exc
+        if isinstance(exc, ccxt.InsufficientFunds):
+            raise InsufficientFunds(str(exc)) from exc
+
+    async def _ressincronizar_relogio(self, operation: str) -> None:
+        """Rele a diferenca de relogio depois de um `-1021`.
+
+        O `adjustForTimeDifference` do ccxt so mede a diferenca no `load_markets`,
+        uma vez por processo. A deriva que importa nasce DEPOIS (o host suspende e
+        volta), entao sem isto o retry repetia o mesmo timestamp errado 3 vezes.
+        Falhar aqui so registra: o retry seguinte decide.
+        """
+        sincronizar = getattr(self._client, "load_time_difference", None)
+        if sincronizar is None:
+            return
+        try:
+            diferenca = await sincronizar()
+        except Exception as exc:
+            log.warning(
+                "exchange.relogio_nao_ressincronizado",
+                exchange=self.name,
+                operation=operation,
+                error=str(exc),
+            )
+            return
+        log.warning(
+            "exchange.relogio_ressincronizado",
+            exchange=self.name,
+            operation=operation,
+            diferenca_ms=diferenca,
+        )
+
+    async def _criar_ordem(self, request: OrderRequest, *args: Any) -> Any:
+        """`create_order` sem reenvio as cegas (auditoria de 09/11/2026, P0 #1 e #2).
+
+        O `clientOrderId` NAO protege o reenvio: na Binance ele e unico so entre
+        ordens ABERTAS, e uma MARKET preenche na hora. O `_with_retry` reenviava
+        com o mesmo id depois de um timeout, e a segunda compra preenchia de novo
+        -- 40% da carteira em vez de 20%, com um trade so no banco.
+
+        Por isso cada falha transitoria cai em um de dois grupos:
+
+        * **recusa na porta** (429/418 sem `-2015`, e `-1021` depois de
+          ressincronizar o relogio): a Binance respondeu sem processar o pedido,
+          nada entrou no motor, e reenviar e seguro;
+        * **desfecho desconhecido** (timeout, `-1007`, `-1006`, `-1000`/`-1001`,
+          HTTP 5xx, conexao caida, resposta ilegivel -- tudo `OperationFailed` no
+          ccxt 4.5): consulta a ordem pelo `clientOrderId`. Achou, devolve o
+          estado real. Nao achou ou nao conseguiu consultar, levanta
+          `DesfechoDesconhecido` -- e NAO reenvia. Um `-2013` logo depois de um
+          "execution status unknown" nao prova que a ordem nao vai executar (a
+          mensagem pode estar na fila do motor), e o custo e assimetrico: nao
+          reenviar custa um alerta de reconciliacao; reenviar errado custa uma
+          compra dobrada.
+        """
+        delay = 1.0
+        last_error: Exception | None = None
+        for attempt in range(1, self._max_retries + 1):
+            try:
+                return await self._client.create_order(*args)
+            except ccxt.BaseError as exc:
+                self._levantar_se_definitivo("create_order", exc)
+                if isinstance(exc, ccxt.InvalidNonce):
+                    # `-1021`: timestamp recusado na validacao, antes do motor.
+                    await self._ressincronizar_relogio("create_order")
+                elif isinstance(exc, _RECUSA_NA_PORTA):
+                    pass
+                elif isinstance(exc, ccxt.OperationFailed):
+                    return await self._descobrir_desfecho(request, exc)
+                else:
+                    # Recusa explicita da exchange (4xx com codigo): definitiva.
+                    raise ExchangeError(f"{self.name}.create_order: {exc}") from exc
+                last_error = exc
+                log.warning(
+                    "exchange.retry",
+                    exchange=self.name,
+                    operation="create_order",
+                    attempt=attempt,
+                    error=str(exc),
+                )
+                if attempt < self._max_retries:
+                    await asyncio.sleep(delay)
+                    delay *= 2
+        # Todas as tentativas foram recusadas NA PORTA: nenhuma ordem foi criada, e
+        # FAILED aqui e verdade.
+        raise ExchangeError(
+            f"{self.name}.create_order recusado {self._max_retries} vezes antes de chegar "
+            f"ao motor (nenhuma ordem criada): {last_error}"
+        )
+
+    async def _descobrir_desfecho(self, request: OrderRequest, erro: Exception) -> Any:
+        """Consulta pelo `clientOrderId` o envio que ficou sem resposta."""
+        cid = request.client_order_id
+        log.warning(
+            "exchange.desfecho_incerto",
+            exchange=self.name,
+            client_order_id=cid,
+            error=str(erro),
+        )
+        await asyncio.sleep(_ESPERA_ANTES_DA_CONSULTA)
+        try:
+            raw = await self._buscar_ordem(request)
+        except Exception as exc:
+            # Inclusive acesso negado na consulta: o desfecho do ENVIO continua
+            # desconhecido, e e isso que precisa chegar ao ExecutionAgent.
+            raise DesfechoDesconhecido(
+                f"{self.name}.create_order sem resposta ({erro}); a consulta pelo "
+                f"clientOrderId {cid} tambem falhou ({exc}). Nao reenviada."
+            ) from erro
+        if raw is None:
+            raise DesfechoDesconhecido(
+                f"{self.name}.create_order sem resposta ({erro}); consulta pelo "
+                f"clientOrderId {cid}: ordem nao encontrada. Nao reenviada: logo depois "
+                "de um desfecho incerto, nao achar nao prova que ela nao vai executar."
+            ) from erro
+        log.warning(
+            "exchange.desfecho_descoberto",
+            exchange=self.name,
+            client_order_id=cid,
+            status=raw.get("status"),
+            filled=raw.get("filled"),
+        )
+        return raw
+
+    async def _buscar_ordem(self, request: OrderRequest) -> Any:
+        """A ordem pelo `clientOrderId` (`origClientOrderId` na Binance), ou None.
+
+        `-2013` ("Order does not exist") vira None; qualquer outra falha sobe.
+        """
+
+        async def consultar() -> Any:
+            try:
+                return await self._client.fetch_order(
+                    None, request.symbol, {"origClientOrderId": request.client_order_id}
+                )
+            except ccxt.OrderNotFound:
+                return None
+
+        return await self._with_retry("fetch_order", consultar)
+
+    async def consultar_ordem(self, request: OrderRequest) -> OrderResult | None:
+        """O estado atual da ordem na exchange, pelo `clientOrderId`; None se nao existe.
+
+        E o mecanismo de que o envio depende para nao reenviar as cegas; existe
+        publico para que o ensaio da testnet o prove contra o servidor de verdade.
+        """
+        raw = await self._buscar_ordem(request)
+        return None if raw is None else self._resultado(request, raw)
 
     # ------------------------------------------------------------------
     # MarketDataSource
@@ -272,9 +469,8 @@ class CcxtExchange(MarketDataSource, Broker):
 
         params: dict[str, Any] = {"clientOrderId": request.client_order_id}
         try:
-            raw = await self._with_retry(
-                "create_order",
-                self._client.create_order,
+            raw = await self._criar_ordem(
+                request,
                 request.symbol,
                 str(request.order_type),
                 str(request.side),
@@ -303,6 +499,11 @@ class CcxtExchange(MarketDataSource, Broker):
             # apertado em retentar: uma ordem nova exige um sinal novo, que exige
             # um candle FECHADO -- em 1d, uma vez por dia por par.
             raise
+        except DesfechoDesconhecido:
+            # Tambem vem ANTES do generico: sem resposta e sem achar a ordem, o
+            # FAILED afirmaria que nada aconteceu. O ExecutionAgent grava PENDING
+            # e alerta `order_outcome_unknown`.
+            raise
         except ExchangeError as exc:
             return OrderResult(
                 order_request_id=request.id,
@@ -312,6 +513,10 @@ class CcxtExchange(MarketDataSource, Broker):
                 error=str(exc),
             )
 
+        return self._resultado(request, raw)
+
+    def _resultado(self, request: OrderRequest, raw: dict[str, Any]) -> OrderResult:
+        """`OrderResult` a partir da ordem no formato do ccxt (envio ou consulta)."""
         return OrderResult(
             order_request_id=request.id,
             client_order_id=request.client_order_id,
