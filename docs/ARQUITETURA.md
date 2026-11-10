@@ -31,7 +31,7 @@ Strategy Agent ──── calcula indicadores, aplica estratégias
    ▼
 Risk Manager Agent ── aplica TODAS as regras de risco
    │                   grava RiskAssessment (aprovado OU rejeitado)
-   │  OrderRequest (com stop-loss e take-profit anexados)
+   │  OrderRequest (níveis de stop e alvo calculados; a Execução recusa compra sem eles)
    ▼
 Execution Agent ──── grava PENDING, envia, reconcilia
    │  OrderResult
@@ -54,8 +54,8 @@ dentro do mesmo minuto — e cada oscilação dessas viraria uma ordem.
 |---|---|---|
 | Market Data | Busca candles/ticker, normaliza, persiste, publica | Não — usa só endpoints públicos, sem credenciais |
 | Strategy | Calcula indicadores, roda estratégias, emite `Signal` | Não |
-| Risk Manager | Valida limites, anexa SL/TP, circuit breaker, audita | Não — mas é quem autoriza |
-| Execution | Envia ordem, reconcilia status, garante idempotência | **Sim** — único componente que pode |
+| Risk Manager | Valida limites, calcula SL/TP, confere a proteção a cada retrato contra o preço corrente, circuit breaker, audita | Não — mas é quem autoriza |
+| Execution | Envia ordem, reconcilia status; em desfecho incerto consulta pelo `clientOrderId` e não reenvia | **Sim** — único componente que pode |
 | Portfolio | Saldos, posições, PnL, snapshots | Não — só leitura |
 | Orquestrador | Agenda ciclos, heartbeats, pausa/retoma, restart | Não |
 
