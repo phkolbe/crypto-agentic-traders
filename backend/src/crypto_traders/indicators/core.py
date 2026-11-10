@@ -42,6 +42,14 @@ def _smooth(series: pd.Series, period: int, alpha: float) -> pd.Series:
     no grafico da exchange, e o backtest passa a validar um sistema diferente do
     que roda ao vivo.
 
+    A semente depende de ONDE a janela comeca: o ao vivo calcula sobre os
+    `candle_history_limit` candles mais recentes e o backtest sobre a serie
+    inteira, e as duas EMAs so coincidem depois que o peso da semente,
+    `(1 - alpha) ** k` apos k barras, some. Com janela de 100: EMA 21 fica a
+    ~0,05% e a RMA 14 do RSI a ~0,2% do peso inicial no ultimo candle; com 50, a
+    EMA 21 ainda carrega ~6%. Por isso a janela minima pratica e ~4x o maior
+    periodo (100 para 9/21/14), e abaixo disso live e backtest divergem.
+
     NaN **inicial** (produzido por `diff()`/`shift()`) e artefato de aquecimento e
     e pulado na semente. NaN **no meio** da serie e outra coisa: e dado
     corrompido, e a recursao a partir dele fica indefinida -- por isso ele

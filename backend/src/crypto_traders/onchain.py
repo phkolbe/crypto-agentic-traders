@@ -128,9 +128,9 @@ class OnChainProvider:
         """
         serie = await self.mvrv_series()
         alvo = moment or datetime.now(UTC)
-        passado = [(d, v) for d, v in serie if d <= alvo.date()]
+        passado = sorted((d, v) for d, v in serie if d <= _dia_utc(alvo))
         if passado:
-            idade = alvo.date() - passado[-1][0]
+            idade = _dia_utc(alvo) - passado[-1][0]
             if idade > IDADE_MAXIMA_MVRV:
                 if not self._velho_avisado:
                     # Um aviso por episodio: o Risk le isto a cada lote de sinais.
@@ -162,9 +162,25 @@ def reading_from_series(
 
     Nao aplica `IDADE_MAXIMA_MVRV`: a serie historica do backtest e diaria e
     completa, e quem precisa do limite e a leitura ao vivo (`mvrv_reading`).
+
+    Ordena a serie em vez de supor que ela chega ordenada: `passado[-1]` e "o
+    ponto mais novo" so numa lista em ordem, e uma serie montada a mao (teste,
+    backtest com fonte trocada) daria o percentil de um dia qualquer.
     """
-    alvo = moment.date()
-    passado = [(d, v) for d, v in serie if d <= alvo]
+    alvo = _dia_utc(moment)
+    passado = sorted((d, v) for d, v in serie if d <= alvo)
     if not passado:
         return None
     return zone_by_percentile(passado[-1][1], [v for _, v in passado])
+
+
+def _dia_utc(moment: datetime) -> date:
+    """O dia UTC do instante: a serie e por dia UTC.
+
+    `moment.date()` sem normalizar pega o dia do fuso do objeto: 22:00 de D em
+    Brasilia ja e D+1 em UTC. Instante sem fuso e tratado como UTC, a convencao
+    do projeto.
+    """
+    if moment.tzinfo is None:
+        return moment.date()
+    return moment.astimezone(UTC).date()
