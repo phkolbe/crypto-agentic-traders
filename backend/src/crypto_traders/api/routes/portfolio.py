@@ -85,8 +85,17 @@ async def current_portfolio(session: AsyncSession = Depends(db_session)) -> Port
             return None
         return float((current_value - reference) / reference)
 
-    history = await repository.history(limit=1)
-    first = history[0] if history else None
+    # O primeiro retrato DO MODO atual. Era `history(limit=1)`, que devolve o mais
+    # RECENTE: o campo saia sempre ~0. E do mesmo modo porque o ensaio em
+    # dry_run de antes do live mede dinheiro de papel, nao o inicio do real.
+    first = (
+        await session.execute(
+            select(orm.PortfolioSnapshot)
+            .where(orm.PortfolioSnapshot.mode == latest.mode)
+            .order_by(orm.PortfolioSnapshot.timestamp.asc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
     since_start = None
     if first is not None:
         base = Decimal(str(first.total_value))
