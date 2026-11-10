@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import random
 import sqlite3
 import uuid
 from decimal import Decimal
@@ -12,6 +13,7 @@ import pytest
 from helpers import (
     LIBERACAO_DO_BANCO_DO_SISTEMA,
     e_o_banco_do_sistema,
+    isolar_do_ambiente,
     make_candles,
     recusa_do_banco_do_sistema,
 )
@@ -47,6 +49,31 @@ def pytest_configure(config):
     motivo = recusa_do_banco_do_sistema(dict(os.environ))
     if motivo is not None:
         raise pytest.UsageError(motivo)
+
+
+#: Semente para rodar a suite em ordem embaralhada (vazio = ordem normal).
+EMBARALHAR = "CRYPTO_TESTES_EMBARALHAR"
+
+
+def pytest_collection_modifyitems(config, items):
+    """Com `CRYPTO_TESTES_EMBARALHAR=<semente>`, roda os testes em ordem aleatoria.
+
+    A suite roda sempre na mesma ordem, entao um teste que so passa porque outro
+    rodou antes (estado de modulo, engine singleton, import de outro arquivo de
+    teste) nao aparece. O `pytest-randomly` faria isso, mas e dependencia nova e
+    mudaria a ordem de todo mundo em toda execucao; aqui e sob pedido, e a mesma
+    semente reproduz a mesma ordem. Auditoria de 09/11/2026, testes, foco 3.
+    """
+    semente = os.environ.get(EMBARALHAR)
+    if semente:
+        random.Random(semente).shuffle(items)
+
+
+def pytest_report_header(config):
+    semente = os.environ.get(EMBARALHAR)
+    if semente:
+        return f"ordem embaralhada: {EMBARALHAR}={semente}"
+    return None
 
 
 def _e_o_banco_do_ensaio(alvo: object) -> bool:
@@ -155,8 +182,14 @@ def isolate_from_dotenv(monkeypatch):
 
     `RiskSettings` e `TradingSettings` nao aparecem aqui porque nao leem ambiente
     nenhum: sao configuracao de negocio, e negocio mora no banco.
+
+    O `.env` nao era a unica porta: `DATABASE_URL`, `TRADING_MODE` e as chaves
+    `BINANCE__*` exportadas no shell chegavam a todo `Settings()` da suite
+    (auditoria de 09/11/2026, testes, foco 3). Saem tambem -- ver
+    `helpers.variaveis_do_sistema`. `POSTGRES_TEST_URL` fica: e o pedido
+    explicito de Postgres descartavel.
     """
-    monkeypatch.setitem(Settings.model_config, "env_file", None)
+    isolar_do_ambiente(monkeypatch)
 
 
 @pytest.fixture

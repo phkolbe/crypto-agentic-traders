@@ -6,15 +6,17 @@ import asyncio
 import inspect
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
 from sqlalchemy.engine import make_url
 
+from crypto_traders.config import ExchangeCredentials, Settings
 from crypto_traders.domain.enums import ExchangeName
 from crypto_traders.domain.models import Candle
+from crypto_traders.exchanges.base import timeframe_seconds
 
 #: Raiz do repositorio, ancorada no arquivo e nao no diretorio de trabalho.
 #: `backend/tests/helpers.py` -> `backend/tests` -> `backend` -> raiz.
@@ -84,6 +86,41 @@ def recusa_do_banco_do_sistema(ambiente: dict[str, str]) -> str | None:
     return None
 
 
+def variaveis_do_sistema(ambiente: Mapping[str, str]) -> list[str]:
+    """Variaveis do ambiente que `Settings` leria: as de campo e as aninhadas (`__`).
+
+    Desligar o `.env` nao bastava: `DATABASE_URL`, `TRADING_MODE`,
+    `BINANCE__API_KEY` ou `SMTP_PASSWORD` exportados no shell de quem roda a
+    suite continuam chegando a todo `Settings()` sem argumento -- e um teste
+    que construisse um passaria a ler o banco, o modo e as chaves da maquina.
+    `POSTGRES_TEST_URL` nao e campo de `Settings` e fica.
+
+    Entram tambem os campos de `ExchangeCredentials` SEM prefixo (`API_KEY`,
+    `API_SECRET`, `PASSPHRASE`): ela e um `BaseSettings` construido pelo
+    `default_factory` de `binance`/`binance_testnet`, e le o ambiente sozinha.
+    """
+    campos = [
+        nome.upper()
+        for nome in (*Settings.model_fields, *ExchangeCredentials.model_fields)
+    ]
+    return [
+        nome
+        for nome in ambiente
+        if any(nome.upper() == campo or nome.upper().startswith(f"{campo}__") for campo in campos)
+    ]
+
+
+def isolar_do_ambiente(monkeypatch) -> None:
+    """Desliga o `.env` e tira do `os.environ` o que `Settings` leria.
+
+    E o corpo da fixture autouse `isolate_from_dotenv`, separado para o teste da
+    barreira poder chama-lo de novo depois de sujar o ambiente.
+    """
+    monkeypatch.setitem(Settings.model_config, "env_file", None)
+    for nome in variaveis_do_sistema(os.environ):
+        monkeypatch.delenv(nome)
+
+
 def arquivo_do_repo(relativo: str) -> Path:
     """Caminho absoluto de um arquivo do repositorio.
 
@@ -104,8 +141,14 @@ def make_candles(
     start: datetime | None = None,
     closed: bool = True,
 ) -> list[Candle]:
-    """Constroi uma serie de candles a partir de uma lista de fechamentos."""
+    """Constroi uma serie de candles a partir de uma lista de fechamentos.
+
+    O espacamento e o do `timeframe`. Era 15 minutos fixos: uma serie "1h" tinha
+    candles a cada 15 min, e o motor -- que decide no fechamento, `open_time` +
+    duracao do timeframe -- via candles sobrepostos que nenhuma exchange produz.
+    """
     start = start or datetime(2026, 1, 1, tzinfo=UTC)
+    passo = timedelta(seconds=timeframe_seconds(timeframe))
     candles = []
     for index, close in enumerate(closes):
         value = Decimal(str(close))
@@ -114,7 +157,7 @@ def make_candles(
                 exchange=ExchangeName.BINANCE,
                 symbol=symbol,
                 timeframe=timeframe,
-                open_time=start + timedelta(minutes=15 * index),
+                open_time=start + passo * index,
                 open=value,
                 high=value * Decimal("1.005"),
                 low=value * Decimal("0.995"),
