@@ -22,7 +22,8 @@ x-imagem: &imagem
 
 services:
   postgres:
-    image: postgres:16-alpine
+    # postgres 16.15 (alpine), o mesmo digest da producao (implantacao/producao/compose.yml)
+    image: postgres:16-alpine@sha256:aa6cb33cf4c19c765cefcf48d96176258800870a9a1e930ad126200f9d825139
     container_name: crypto-postgres
     restart: unless-stopped
     environment:

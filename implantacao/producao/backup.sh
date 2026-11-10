@@ -55,10 +55,13 @@ if [ -n "$repositorio" ]; then
   segredos="$(mktemp -d)"
   trap 'rm -rf "$segredos"' EXIT
   valor RESTIC_PASSWORD >"$segredos/senha" || true
+  # restic 0.18.0, fixado por digest (le a senha e as credenciais do provedor): README,
+  # "Imagens".
   restic() {
     docker run --rm "${extra[@]}" -e RESTIC_REPOSITORY="$repositorio" \
       -e RESTIC_PASSWORD_FILE=/run/restic/senha -v "$segredos:/run/restic:ro" \
-      -v "$PASTA/backups:/backups:ro" restic/restic:0.18.0 "$@"
+      -v "$PASTA/backups:/backups:ro" \
+      restic/restic:0.18.0@sha256:4cf4a61ef9786f4de53e9de8c8f5c040f33830eb0a10bf3d614410ee2fcb6120 "$@"
   }
   restic cat config >/dev/null 2>&1 || restic init
   restic backup --tag crypto "/backups/$arquivo"

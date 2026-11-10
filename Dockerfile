@@ -9,11 +9,21 @@
 # A mesma imagem roda o `migrar` (schema e gatilhos, com o usuario dono do banco) e
 # o `run` (agentes + API + telas, com o usuario da aplicacao). Segredos e modo de
 # operacao vem so do ambiente do conteiner; nada de .env dentro da imagem.
+#
+# Imagens base fixadas por DIGEST (a versao exata no comentario): a tag `3.13-slim` ou
+# `22-bookworm-slim` muda de conteudo a cada correcao do upstream, e o mesmo commit
+# gerava imagens diferentes conforme o dia do build. O digest e o do indice
+# multiplataforma (serve ao arm64 da producao e ao amd64 da CI). Para atualizar (de
+# proposito, num commit proprio, com a CI construindo a imagem):
+#     docker buildx imagetools inspect python:3.13-slim-bookworm   # linha "Digest:"
+# e trocar digest e versao aqui; o mesmo para node e uv (README da producao, "Imagens").
 
-ARG PYTHON_IMAGE=python:3.13-slim-bookworm
+# python 3.13.18 (slim-bookworm)
+ARG PYTHON_IMAGE=python:3.13-slim-bookworm@sha256:a5a7017efc5969e00ae2b91c8eb0631049a569652aa4ffc4501769049ae45c72
 
 # --- telas: frontend/dist ---------------------------------------------------------
-FROM node:22-bookworm-slim AS telas
+# node 22.23.4 (bookworm-slim)
+FROM node:22-bookworm-slim@sha256:5ec23b7c622b00547753bc6ffd78085dd868a68aeb41c8e0a1418f033e13d96d AS telas
 WORKDIR /src/frontend
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci --no-audit --no-fund
@@ -22,7 +32,8 @@ RUN npm run build
 
 # --- dependencias: /app/.venv -----------------------------------------------------
 FROM ${PYTHON_IMAGE} AS deps
-COPY --from=ghcr.io/astral-sh/uv:0.11.24 /uv /bin/uv
+# uv 0.11.24
+COPY --from=ghcr.io/astral-sh/uv:0.11.24@sha256:99ea34acedc870ba4ad11a1f540a1c04267c9f30aadc465a94406f52dfda2c36 /uv /bin/uv
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=never UV_PROJECT_ENVIRONMENT=/app/.venv
 WORKDIR /app
 COPY pyproject.toml uv.lock README.md ./
