@@ -27,18 +27,45 @@ _SENSITIVE_KEYS = {
     "password",
     "token",
     "authorization",
+    # A URL do banco leva a senha (postgresql+asyncpg://crypto:<senha>@...).
+    "database_url",
+    "dsn",
 }
+
+#: Nomes compostos: `smtp_password`, `whatsapp_access_token`, `binance_api_secret`.
+#: So o nome exato deixava todos eles passarem (auditoria 09/11/2026).
+_SENSITIVE_SUFFIXES = ("_password", "_secret", "_token", "_api_key", "_apikey", "_passphrase")
+
+
+def _sensivel(key: str) -> bool:
+    nome = key.lower()
+    return nome in _SENSITIVE_KEYS or nome.endswith(_SENSITIVE_SUFFIXES)
+
+
+def _redigir(valor: dict[Any, Any]) -> dict[Any, Any]:
+    """Copia redigida de um dict aninhado: o original e de quem logou (pode ser a
+    configuracao viva) e nao pode virar `***` por causa de uma linha de log."""
+    return {
+        k: "***"
+        if isinstance(k, str) and _sensivel(k)
+        else (_redigir(v) if isinstance(v, dict) else v)
+        for k, v in valor.items()
+    }
 
 
 def _redact_secrets(_logger: Any, _name: str, event_dict: dict[str, Any]) -> dict[str, Any]:
     """Ultima linha de defesa contra chave de API em arquivo de log.
 
     Se algum agente logar um dict de credenciais por descuido, o valor vira
-    `***`. Melhor um log menos util do que uma chave vazada em disco.
+    `***`. Melhor um log menos util do que uma chave vazada em disco. Vale para
+    nomes compostos (`smtp_password`) e para dicts aninhados; o texto de uma
+    excecao nao e olhado (e texto livre).
     """
     for key in list(event_dict):
-        if key.lower() in _SENSITIVE_KEYS:
+        if _sensivel(key):
             event_dict[key] = "***"
+        elif isinstance(event_dict[key], dict):
+            event_dict[key] = _redigir(event_dict[key])
     return event_dict
 
 
