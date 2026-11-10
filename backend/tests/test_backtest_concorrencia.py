@@ -130,8 +130,11 @@ class TestBacktestNaoTravaOLacoDeEventos:
         assert resposta.status_code == 200, resposta.text
         assert {"inicio", "fim"} <= janela.keys(), "o motor nao rodou"
         durante = [t for t in passos if janela["inicio"] <= t <= janela["fim"]]
-        # No laco de eventos seriam 0 passos; numa thread, ~50 (0,5 s / 10 ms).
-        assert len(durante) >= 10, (
+        # No laco de eventos seriam 0 passos; numa thread, ~50 (0,5 s / 10 ms). O
+        # corte e 2, e nao 10: com a maquina carregada (suite embaralhada da rodada
+        # 3) o laco deu 4 passos -- ainda a prova de que ele girou, que e o que se
+        # mede. Zero e o defeito; qualquer passo dentro da janela e a correcao.
+        assert len(durante) >= 2, (
             f"o laco de eventos deu so {len(durante)} passos durante os 0,5 s de motor"
         )
 

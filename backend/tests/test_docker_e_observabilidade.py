@@ -78,6 +78,17 @@ class TestObservadorDoBarramento:
 # ---------------------------------------------------------------------------
 # Subida sem DDL (DB_MIGRAR_NA_SUBIDA=false)
 # ---------------------------------------------------------------------------
+def _objetos_do_schema(arquivo) -> list[tuple[str, str]]:
+    """Tabelas, indices e gatilhos de um SQLite, para comparar antes e depois."""
+    conn = sqlite3.connect(arquivo)
+    try:
+        return conn.execute(
+            "SELECT type, name FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+    finally:
+        conn.close()
+
+
 class TestSubidaSemMigrar:
     async def test_banco_vazio_recusa_subir_e_nao_cria_nada(self, tmp_path):
         arquivo = tmp_path / "vazio.db"
@@ -103,9 +114,16 @@ class TestSubidaSemMigrar:
         try:
             await init_db(cfg, migrar=True)
             await dispose_engine()
+            # Sem assert este teste so provava "nao levantou" (auditoria, testes.md).
+            # O que importa: a subida sem migrar ACEITA o banco migrado sem recriar
+            # nada nem mexer na versao do schema.
+            antes = _objetos_do_schema(arquivo)
             await init_db(cfg, migrar=False)
+            depois = _objetos_do_schema(arquivo)
         finally:
             await dispose_engine()
+        assert antes, "o migrar nao criou o schema"
+        assert depois == antes, "a subida sem migrar alterou o schema de um banco ja migrado"
 
     async def test_gatilho_derrubado_por_fora_impede_a_subida(self, tmp_path):
         arquivo = tmp_path / "sem_gatilho.db"

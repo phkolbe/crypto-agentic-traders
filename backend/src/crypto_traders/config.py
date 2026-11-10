@@ -129,10 +129,17 @@ def _split_csv_value(value: object, *, upper: bool = False) -> object:
     return value
 
 
-class ExchangeCredentials(BaseSettings):
-    """Credenciais de uma exchange. `SecretStr` evita vazamento acidental em log/repr."""
+class ExchangeCredentials(BaseModel):
+    """Credenciais de uma exchange. `SecretStr` evita vazamento acidental em log/repr.
 
-    model_config = SettingsConfigDict(extra="ignore")
+    Modelo comum, e nao `BaseSettings`: so o `Settings` le o ambiente, e por nome com
+    prefixo (`BINANCE__API_KEY`, `BINANCE_TESTNET__API_KEY`). Como `BaseSettings`
+    criado por `default_factory`, cada instancia lia o ambiente SEM prefixo -- medido
+    em 10/11/2026: `API_SECRET=x` de qualquer outra ferramenta preenchia ao mesmo
+    tempo a credencial real e a da testnet.
+    """
+
+    model_config = ConfigDict(extra="ignore")
 
     api_key: SecretStr | None = None
     api_secret: SecretStr | None = None

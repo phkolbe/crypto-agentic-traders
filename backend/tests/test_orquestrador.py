@@ -1622,7 +1622,15 @@ class TestPausarAExecucaoNaoDesligaOStopLoss:
 
         # O outro lado de D4, com a mesma trava: a compra nao passa.
         await bus.publish(Topics.ORDER_REQUESTS, _compra("apos-pausa"))
-        await asyncio.sleep(0.3)
+
+        async def recusa_gravada() -> bool:
+            async with session_scope(settings) as session:
+                acoes = [r.action for r in await AuditLogRepository(session).list(limit=30)]
+            return "opening_refused" in acoes
+
+        # Era `sleep(0.3)`: com a maquina carregada a recusa ainda nao estava no
+        # audit_log e o teste falhava sem defeito (rodada 3, suite embaralhada).
+        await esperar_ate(recusa_gravada, prazo=5)
         async with session_scope(settings) as session:
             ordens = await OrderRepository(session).list()
             registros = [r.action for r in await AuditLogRepository(session).list(limit=30)]

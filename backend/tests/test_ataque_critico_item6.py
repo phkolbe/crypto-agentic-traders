@@ -27,9 +27,11 @@ agente de execucao e a trava de protecao desligava o stop-loss.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from decimal import Decimal
 
 import pytest
+from helpers import esperar_ate
 
 from crypto_traders.agents.base import BaseAgent
 from crypto_traders.agents.execution import ExecutionAgent
@@ -276,7 +278,16 @@ class TestSemProtecaoTambemSemAbertura:
         )
 
         await bus.publish(Topics.ORDER_REQUESTS, _pedido("abertura-liberada", Side.BUY))
-        await asyncio.sleep(0.4)
+
+        async def compra_gravada() -> bool:
+            return any(
+                o.client_order_id == "abertura-liberada" for o in await _ordens(settings)
+            )
+
+        # Espera positiva: termina quando a compra aparece (era `sleep(0.4)`, que num
+        # CI lento falhava sem defeito). Se ela nunca aparece, o assert abaixo diz por que.
+        with contextlib.suppress(AssertionError):
+            await esperar_ate(compra_gravada, prazo=5)
         ordens = await _ordens(settings)
         await execucao.stop()
 
