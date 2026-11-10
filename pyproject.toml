@@ -1,6 +1,6 @@
 [project]
 name = "crypto-agentic-traders"
-version = "0.1.0"
+version = "0.2.0"
 description = "Agentes autonomos de negociacao de criptomoedas com Risk Manager como guardiao obrigatorio"
 readme = "README.md"
 requires-python = ">=3.13"

@@ -72,7 +72,7 @@ def create_app(orchestrator: Orchestrator | None = None) -> FastAPI:
     app = FastAPI(
         title="crypto-agentic-traders",
         description=DESCRIPTION,
-        version="0.1.0",
+        version="0.2.0",
         lifespan=lifespan,
     )
     app.state.orchestrator = orchestrator
