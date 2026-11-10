@@ -299,6 +299,19 @@ class OrderRepository:
         order = await self._session.get(orm.Order, result.order_request_id)
         if order is None:
             return None
+        filled = str(OrderStatus.FILLED)
+        if order.status == filled and str(result.status) != filled:
+            # Sem maquina de estados, um resultado tardio (`open`, `pending`, ou a
+            # consulta de reconciliacao vendo a ordem antes do preenchimento)
+            # REGREDIA a ordem preenchida -- e o que decide "ha ordem viva" volta
+            # a ver uma ordem que ja executou (auditoria de 09/11/2026, banco).
+            # Preenchida e fato consumado: o resultado tardio fica so no log.
+            log.warning(
+                "db.ordem_preenchida_nao_regride",
+                order_id=order.id,
+                status_recebido=str(result.status),
+            )
+            return order
         order.status = str(result.status)
         order.exchange_order_id = result.exchange_order_id
         order.filled_quantity = result.filled_quantity

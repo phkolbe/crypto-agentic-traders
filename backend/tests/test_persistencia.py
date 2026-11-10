@@ -1984,3 +1984,36 @@ class TestJsonQueOBancoAceita:
         assert sinal.indicators == {
             "rsi": "NaN", "topo": "Infinity", "preco": "60000.10", "lista": ["-Infinity"]
         }
+
+
+class TestOrdemPreenchidaNaoRegride:
+    """Auditoria de 09/11/2026 (banco, low): `apply_result` sobrescrevia o status
+    sem maquina de estados -- um resultado tardio `open` depois de `filled`
+    regredia a ordem que ja executou."""
+
+    async def test_resultado_tardio_nao_desfaz_o_preenchimento(self, settings):
+        from crypto_traders.db.repositories import OrderRepository
+        from crypto_traders.domain.enums import OrderStatus, OrderType, Side
+
+        pedido = dm.OrderRequest(
+            client_order_id="c1", signal_id=None, risk_event_id="r1",
+            exchange=ExchangeName.BINANCE, symbol="BTC/USDT", side=Side.BUY,
+            order_type=OrderType.MARKET, quantity=Decimal("0.001"), notional=Decimal("0.1"),
+        )
+
+        def resultado(status, filled):
+            return dm.OrderResult(
+                order_request_id=pedido.id, client_order_id="c1",
+                exchange_order_id="e1", status=status, filled_quantity=Decimal(filled),
+                average_price=Decimal("100"),
+            )
+
+        async with session_scope(settings) as ses:
+            repositorio = OrderRepository(ses)
+            await repositorio.create_pending(pedido, "dry_run")
+            await repositorio.apply_result(resultado(OrderStatus.FILLED, "0.001"))
+            await repositorio.apply_result(resultado(OrderStatus.OPEN, "0"))
+        async with session_scope(settings) as ses:
+            ordem = await ses.get(orm.Order, pedido.id)
+        assert ordem.status == str(OrderStatus.FILLED)
+        assert ordem.filled_quantity == Decimal("0.001")

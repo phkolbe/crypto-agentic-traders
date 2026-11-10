@@ -663,7 +663,34 @@ class Orchestrator:
                 ativo = config.circuit_breaker_active
                 motivo = config.circuit_breaker_reason
         except Exception as exc:
+            # Falhava ABERTO: sem saber se a trava estava armada, a abertura
+            # seguia solta -- o contrario de "padrao de fabrica de uma trava nunca
+            # pode ser solta" logo acima (auditoria de 09/11/2026, L5). O RiskEngine
+            # ainda recusa pelo proprio estado, mas esse estado vem do mesmo banco.
+            # Barra a abertura (fechar segue passando, D4) e avisa; o operador a
+            # solta retomando a execucao pela interface.
             log.error("orchestrator.circuit_breaker_state_unreadable", error=str(exc))
+            motivo_trava = f"estado do circuit breaker ilegivel na subida: {exc}"
+            execucao = self.agents.get("execution")
+            bloquear = getattr(execucao, "block_openings", None)
+            if bloquear is not None and getattr(execucao, "openings_blocked", None) is None:
+                bloquear(motivo_trava)
+            with contextlib.suppress(Exception):
+                await self.bus.publish(
+                    Topics.ALERTS,
+                    {
+                        "type": "circuit_breaker_ilegivel",
+                        "title": "Abertura bloqueada: estado da trava ilegivel na subida",
+                        "message": (
+                            f"O banco nao respondeu ao ler o circuit breaker ({exc}). Sem "
+                            "saber se a trava estava armada, nenhuma compra sera executada; "
+                            "vendas e saidas de protecao continuam passando. Confira o "
+                            "circuit breaker na tela Risco e retome o agente de execucao "
+                            "para liberar."
+                        ),
+                        "timestamp": datetime.now(UTC).isoformat(),
+                    },
+                )
             return
 
         if not ativo:

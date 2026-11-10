@@ -1274,6 +1274,54 @@ class TestCircuitBreakerBloqueiaAbertura:
         )
         assert "perda diaria" in execucao.openings_blocked
 
+    async def test_estado_ilegivel_da_trava_falha_fechado(self, settings, monkeypatch):
+        """Banco sem responder na leitura do circuit breaker: a abertura ficava solta.
+
+        Auditoria de 09/11/2026, orquestracao L5: sem saber se a trava estava
+        armada, o padrao nao pode ser "solta".
+        """
+        from crypto_traders.agents.execution import ExecutionAgent
+        from crypto_traders.exchanges.paper import PaperBroker
+
+        def banco_fora(_settings=None):
+            raise OSError("connection refused")
+
+        monkeypatch.setattr(orch_mod, "session_scope", banco_fora)
+        bus = InMemoryEventBus()
+        await bus.start()
+        alertas: list[dict] = []
+        bus.observar(lambda topico, p: alertas.append(p) if topico == Topics.ALERTS else None)
+        execucao = ExecutionAgent(bus, PaperBroker(initial_balance=Decimal("100")), settings)
+        orquestrador = BancadaOrquestrador(settings, {"execution": execucao}, bus)
+
+        await orquestrador._apply_persisted_circuit_breaker()
+
+        assert execucao.openings_blocked is not None
+        assert "ilegivel" in execucao.openings_blocked
+        assert [a["type"] for a in alertas] == ["circuit_breaker_ilegivel"]
+
+
+class TestCrashComBusFora:
+    async def test_a_excecao_do_agente_nao_e_trocada_pela_do_bus(self, settings):
+        """Auditoria de 09/11/2026, orquestracao L9: no caminho do crash a batida
+        levantava (bus fora) e a tarefa morria com a falha do BUS."""
+
+        class Quebra(BaseAgent):
+            name = "quebra"
+
+            async def _run(self):
+                raise ValueError("a causa de verdade")
+
+            async def heartbeat(self, detail=None):
+                raise ConnectionResetError("bus fora")
+
+        agente = Quebra(InMemoryEventBus())
+        await agente.start()
+        await esperar_ate(lambda: not agente.is_running)
+        assert isinstance(agente._task.exception(), ValueError)
+        assert agente.last_error == "a causa de verdade"
+        await agente.stop()
+
 
 # ---------------------------------------------------------------------------
 class TestExecucaoAbandonada:

@@ -766,5 +766,11 @@ class BaseAgent(abc.ABC):
             self.state = AgentState.ERROR
             self.last_error = str(exc)
             self.log.exception("agent.crashed", error=str(exc))
-            await self.heartbeat(detail=f"crash: {exc}")
+            try:
+                await self.heartbeat(detail=f"crash: {exc}")
+            except Exception as falha_da_batida:
+                # Com o bus fora, a batida levantava aqui e o `raise` abaixo
+                # relancava a falha do BUS: a tarefa morria com a causa errada e
+                # a original so ficava no log (auditoria de 09/11/2026, L9).
+                self.log.warning("agent.crash_beat_failed", error=str(falha_da_batida))
             raise
