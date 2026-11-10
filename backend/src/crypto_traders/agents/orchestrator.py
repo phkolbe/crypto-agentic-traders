@@ -119,6 +119,11 @@ ONCHAIN_REFRESH_INTERVAL_SECONDS = 3600
 CHAVE_INSTANCIA_UNICA = 0x63727970746F
 
 
+#: Teto para a conferencia da trava no `pg_locks`. Conexao pendurada (TCP aberto
+#: sem resposta) nao pode pendurar o watchdog, que e quem confere.
+PRAZO_CONFERENCIA_DA_TRAVA_SEGUNDOS = 10.0
+
+
 class InstanciaDuplicada(RuntimeError):
     """Outro `crypto-traders run` ja opera sobre este banco (M3 da orquestracao)."""
 
@@ -140,6 +145,14 @@ _OWN_TASK_CONSEQUENCE = {
         "valor buscado."
     ),
 }
+
+
+async def _descartar_conexao(conexao: Any) -> None:
+    """Fecha sem devolver ao pool: no pool, a sessao (e a trava) seguiria viva."""
+    with contextlib.suppress(Exception):
+        await conexao.invalidate()
+    with contextlib.suppress(Exception):
+        await conexao.close()
 
 
 class Orchestrator:
@@ -235,6 +248,15 @@ class Orchestrator:
 
         self._instancia_recusada = False
         """A subida foi recusada por haver outra instancia: o `stop()` nao marca nada."""
+
+        self._usa_trava = False
+        """A trava de instancia unica foi tomada (Postgres) e deve ser conferida."""
+
+        self._trava_perdida = False
+        """A trava caiu e nao foi retomada: aviso uma vez por episodio (D19)."""
+
+        self._abertura_barrada_pela_trava: str | None = None
+        """Motivo com que a trava perdida barrou a abertura, para soltar so a nossa."""
 
         self._alertas_assinados = asyncio.Event()
         """A assinatura de ALERTS ja existe no bus (ver `_esperar_assinatura_de_alertas`)."""
@@ -422,8 +444,8 @@ class Orchestrator:
         `pg_try_advisory_lock` de SESSAO numa conexao dedicada, mantida pela vida
         do processo: a trava some sozinha quando o processo morre (a conexao cai),
         sem arquivo de trava para limpar. Se a conexao cair com o processo vivo
-        (Postgres reiniciado), a trava se perde em silencio e uma segunda
-        instancia passaria -- limite conhecido, que nao piora o que havia.
+        (Postgres reiniciado, rede), a trava some junto -- e o watchdog confere a
+        cada ciclo se ela continua de pe (`_conferir_instancia_unica`).
 
         SQLite fica de fora: o arquivo e local da maquina, e o risco medido e o
         Postgres compartilhado do servidor.
@@ -431,22 +453,8 @@ class Orchestrator:
         engine = get_engine(self.settings)
         if engine.dialect.name != "postgresql":
             return
-        conexao = await engine.connect()
-        try:
-            livre = (
-                await conexao.execute(
-                    text("SELECT pg_try_advisory_lock(:chave)"),
-                    {"chave": CHAVE_INSTANCIA_UNICA},
-                )
-            ).scalar()
-            # A trava e de sessao, sobrevive ao commit; a transacao aberta nao
-            # pode ficar "idle in transaction" pela vida do processo.
-            await conexao.commit()
-        except Exception:
-            await conexao.close()
-            raise
-        if not livre:
-            await conexao.close()
+        conexao = await self._abrir_trava()
+        if conexao is None:
             self._instancia_recusada = True
             log.error(
                 "orchestrator.instancia_duplicada",
@@ -458,6 +466,170 @@ class Orchestrator:
                 "conta em dobro; pare a outra antes de subir esta."
             )
         self._conexao_da_trava = conexao
+        self._usa_trava = True
+
+    async def _abrir_trava(self) -> Any | None:
+        """Conexao dedicada segurando a trava, ou `None` se outra sessao a tem."""
+        conexao = await get_engine(self.settings).connect()
+        try:
+            livre = (
+                await conexao.execute(
+                    text("SELECT pg_try_advisory_lock(:chave)"),
+                    {"chave": CHAVE_INSTANCIA_UNICA},
+                )
+            ).scalar()
+            # A trava e de sessao, sobrevive ao commit; a transacao aberta nao
+            # pode ficar "idle in transaction" pela vida do processo.
+            await conexao.commit()
+        except Exception:
+            await _descartar_conexao(conexao)
+            raise
+        if not livre:
+            await _descartar_conexao(conexao)
+            return None
+        return conexao
+
+    async def _trava_mantida(self) -> bool:
+        """A sessao da conexao dedicada ainda segura a trava?
+
+        Pergunta ao `pg_locks` pela sessao corrente (`pg_backend_pid()`), e nao
+        so "a conexao responde": depois de uma queda o SQLAlchemy pode pegar
+        outra conexao por baixo do mesmo objeto, e um `SELECT 1` responderia de
+        uma sessao nova -- SEM a trava. Qualquer erro aqui e trava perdida.
+        """
+        conexao = self._conexao_da_trava
+        if conexao is None:
+            return False
+        try:
+            async with asyncio.timeout(PRAZO_CONFERENCIA_DA_TRAVA_SEGUNDOS):
+                mantida = (
+                    await conexao.execute(
+                        text(
+                            "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE "
+                            "locktype = 'advisory' AND granted AND objsubid = 1 "
+                            "AND pid = pg_backend_pid() "
+                            "AND classid::bigint = :alta AND objid::bigint = :baixa)"
+                        ),
+                        {
+                            "alta": CHAVE_INSTANCIA_UNICA >> 32,
+                            "baixa": CHAVE_INSTANCIA_UNICA & 0xFFFFFFFF,
+                        },
+                    )
+                ).scalar()
+                await conexao.commit()
+        except Exception as exc:
+            log.error("orchestrator.trava_ilegivel", error=str(exc))
+            return False
+        return bool(mantida)
+
+    async def _conferir_instancia_unica(self) -> None:
+        """Confere a trava de instancia unica; perdida, retoma ou para de abrir.
+
+        A trava vive na conexao dedicada. Se ela cai com o processo vivo
+        (Postgres reiniciado, rede piscando), a trava some com ela em silencio, e
+        um segundo `crypto-traders run` subiria sem ser recusado: ordem dobrada
+        com dinheiro real. Era um limite conhecido; agora o watchdog pergunta a
+        cada ciclo.
+
+        * Mantida: nada a fazer.
+        * Perdida e retomada numa conexao nova: avisa, porque na janela entre a
+          queda e a retomada outra instancia poderia ter subido.
+        * Perdida e NAO retomada (outra sessao a tem, ou o banco nao responde):
+          barra a ABERTURA -- se outra instancia opera a mesma conta, comprar e
+          comprar em dobro -- e avisa. Fechar segue passando (D4): tirar o stop
+          por causa da trava seria trocar um risco por outro maior. A abertura
+          volta sozinha quando a trava for retomada.
+        """
+        if not self._usa_trava or self._shutting_down:
+            return
+        if await self._trava_mantida():
+            return
+
+        velha, self._conexao_da_trava = self._conexao_da_trava, None
+        if velha is not None:
+            await _descartar_conexao(velha)
+        erro: str | None = None
+        try:
+            nova = await self._abrir_trava()
+        except Exception as exc:
+            nova, erro = None, str(exc)
+
+        if nova is not None:
+            self._conexao_da_trava = nova
+            perdida_antes = self._trava_perdida
+            self._trava_perdida = False
+            self._soltar_abertura_da_trava()
+            log.warning(
+                "orchestrator.trava_retomada",
+                detail="a trava de instancia unica caiu e foi retomada numa conexao nova",
+            )
+            titulo = (
+                "Trava de instancia unica retomada: abertura liberada"
+                if perdida_antes
+                else "Trava de instancia unica caiu e foi retomada"
+            )
+            await self.bus.publish(
+                Topics.ALERTS,
+                {
+                    "type": "instancia_unica_retomada",
+                    "title": titulo,
+                    "message": (
+                        "A conexao que segura a trava contra um segundo "
+                        "'crypto-traders run' caiu (Postgres reiniciado ou rede), e a "
+                        "trava foi retomada. Entre a queda e a retomada outra instancia "
+                        "poderia ter subido: confira se ha mais de um processo do sistema "
+                        "e ordens repetidas na aba Operacoes."
+                    ),
+                    "timestamp": datetime.now(UTC).isoformat(),
+                },
+            )
+            return
+
+        motivo = (
+            "trava de instancia unica perdida: outra instancia pode estar operando "
+            "esta conta" + (f" (banco: {erro})" if erro else "")
+        )
+        log.error("orchestrator.trava_perdida", reason=motivo)
+        execucao = self.agents.get("execution")
+        bloquear = getattr(execucao, "block_openings", None)
+        if bloquear is not None and getattr(execucao, "openings_blocked", None) is None:
+            # Trava de abertura ja armada (circuit breaker, interface) nao troca de
+            # motivo e nao passa a ser nossa para soltar depois.
+            bloquear(motivo)
+            self._abertura_barrada_pela_trava = motivo
+        if self._trava_perdida:
+            return  # um aviso por episodio (D19); o log registra cada ciclo
+        self._trava_perdida = True
+        await self.bus.publish(
+            Topics.ALERTS,
+            {
+                "type": "instancia_unica_perdida",
+                "title": "Trava de instancia unica perdida -- abertura bloqueada",
+                "message": (
+                    "A conexao que segura a trava contra um segundo 'crypto-traders run' "
+                    "caiu e a trava NAO pode ser retomada"
+                    + (f" (o banco respondeu: {erro})" if erro else ": outra sessao a tem")
+                    + ".\n\nSe outra instancia esta de pe sobre o mesmo banco, as duas "
+                    "operam a mesma conta em dobro. Enquanto isso NENHUMA compra sera "
+                    "executada; vendas e saidas de protecao continuam passando (D4). "
+                    "Pare a instancia a mais. A abertura volta sozinha quando a trava "
+                    "for retomada."
+                ),
+                "timestamp": datetime.now(UTC).isoformat(),
+            },
+        )
+
+    def _soltar_abertura_da_trava(self) -> None:
+        """Solta a abertura barrada pela trava perdida -- so se ela ainda e nossa."""
+        motivo, self._abertura_barrada_pela_trava = self._abertura_barrada_pela_trava, None
+        if motivo is None or self._circuit_breaker_active():
+            return
+        execucao = self.agents.get("execution")
+        if getattr(execucao, "openings_blocked", None) != motivo:
+            return
+        liberar = getattr(execucao, "allow_openings", None)
+        if liberar is not None:
+            liberar()
 
     async def _soltar_instancia_unica(self) -> None:
         """Solta a trava e DESCARTA a conexao.
@@ -465,6 +637,7 @@ class Orchestrator:
         Devolve-la ao pool manteria a sessao do Postgres -- e com ela a trava --
         viva dentro do pool.
         """
+        self._usa_trava = False
         conexao, self._conexao_da_trava = self._conexao_da_trava, None
         if conexao is None:
             return
@@ -473,10 +646,7 @@ class Orchestrator:
                 text("SELECT pg_advisory_unlock(:chave)"), {"chave": CHAVE_INSTANCIA_UNICA}
             )
             await conexao.commit()
-        with contextlib.suppress(Exception):
-            await conexao.invalidate()
-        with contextlib.suppress(Exception):
-            await conexao.close()
+        await _descartar_conexao(conexao)
 
     async def _apply_persisted_circuit_breaker(self) -> None:
         """Repoe a parada geral se a trava ficou armada da execucao anterior.
@@ -1000,6 +1170,11 @@ class Orchestrator:
                 **self.entrega_de_alertas,
                 "falhas_por_canal": dict(self.entrega_de_alertas["falhas_por_canal"]),
             },
+            # Trava contra um segundo `crypto-traders run` (Postgres): `None` no
+            # SQLite, "perdida" quando caiu e nao foi retomada (abertura barrada).
+            "instancia_unica": (
+                ("perdida" if self._trava_perdida else "mantida") if self._usa_trava else None
+            ),
         }
 
     def vitalidade(self) -> list[str]:
@@ -1587,6 +1762,10 @@ class Orchestrator:
                 # A vigilancia nunca pode morrer por um erro dela mesma: sem
                 # watchdog, um agente travado deixa de ser detectado.
                 log.error("orchestrator.watchdog_cycle_failed", error=str(exc))
+            try:
+                await self._conferir_instancia_unica()
+            except Exception as exc:
+                log.error("orchestrator.trava_conferencia_falhou", error=str(exc))
             # Ciclo que terminou, com ou sem erro: o laco anda. Pendurado no
             # meio do ciclo, nao chega aqui e a sonda de saude ve o atraso.
             self._watchdog_ultimo_ciclo = time.monotonic()
