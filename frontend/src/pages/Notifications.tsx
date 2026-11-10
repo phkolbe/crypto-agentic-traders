@@ -1,9 +1,32 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useEffect, useState } from 'react'
+import { useEffect, useId, useState } from 'react'
 
 import { ApiError, api } from '../api/client'
 import type { NotificationConfig, NotificationTestResult } from '../api/types'
-import { Card, Loading } from '../components/Shared'
+import { Card, ErroDeCarga, Loading } from '../components/Shared'
+
+type Rascunho = Pick<
+  NotificationConfig,
+  'email_enabled' | 'email_to' | 'whatsapp_enabled' | 'whatsapp_to'
+>
+
+function rascunhoDe(config: NotificationConfig): Rascunho {
+  return {
+    email_enabled: config.email_enabled,
+    email_to: config.email_to,
+    whatsapp_enabled: config.whatsapp_enabled,
+    whatsapp_to: config.whatsapp_to,
+  }
+}
+
+function mesmoRascunho(a: Partial<Rascunho>, b: Partial<Rascunho>): boolean {
+  return (
+    (a.email_enabled ?? false) === (b.email_enabled ?? false) &&
+    (a.email_to ?? '') === (b.email_to ?? '') &&
+    (a.whatsapp_enabled ?? false) === (b.whatsapp_enabled ?? false) &&
+    (a.whatsapp_to ?? '') === (b.whatsapp_to ?? '')
+  )
+}
 
 /** O que cada canal precisa no `.env` antes de poder ser ligado. */
 const CHANNEL_HELP: Record<string, { title: string; setup: string }> = {
@@ -23,7 +46,9 @@ const CHANNEL_HELP: Record<string, { title: string; setup: string }> = {
 
 export default function Notifications() {
   const queryClient = useQueryClient()
-  const [draft, setDraft] = useState<Partial<NotificationConfig>>({})
+  const [draft, setDraft] = useState<Partial<Rascunho>>({})
+  /** De onde o rascunho partiu (o mesmo conserto das telas Risco e Configurações). */
+  const [base, setBase] = useState<Rascunho | null>(null)
   const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null)
   const [results, setResults] = useState<NotificationTestResult[] | null>(null)
 
@@ -32,15 +57,23 @@ export default function Notifications() {
     queryFn: api.notificationConfig,
   })
 
+  // O rascunho era recopiado a cada refetch: um e-mail digitado e ainda nao
+  // salvo sumia quando a query recarregava. Agora so segue o servidor enquanto
+  // nao ha edicao.
   useEffect(() => {
-    if (config.data) setDraft(config.data)
+    if (!config.data) return
+    const novo = rascunhoDe(config.data)
+    if (base === null || mesmoRascunho(draft, base)) setDraft(novo)
+    setBase(novo)
   }, [config.data])
 
   const save = useMutation({
     mutationFn: api.updateNotificationConfig,
-    onSuccess: () => {
+    onSuccess: (salvo) => {
       setMessage({ ok: true, text: 'Canais atualizados.' })
       setResults(null)
+      setDraft(rascunhoDe(salvo))
+      setBase(rascunhoDe(salvo))
       queryClient.invalidateQueries({ queryKey: ['notificationConfig'] })
       queryClient.invalidateQueries({ queryKey: ['audit'] })
     },
@@ -59,6 +92,10 @@ export default function Notifications() {
   })
 
   if (config.isLoading) return <Loading />
+  if (config.isError && !config.data) {
+    // Era os dois canais com "falta configurar", como se o .env estivesse vazio.
+    return <ErroDeCarga error={config.error} oQue="a configuração de notificações" />
+  }
 
   const current = config.data
   const changed =
@@ -91,8 +128,16 @@ export default function Notifications() {
         </button>
       </div>
 
+      {config.isError && (
+        <ErroDeCarga error={config.error} oQue="a versão mais nova da configuração" />
+      )}
+
       {message && (
-        <div className={`form-message ${message.ok ? 'ok' : 'err'}`} style={{ marginBottom: 14 }}>
+        <div
+          className={`form-message ${message.ok ? 'ok' : 'err'}`}
+          style={{ marginBottom: 14 }}
+          role={message.ok ? 'status' : 'alert'}
+        >
           {message.text}
         </div>
       )}
@@ -188,6 +233,7 @@ function ChannelCard({
 }) {
   const help = CHANNEL_HELP[name]
   const ready = status?.configured ?? false
+  const id = useId()
 
   return (
     <Card>
@@ -222,8 +268,9 @@ function ChannelCard({
       </label>
 
       <div className="field" style={{ marginTop: 12 }}>
-        <label>{label}</label>
+        <label htmlFor={id}>{label}</label>
         <input
+          id={id}
           type={type}
           value={value}
           placeholder={placeholder}

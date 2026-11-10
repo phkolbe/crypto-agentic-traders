@@ -75,20 +75,24 @@ async def update_notification_config(
             status_code=422, detail="informe o numero de WhatsApp para ativar o canal"
         )
 
-    before = {
-        "email_enabled": current.email_enabled,
-        "whatsapp_enabled": current.whatsapp_enabled,
-    }
+    # Os destinatarios entram na auditoria: sao para onde vai o alerta de stop e
+    # de circuit breaker, e trocar `whatsapp_to` nao deixava rastro nenhum.
+    def _estado(registro) -> dict:
+        return {
+            "email_enabled": registro.email_enabled,
+            "email_to": registro.email_to,
+            "whatsapp_enabled": registro.whatsapp_enabled,
+            "whatsapp_to": registro.whatsapp_to,
+        }
+
+    before = _estado(current)
     config = await repository.update(values)
     await AuditLogRepository(session).append(
         action="notification_config_updated",
         actor="user",
         target="notification_config",
         before=before,
-        after={
-            "email_enabled": config.email_enabled,
-            "whatsapp_enabled": config.whatsapp_enabled,
-        },
+        after=_estado(config),
     )
 
     notifier = MultiChannelNotifier(settings)

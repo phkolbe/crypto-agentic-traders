@@ -112,12 +112,44 @@ export function quantity(value: Money | number | null | undefined): string {
   })
 }
 
+/**
+ * Preco unitario, com casas suficientes para o ativo barato.
+ *
+ * Abaixo de 1, as casas acompanham a magnitude (4 algarismos significativos):
+ * PEPE a 0,0000095 com 6 casas fixas virava "0,00001", e com `money()` (2 casas,
+ * como estava em Posicoes) virava "0,00" — preco medio e atual iguais a zero.
+ */
 export function price(value: Money | number | null | undefined): string {
   const amount = typeof value === 'number' ? value : toNumber(value)
+  const absoluto = Math.abs(amount)
+  let casas = absoluto < 10 ? 6 : 2
+  if (absoluto > 0 && absoluto < 1) {
+    casas = Math.min(12, Math.max(casas, Math.ceil(-Math.log10(absoluto)) + 3))
+  }
   return amount.toLocaleString(LOCALE_PT_BR, {
     minimumFractionDigits: 2,
-    maximumFractionDigits: amount < 10 ? 6 : 2,
+    maximumFractionDigits: casas,
   })
+}
+
+/**
+ * Taxa de uma operacao, na moeda em que foi cobrada.
+ *
+ * Em `live`, a Binance cobra a taxa da COMPRA no ativo recebido (BTC, sem BNB):
+ * 0,0000012 BTC passava pelo `> 0` e saia de `money()` como "0,00 BTC" — um
+ * numero que parece zero e nao e. Taxa no ativo base usa as casas de
+ * quantidade; na moeda de cotacao, as de dinheiro. Sem taxa: "—".
+ */
+export function taxa(
+  fee: Money | null | undefined,
+  moedaDaTaxa: string | null | undefined,
+  symbol: string | null | undefined,
+): string {
+  if (!(toNumber(fee) > 0)) return '—'
+  const moeda = (moedaDaTaxa ?? '').trim().toUpperCase()
+  const cotacao = quoteOf(symbol)
+  if (moeda && cotacao && moeda !== cotacao) return `${quantity(fee)} ${moeda}`
+  return money(fee, moeda || cotacao)
 }
 
 export function percent(value: number | null | undefined, digits = 2): string {
@@ -449,6 +481,60 @@ export function rodapeDoStat(
     }
   }
   return hint ? { texto: hint, tom: '' } : null
+}
+
+/** Uma linha do "o que vai mudar" da confirmacao de Configuracoes. */
+export interface Alteracao {
+  campo: string
+  antes: string
+  depois: string
+  /** O efeito que o numero nao conta sozinho (ligar a descoberta, trocar a moeda). */
+  aviso?: string
+}
+
+function textoDoValor(valor: unknown): string {
+  if (Array.isArray(valor)) return valor.length > 0 ? valor.join(', ') : '(vazio)'
+  if (valor === null || valor === undefined || valor === '') return '(vazio)'
+  return String(valor)
+}
+
+/**
+ * O que um PUT de `/trading/config` muda, campo a campo, para o dialogo de
+ * confirmacao.
+ *
+ * "Aplicar" valia na hora e sem segundo passo: apagar "Pares negociados" ligava a
+ * descoberta automatica, e trocar a moeda trocava todos os pares — com um
+ * clique. A confirmacao precisa dizer ISSO, nao uma frase generica: a mesma
+ * funcao monta as linhas a partir do pedido que vai sair, entao o dialogo nao
+ * tem como mostrar uma coisa e enviar outra.
+ */
+export function alteracoesDeNegocio(
+  campos: { key: string; label: string }[],
+  atual: Record<string, unknown>,
+  pedido: Record<string, unknown>,
+): Alteracao[] {
+  return Object.keys(pedido).map((chave) => {
+    const campo =
+      campos.find((c) => c.key === chave)?.label ??
+      (chave === 'strategies' ? 'Estratégias ativas' : chave)
+    let aviso: string | undefined
+    if (chave === 'symbols' && Array.isArray(pedido.symbols)) {
+      const antes = Array.isArray(atual.symbols) ? atual.symbols : []
+      if (pedido.symbols.length === 0 && antes.length > 0) {
+        aviso = 'liga a descoberta automática: o sistema passa a escolher os pares sozinho'
+      } else if (pedido.symbols.length > 0 && antes.length === 0) {
+        aviso = 'desliga a descoberta automática: só estes pares serão negociados'
+      }
+    }
+    if (chave === 'quote_currency') {
+      aviso =
+        'troca todos os pares e a moeda em que o saldo é medido; nenhum valor é convertido'
+    }
+    if (chave === 'strategies' && Array.isArray(pedido.strategies) && pedido.strategies.length === 0) {
+      aviso = 'sem estratégia o sistema não gera sinal nenhum'
+    }
+    return { campo, antes: textoDoValor(atual[chave]), depois: textoDoValor(pedido[chave]), aviso }
+  })
 }
 
 /**

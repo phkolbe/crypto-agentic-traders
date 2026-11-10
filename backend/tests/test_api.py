@@ -107,6 +107,40 @@ class TestPortfolio:
         assert response.status_code == 200
         assert len(response.json()) >= 1
 
+    async def test_change_since_start_compares_with_the_first_snapshot(self, client, settings):
+        """`history(limit=1)` devolve o retrato MAIS RECENTE, e o campo saia sempre ~0.
+
+        O primeiro retrato e o do mesmo modo do atual: o ensaio em dry_run de
+        antes do live mede dinheiro de papel e nao e o "inicio" do modo real.
+        """
+        agora = datetime.now(UTC)
+        async with session_scope(settings) as session:
+            repo = PortfolioSnapshotRepository(session)
+            for valor, idade, modo in (
+                ("5000", timedelta(days=30), "dry_run"),
+                ("1000", timedelta(days=10), "live"),
+                ("1100", timedelta(minutes=1), "live"),
+            ):
+                retrato = _snapshot(valor).model_copy(update={"timestamp": agora - idade})
+                await repo.save(retrato, modo)
+
+        body = (await client.get("/api/portfolio")).json()
+        assert body["change_since_start_pct"] == pytest.approx(0.10)
+
+
+class TestNotificacoesDeixamRastro:
+    async def test_trocar_o_destinatario_vai_para_a_auditoria(self, client):
+        """Trocar `whatsapp_to` (para onde vai o alerta de stop e de breaker) nao
+        deixava rastro: a auditoria so gravava os `*_enabled`."""
+        resposta = await client.put(
+            "/api/notifications/config", json={"whatsapp_to": "5511988887777"}
+        )
+        assert resposta.status_code == 200, resposta.text
+
+        entradas = (await client.get("/api/audit?limit=5")).json()
+        entrada = next(e for e in entradas if e["action"] == "notification_config_updated")
+        assert "5511988887777" in json.dumps(entrada)
+
 
 class TestTrades:
     async def test_lists_agent_and_manual_together(self, client, seeded):

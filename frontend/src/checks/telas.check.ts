@@ -27,6 +27,7 @@
  */
 
 import {
+  alteracoesDeNegocio,
   comparacaoAtravessaTroca,
   fronteiraDaMoeda,
   granularidadeDoIntervalo,
@@ -35,12 +36,14 @@ import {
   parDoEvento,
   percent,
   posicoesAbertas,
+  price,
   quoteOf,
   rodapeDoStat,
   rotuladorDeSerie,
   rotuloDeCampo,
   rotuloDeDecisao,
   serieNaMoedaAtual,
+  taxa,
   toNumber,
   unidadeDoEvento,
 } from '../api/format'
@@ -1415,6 +1418,183 @@ const fonteManualTrade = fonteSemComentarios('pages', 'ManualTrade.tsx')
 verifica(
   'nenhuma data de formulario e calculada no carregamento do modulo',
   !/^const\s+EMPTY\b/m.test(fonteManualTrade) && !/^\s*executed_at:\s*nowForInput\(\)/m.test(fonteManualTrade),
+)
+
+// ===========================================================================
+bloco('Preco de ativo barato e taxa no ativo base')
+
+// O defeito: Posicoes formatava preco com `money()`, 2 casas.
+verifica(
+  'o defeito existe: PEPE a 0,0000095 com money() vira 0,00',
+  money('0.0000095', '') === '0,00',
+  money('0.0000095', ''),
+)
+verifica('price mostra o PEPE com casas significativas', price('0.0000095') === '0,0000095', price('0.0000095'))
+verifica('price mostra o SHIB inteiro', price('0.00001234') === '0,00001234', price('0.00001234'))
+verifica('price mantem 6 casas abaixo de 10', price('0.17345') === '0,17345', price('0.17345'))
+verifica('price de BTC continua com 2 casas', price('65432.1') === '65.432,10', price('65432.1'))
+verifica('price de zero nao inventa casas', price('0') === '0,00', price('0'))
+
+// O defeito: taxa de compra em live, cobrada no ativo base.
+verifica(
+  'o defeito existe: 0,0000012 BTC com money() vira 0,00 BTC',
+  money('0.0000012', 'BTC') === '0,00 BTC',
+  money('0.0000012', 'BTC'),
+)
+verifica(
+  'taxa no ativo base sai com casas de quantidade e a moeda',
+  taxa('0.0000012', 'BTC', 'BTC/USDC') === '0,0000012 BTC',
+  taxa('0.0000012', 'BTC', 'BTC/USDC'),
+)
+verifica(
+  'taxa na cotacao sai como dinheiro',
+  taxa('0.05', 'USDC', 'BTC/USDC') === '0,05 USDC',
+  taxa('0.05', 'USDC', 'BTC/USDC'),
+)
+verifica(
+  'taxa sem moeda gravada usa a cotacao do par',
+  taxa('0.05', null, 'BTC/BRL') === '0,05 BRL',
+  taxa('0.05', null, 'BTC/BRL'),
+)
+verifica('sem taxa: travessao, e nao 0,00', taxa('0', 'USDC', 'BTC/USDC') === '—' && taxa(null, null, null) === '—')
+// [VERIFICACAO DE FONTE] O defeito era escolher o formatador errado no JSX.
+verifica(
+  'Posicoes nao formata preco com money()',
+  !/money\(position\.(average|current)_price/.test(fonteDashboard),
+)
+verifica(
+  'Negociacoes formata a taxa com taxa()',
+  /taxa\(trade\.fee, trade\.fee_currency, trade\.symbol\)/.test(fonteSemComentarios('pages', 'Trades.tsx')),
+)
+// [VERIFICACAO DE FONTE] Barras de "Resultado por par" com a moeda do par.
+verifica(
+  'Resultado por par: barras na moeda de cada par',
+  /formatValue=\{\(v, i\) => money\(v, pares\[i\]\?\.moeda/.test(fonteSemComentarios('pages', 'Portfolio.tsx')),
+)
+
+// ===========================================================================
+bloco('Configuracoes: a confirmacao diz o que muda')
+
+const CONFIG_ATUAL = {
+  quote_currency: 'USDC',
+  symbols: ['BTC/USDC', 'ETH/USDC'],
+  timeframe: '1h',
+  strategies: ['ma_crossover'],
+}
+const CAMPOS = [
+  { key: 'quote_currency', label: 'Moeda de cotação' },
+  { key: 'symbols', label: 'Pares negociados' },
+  { key: 'timeframe', label: 'Timeframe' },
+]
+const apagarPares = alteracoesDeNegocio(CAMPOS, CONFIG_ATUAL, { symbols: [] })
+verifica(
+  'apagar os pares diz que liga a descoberta automatica',
+  apagarPares.length === 1 &&
+    apagarPares[0]!.campo === 'Pares negociados' &&
+    apagarPares[0]!.antes === 'BTC/USDC, ETH/USDC' &&
+    apagarPares[0]!.depois === '(vazio)' &&
+    /descoberta automática/.test(apagarPares[0]!.aviso ?? ''),
+  JSON.stringify(apagarPares),
+)
+const trocarMoeda = alteracoesDeNegocio(CAMPOS, CONFIG_ATUAL, { quote_currency: 'USDT', timeframe: '4h' })
+verifica(
+  'trocar a moeda avisa que nada e convertido; cada campo vira uma linha',
+  trocarMoeda.length === 2 &&
+    trocarMoeda[0]!.antes === 'USDC' &&
+    trocarMoeda[0]!.depois === 'USDT' &&
+    /nenhum valor é convertido/.test(trocarMoeda[0]!.aviso ?? '') &&
+    trocarMoeda[1]!.campo === 'Timeframe' &&
+    trocarMoeda[1]!.aviso === undefined,
+  JSON.stringify(trocarMoeda),
+)
+const voltarAosPares = alteracoesDeNegocio(CAMPOS, { ...CONFIG_ATUAL, symbols: [] }, { symbols: ['BTC/USDC'] })
+verifica(
+  'listar pares com a descoberta ligada diz que a desliga',
+  /desliga a descoberta/.test(voltarAosPares[0]!.aviso ?? ''),
+  JSON.stringify(voltarAosPares),
+)
+// [VERIFICACAO DE FONTE] O defeito era o botao chamar `save.mutate` direto. O
+// pedido enviado tem de ser o congelado no primeiro passo, de onde o resumo saiu.
+const fonteConfiguracao = fonteSemComentarios('pages', 'Configuration.tsx')
+const chamadasDeSalvar = fonteConfiguracao.match(/save\.mutate\([^)]*\)/g) ?? []
+verifica(
+  'Configuracoes so envia o pedido confirmado',
+  chamadasDeSalvar.length === 1 && chamadasDeSalvar[0] === 'save.mutate(pendente.pedido)',
+  chamadasDeSalvar.join(', '),
+)
+verifica(
+  '"Aplicar alterações" abre a confirmacao, nao aplica',
+  /onClick=\{pedirConfirmacao\}/.test(fonteConfiguracao),
+)
+
+// ===========================================================================
+bloco('Nenhuma tela de dados confunde falha com vazio')
+
+// [VERIFICACAO DE FONTE] Cada `const x = useQuery(...)` de pagina precisa olhar
+// `x.isError` em algum lugar: sem isso, a falha da API cai no ramo "vazio"
+// ("Nenhuma negociação encontrada", "falta configurar"). Nao prova que o ramo
+// esta certo — prova que ninguem esqueceu a consulta, que era o defeito.
+for (const pagina of paginas) {
+  const codigo = fonteSemComentarios('pages', pagina)
+  const consultas = [...codigo.matchAll(/const (\w+) = useQuery\b/g)].map((m) => m[1]!)
+  const semTratamento = consultas.filter((nome) => !codigo.includes(`${nome}.isError`))
+  verifica(
+    `${pagina}: toda consulta trata erro`,
+    semTratamento.length === 0,
+    semTratamento.length ? `sem isError: ${semTratamento.join(', ')}` : '',
+  )
+  if (consultas.length > 0 || /useHealth\(\)/.test(codigo)) {
+    verifica(`${pagina}: a falha aparece com ErroDeCarga`, codigo.includes('<ErroDeCarga'))
+  }
+}
+
+// ===========================================================================
+bloco('Faixa de modo em todas as telas; trava respeitada por agente')
+
+// [VERIFICACAO DE FONTE] A faixa mora no layout. Se uma pagina voltar a desenhar
+// a sua, aparecem duas; se o layout perder a dele, quatro telas de acao ficam
+// sem saber se e dinheiro real.
+const fonteApp = fonteSemComentarios('App.tsx')
+verifica('App desenha a faixa de modo acima das rotas', /<ModeBanner[^>]*\/>\s*<Routes>/.test(fonteApp))
+const paginasComFaixa = paginas.filter((pagina) =>
+  /<ModeBanner\b/.test(fonteSemComentarios('pages', pagina)),
+)
+verifica('nenhuma pagina desenha a propria faixa', paginasComFaixa.length === 0, paginasComFaixa.join(', '))
+const fonteAgentes = fonteSemComentarios('pages', 'Agents.tsx')
+verifica(
+  '"retomar" de cada agente fica indisponivel com a trava acionada, com o motivo',
+  /disabled=\{status\.paused && travado\}/.test(fonteAgentes) &&
+    /title=\{status\.paused && travado \? motivoDaTrava/.test(fonteAgentes),
+)
+
+// ===========================================================================
+bloco('Celular de 360 px, rotulos e reconexao')
+
+// [VERIFICACAO DE FONTE] Coluna minima fixa maior que a tela: com 360 px de
+// largura e 14 px de margem dos dois lados sobram 332 px, e `minmax(340px, 1fr)`
+// fazia o grid-2 rolar de lado.
+const fonteCss = fonte('styles.css')
+const colunasLargas = [...fonteCss.matchAll(/minmax\((\d+)px/g)].filter((m) => Number(m[1]) > 300)
+verifica(
+  'nenhuma coluna de grid exige mais de 300 px fixos',
+  colunasLargas.length === 0,
+  colunasLargas.map((m) => m[0]).join(', '),
+)
+// Rotulo sem `htmlFor` nao nomeia o campo para o leitor de tela. Rotulo que
+// ENVOLVE o campo (checkbox) nomeia sozinho e nao entra aqui.
+const rotuloSolto = /<label>(?:(?!<\/label>)[\s\S])*?<\/label>\s*<(input|select|textarea)/
+const paginasComRotuloSolto = paginas.filter((pagina) => rotuloSolto.test(fonte('pages', pagina)))
+verifica(
+  'todo rotulo seguido de campo aponta para ele (htmlFor)',
+  paginasComRotuloSolto.length === 0,
+  paginasComRotuloSolto.join(', '),
+)
+// [VERIFICACAO DE FONTE] O socket nao guarda historico: o que aconteceu na
+// queda so chega revalidando.
+const fonteLive = fonteSemComentarios('hooks', 'useLiveEvents.ts')
+verifica(
+  'reconectar o WebSocket revalida as consultas',
+  /onopen = \(\) => \{[\s\S]*?invalidateQueries\(\)[\s\S]*?\}/.test(fonteLive),
 )
 
 // ===========================================================================

@@ -1,10 +1,17 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useEffect, useState } from 'react'
+import { useEffect, useId, useState } from 'react'
 
 import { ApiError, api } from '../api/client'
-import { rotuloDeCampo } from '../api/format'
+import { type Alteracao, alteracoesDeNegocio, MODE_LABEL, rotuloDeCampo } from '../api/format'
 import type { TradingConfig } from '../api/types'
-import { AgentsOffline, Card, Loading } from '../components/Shared'
+import {
+  AgentsOffline,
+  Card,
+  ErroDeCarga,
+  Loading,
+  mensagemDeErro,
+  useHealth,
+} from '../components/Shared'
 
 /**
  * Configuração de negócio: o que negociar e com que cadência.
@@ -176,9 +183,31 @@ function splitList(value: string): string[] {
     .filter(Boolean)
 }
 
+/** Os valores do servidor como o formulario os mostra. */
+function rascunhoDe(config: TradingConfig): Record<string, string> {
+  const rascunho: Record<string, string> = {}
+  for (const campo of TODOS) rascunho[campo.key] = paraTexto(config, campo)
+  rascunho.strategies = config.strategies.join(', ')
+  return rascunho
+}
+
 export default function Configuration() {
   const queryClient = useQueryClient()
+  const idBase = useId()
+  const health = useHealth()
   const [draft, setDraft] = useState<Record<string, string>>({})
+  /**
+   * Os valores do servidor de que o rascunho partiu — o mesmo conserto da tela
+   * Risco. O rascunho era recopiado da query a cada refetch: uma edição sumia em
+   * silêncio quando a configuração recarregava, e um campo que o servidor mudou
+   * durante a edição voltaria ao valor velho no envio.
+   */
+  const [base, setBase] = useState<Record<string, string> | null>(null)
+  /** O pedido congelado no primeiro clique, com o que ele muda; `null` sem confirmação aberta. */
+  const [pendente, setPendente] = useState<{
+    pedido: Record<string, unknown>
+    alteracoes: Alteracao[]
+  } | null>(null)
   const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null)
 
   const config = useQuery<TradingConfig>({
@@ -189,30 +218,52 @@ export default function Configuration() {
 
   useEffect(() => {
     if (!config.data) return
-    const inicial: Record<string, string> = {}
-    for (const campo of TODOS) inicial[campo.key] = paraTexto(config.data, campo)
-    inicial.strategies = config.data.strategies.join(', ')
-    setDraft(inicial)
+    const novo = rascunhoDe(config.data)
+    if (base === null) {
+      setDraft(novo)
+      setBase(novo)
+      return
+    }
+    // O que o operador NAO tocou segue o servidor; o que ele tocou fica.
+    const tocados = Object.keys(draft).filter((k) => (draft[k] ?? '') !== (base[k] ?? ''))
+    const rebaseado = { ...novo }
+    for (const chave of tocados) rebaseado[chave] = draft[chave] ?? ''
+    setDraft(rebaseado)
+    setBase(novo)
+    // `draft` e `base` fora das dependencias de proposito: so dado novo do
+    // servidor decide.
   }, [config.data])
+
+  const editar = (novo: Record<string, string>) => {
+    setDraft(novo)
+    // Mudou depois de abrir a confirmacao: o resumo que estava na tela ja nao
+    // e o pedido. Fecha e pede o primeiro passo de novo.
+    setPendente(null)
+  }
 
   const save = useMutation({
     mutationFn: api.updateTradingConfig,
-    onSuccess: () => {
+    onSuccess: (atualizado) => {
       setMessage({
         ok: true,
         text: 'Configuração aplicada, já valendo, e registrada no log de auditoria.',
       })
+      setPendente(null)
+      const novo = rascunhoDe(atualizado)
+      setDraft(novo)
+      setBase(novo)
       queryClient.invalidateQueries({ queryKey: ['tradingConfig'] })
       queryClient.invalidateQueries({ queryKey: ['audit'] })
       queryClient.invalidateQueries({ queryKey: ['health'] })
     },
-    onError: (error) =>
-      setMessage({ ok: false, text: error instanceof ApiError ? error.message : String(error) }),
+    onError: (error) => setMessage({ ok: false, text: mensagemDeErro(error) }),
   })
 
-  if (config.isError) {
+  if (config.isError && !config.data) {
     const error = config.error
     if (error instanceof ApiError && error.agentsAreDown) return <AgentsOffline />
+    // Qualquer outra falha era "Carregando…" para sempre.
+    return <ErroDeCarga error={error} oQue="a configuração de negócio" />
   }
   if (config.isLoading || !config.data) return <Loading />
 
@@ -231,28 +282,44 @@ export default function Configuration() {
     TODOS.some((campo) => draft[campo.key] !== undefined && draft[campo.key] !== paraTexto(atual, campo)) ||
     estrategiasSelecionadas.join(',') !== atual.strategies.join(',')
 
-  const submit = () => {
+  const montarPedido = (): Record<string, unknown> => {
     const payload: Record<string, unknown> = {}
     for (const campo of TODOS) {
       const valor = draft[campo.key]
       if (valor === undefined || valor === paraTexto(atual, campo)) continue
       if (campo.kind === 'list') payload[campo.key] = splitList(valor)
-      else if (campo.kind === 'text' || campo.kind === 'money') payload[campo.key] = valor
-      else payload[campo.key] = Number(valor)
+      // `percent` aqui sao `paper_fee_pct`/`paper_slippage_pct`, tipados `Money`:
+      // vao como texto, sem passar por float (D7). So `int` vira numero.
+      else if (campo.kind === 'int') payload[campo.key] = Number(valor)
+      else payload[campo.key] = valor
     }
     if (estrategiasSelecionadas.join(',') !== atual.strategies.join(',')) {
       payload.strategies = estrategiasSelecionadas
     }
+    return payload
+  }
+
+  /** Primeiro passo: congela o pedido e mostra o que ele muda. Nada sai daqui. */
+  const pedirConfirmacao = () => {
+    const pedido = montarPedido()
     setMessage(null)
-    save.mutate(payload)
+    if (Object.keys(pedido).length === 0) {
+      setMessage({ ok: false, text: 'Nada a aplicar: nenhum campo difere do que está valendo.' })
+      return
+    }
+    setPendente({
+      pedido,
+      alteracoes: alteracoesDeNegocio(TODOS, atual as unknown as Record<string, unknown>, pedido),
+    })
   }
 
   const alternarEstrategia = (nome: string) => {
     const atuais = new Set(estrategiasSelecionadas)
     if (atuais.has(nome)) atuais.delete(nome)
     else atuais.add(nome)
-    setDraft({ ...draft, strategies: [...atuais].join(', ') })
+    editar({ ...draft, strategies: [...atuais].join(', ') })
   }
+  const modo = health.data?.mode
 
   return (
     <>
@@ -302,8 +369,16 @@ export default function Configuration() {
         </div>
       )}
 
+      {config.isError && (
+        <ErroDeCarga error={config.error} oQue="a versão mais nova da configuração" />
+      )}
+
       {message && (
-        <div className={`form-message ${message.ok ? 'ok' : 'err'}`} style={{ marginBottom: 14 }}>
+        <div
+          className={`form-message ${message.ok ? 'ok' : 'err'}`}
+          style={{ marginBottom: 14 }}
+          role={message.ok ? 'status' : 'alert'}
+        >
           {message.text}
         </div>
       )}
@@ -316,14 +391,15 @@ export default function Configuration() {
                 {/* A unidade e parte do rotulo, nao enfeite: "Piso de liquidez
                     em 24h = 9760000" nao se confere sem saber de que. Vem de
                     `rotuloDeCampo`, que e verificada. */}
-                <label>{rotuloDeCampo(campo, unidadeSalva)}</label>
+                <label htmlFor={`${idBase}-${campo.key}`}>{rotuloDeCampo(campo, unidadeSalva)}</label>
                 <input
+                  id={`${idBase}-${campo.key}`}
                   type={campo.kind === 'int' || campo.kind === 'percent' ? 'number' : 'text'}
                   step={campo.kind === 'int' ? '1' : 'any'}
                   min={campo.kind === 'int' || campo.kind === 'percent' ? '0' : undefined}
                   value={draft[campo.key] ?? ''}
                   onChange={(e) =>
-                    setDraft({
+                    editar({
                       ...draft,
                       [campo.key]: campo.upper ? e.target.value.toUpperCase() : e.target.value,
                     })
@@ -364,24 +440,58 @@ export default function Configuration() {
         )}
       </Card>
 
+      {/* Segundo passo, no padrao da tela Risco: o que muda, campo a campo, e
+          em que modo. O pedido enviado e o que esta congelado em `pendente` —
+          o mesmo de onde as linhas foram montadas. */}
+      {pendente && (
+        <div className="alert-banner" style={{ marginTop: 14 }} role="alertdialog">
+          <div>
+            <strong>
+              Aplicar {pendente.alteracoes.length === 1 ? 'esta alteração' : 'estas alterações'}
+              {modo ? ` em ${MODE_LABEL[modo] ?? modo}` : ''}? Vale na hora, sem reiniciar.
+            </strong>
+            <ul style={{ margin: '8px 0 0', paddingLeft: 18 }}>
+              {pendente.alteracoes.map((a) => (
+                <li key={a.campo} style={{ marginBottom: 4 }}>
+                  <strong>{a.campo}:</strong>{' '}
+                  <span className="muted">{a.antes}</span> → <span>{a.depois}</span>
+                  {a.aviso && <div className="muted" style={{ fontSize: 12 }}>{a.aviso}</div>}
+                </li>
+              ))}
+            </ul>
+          </div>
+          <div className="row-tight">
+            <button
+              className="danger"
+              onClick={() => save.mutate(pendente.pedido)}
+              disabled={save.isPending}
+            >
+              {save.isPending ? 'Aplicando…' : 'Sim, aplicar'}
+            </button>
+            <button onClick={() => setPendente(null)} disabled={save.isPending}>
+              Cancelar
+            </button>
+          </div>
+        </div>
+      )}
+
       <div className="row" style={{ marginTop: 14, gap: 10 }}>
         {/* `primary`: nao existe `.btn` nem `.btn-primary` no CSS deste projeto,
             e o botao que aplica a configuracao de negocio saia com a aparencia
             de um botao secundario. */}
         <button
           className="primary"
-          disabled={!alterado || save.isPending || estrategiasSelecionadas.length === 0}
-          onClick={submit}
+          disabled={
+            !alterado || save.isPending || estrategiasSelecionadas.length === 0 || pendente !== null
+          }
+          onClick={pedirConfirmacao}
         >
-          {save.isPending ? 'Aplicando…' : 'Aplicar alterações'}
+          Aplicar alterações
         </button>
         {alterado && (
           <button
             onClick={() => {
-              const inicial: Record<string, string> = {}
-              for (const campo of TODOS) inicial[campo.key] = paraTexto(atual, campo)
-              inicial.strategies = atual.strategies.join(', ')
-              setDraft(inicial)
+              editar(rascunhoDe(atual))
               setMessage(null)
             }}
           >

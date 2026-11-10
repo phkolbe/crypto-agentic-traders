@@ -534,6 +534,10 @@ class NotificationTestOut(BaseModel):
 
 # ---------------------------------------------------------------------------
 class BacktestIn(BaseModel):
+    # Como os outros `*In`: `dias` no lugar de `days` era ignorado e o backtest
+    # rodava os 90 dias padrao sem aviso.
+    model_config = ConfigDict(extra="forbid")
+
     symbol: str = Field(pattern=r"^[A-Z0-9]{2,12}/[A-Z0-9]{2,12}$")
     strategy: str
     timeframe: str = "1h"

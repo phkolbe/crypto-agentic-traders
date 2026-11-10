@@ -8,6 +8,7 @@ import {
   parDoEvento,
   percent,
   posicoesAbertas,
+  price,
   quantity,
   quoteOf,
   rotuloDeDecisao,
@@ -24,9 +25,9 @@ import {
   Card,
   CircuitBreakerBanner,
   Empty,
+  ErroDeCarga,
   Loading,
   mensagemDeErro,
-  ModeBanner,
   SizingBanner,
   Stat,
   useHealth,
@@ -126,7 +127,6 @@ export default function Dashboard({ feed }: { feed: { event: string; data: any; 
         </div>
       </div>
 
-      <ModeBanner health={health.data} />
       <SizingBanner health={health.data} />
       <CircuitBreakerBanner
         active={health.data?.circuit_breaker_active ?? false}
@@ -135,6 +135,10 @@ export default function Dashboard({ feed }: { feed: { event: string; data: any; 
         // Sem isto, um rearme recusado nao aparecia em lugar nenhum desta tela.
         erro={reset.isError ? mensagemDeErro(reset.error) : null}
       />
+
+      {/* Falha dita como falha: sem isto os cartoes mostravam "—" e "0" como se
+          o sistema nao tivesse patrimonio nem operacoes. */}
+      {portfolio.isError && <ErroDeCarga error={portfolio.error} oQue="o patrimônio" />}
 
       <div className="grid grid-4" style={{ marginBottom: 14 }}>
         <Stat
@@ -182,6 +186,8 @@ export default function Dashboard({ feed }: { feed: { event: string; data: any; 
         >
           {carregandoGrafico ? (
             <Loading />
+          ) : history.isError && !history.data ? (
+            <ErroDeCarga error={history.error} oQue="o histórico de patrimônio" />
           ) : curve.length < 2 ? (
             <Empty>
               Ainda não há histórico suficiente para o gráfico.
@@ -211,6 +217,9 @@ export default function Dashboard({ feed }: { feed: { event: string; data: any; 
                   {fronteira.anterior}: patrimônio em unidades diferentes não forma uma curva.
                 </div>
               )}
+              {audit.isError && (
+                <ErroDeCarga error={audit.error} oQue="o log de auditoria (moeda da série)" />
+              )}
               {fronteira.tipo === 'desconhecida' && (
                 <div className="chart-note">
                   Valores <strong>sem unidade</strong> de propósito. O log de auditoria consultado
@@ -226,7 +235,9 @@ export default function Dashboard({ feed }: { feed: { event: string; data: any; 
           title="Alocação por ativo"
           subtitle={`Sobre o patrimônio total, incluindo o caixa${moeda ? ` em ${moeda}` : ''}.`}
         >
-          {fatias.length === 0 ? (
+          {portfolio.isError && !portfolio.data ? (
+            <ErroDeCarga error={portfolio.error} oQue="a alocação" />
+          ) : fatias.length === 0 ? (
             <Empty>Sem patrimônio apurado ainda.</Empty>
           ) : fatias.length === 1 ? (
             // Fatia unica: um anel de 180 px para dizer "100,00%" gasta um quarto
@@ -282,7 +293,9 @@ export default function Dashboard({ feed }: { feed: { event: string; data: any; 
 
       <div className="grid grid-2">
         <Card title="Posições">
-          {posicoes.length === 0 ? (
+          {portfolio.isError && !portfolio.data ? (
+            <ErroDeCarga error={portfolio.error} oQue="as posições" />
+          ) : posicoes.length === 0 ? (
             // O estado vazio de HOJE, e o que o dono vai olhar por dias. Ele
             // responde a pergunta seguinte — "esperando o quê, em quê?" — em vez
             // de so constatar a ausencia.
@@ -326,9 +339,13 @@ export default function Dashboard({ feed }: { feed: { event: string; data: any; 
                       <tr key={position.asset}>
                         <td><strong>{position.asset}</strong></td>
                         <td className="right">{quantity(position.quantity)}</td>
-                        <td className="right muted">{money(position.average_price, '')}</td>
+                        {/* `price`, nao `money`: com 2 casas, PEPE a 0,0000095
+                            aparecia como "Preço médio 0,00 · Atual 0,00". */}
+                        <td className="right muted">
+                          {position.average_price ? price(position.average_price) : '—'}
+                        </td>
                         <td className="right">
-                          {position.current_price ? money(position.current_price, '') : '—'}
+                          {position.current_price ? price(position.current_price) : '—'}
                         </td>
                         <td className={`right ${pnl > 0 ? 'positive' : pnl < 0 ? 'negative' : 'muted'}`}>
                           {money(position.unrealized_pnl, '')}
@@ -366,6 +383,8 @@ export default function Dashboard({ feed }: { feed: { event: string; data: any; 
         <Card title="Decisões recentes do Risk Manager">
           {riskEvents.isLoading ? (
             <Loading />
+          ) : riskEvents.isError && !riskEvents.data ? (
+            <ErroDeCarga error={riskEvents.error} oQue="as decisões do Risk Manager" />
           ) : (riskEvents.data ?? []).length === 0 ? (
             <Empty>Nenhuma decisão registrada ainda.</Empty>
           ) : (
@@ -429,10 +448,9 @@ function describeEvent(event: string, data: any, moeda: string): string {
         ? `Risk Manager aprovou ${money(data.approved_notional ?? '0', quoteOf(data.symbol) || moeda)}`
         : `Risk Manager rejeitou: ${(data.reasons ?? []).join(' · ')}`
     case 'order_result':
-      return `Ordem ${data.status} — ${quantity(data.filled_quantity)} @ ${money(
-        data.average_price ?? '0',
-        '',
-      )}`
+      return `Ordem ${data.status} — ${quantity(data.filled_quantity)} @ ${
+        data.average_price ? price(data.average_price) : '—'
+      }`
     case 'portfolio':
       // O percentual que estava aqui era `unrealized_pnl / max(total_value, 1)`:
       // uma DIVISAO de dinheiro por dinheiro em float (proibida por D7) e,
