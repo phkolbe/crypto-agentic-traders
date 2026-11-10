@@ -93,25 +93,32 @@ class TestBacktestNaoTravaOLacoDeEventos:
         `time.sleep` dentro do `run` faz o papel do laco pandas: e trabalho
         sincrono, que nenhum `await` interrompe. Rodando no laco de eventos, o
         relogio abaixo ficava 0,5 s sem dar um passo.
+
+        Mede-se SO a janela do trabalho sincrono, e nao a maior pausa do pedido
+        inteiro. O motor real que vem depois usa pandas/numpy, que seguram o GIL
+        em trechos de codigo C: no runner do CI (mais lento) um desses trechos
+        parou o laco 0,51 s uma vez, e o teste reprovava uma rota correta pela
+        velocidade da CPU. Nenhuma thread evita o GIL; o que a rota garante -- e o
+        que se prova aqui -- e que o laco gira enquanto o motor trabalha.
         """
+        janela: dict[str, float] = {}
 
         class MotorPesado(BacktestEngine):
             async def run(self, candles):
+                janela["inicio"] = time.perf_counter()
                 time.sleep(0.5)
+                janela["fim"] = time.perf_counter()
                 return await super().run(candles)
 
         monkeypatch.setattr(rota, "BacktestEngine", MotorPesado)
 
-        pausas: list[float] = []
+        passos: list[float] = []
         terminou = asyncio.Event()
 
         async def relogio():
-            ultimo = time.perf_counter()
             while not terminou.is_set():
                 await asyncio.sleep(0.01)
-                agora = time.perf_counter()
-                pausas.append(agora - ultimo)
-                ultimo = agora
+                passos.append(time.perf_counter())
 
         tarefa = asyncio.create_task(relogio())
         try:
@@ -121,9 +128,11 @@ class TestBacktestNaoTravaOLacoDeEventos:
             await tarefa
 
         assert resposta.status_code == 200, resposta.text
-        assert pausas, "o relogio nao girou nenhuma vez"
-        assert max(pausas) < 0.25, (
-            f"o laco de eventos ficou {max(pausas):.2f} s parado durante o backtest"
+        assert {"inicio", "fim"} <= janela.keys(), "o motor nao rodou"
+        durante = [t for t in passos if janela["inicio"] <= t <= janela["fim"]]
+        # No laco de eventos seriam 0 passos; numa thread, ~50 (0,5 s / 10 ms).
+        assert len(durante) >= 10, (
+            f"o laco de eventos deu so {len(durante)} passos durante os 0,5 s de motor"
         )
 
     async def test_segundo_pedido_simultaneo_recebe_429(self, http, monkeypatch):
