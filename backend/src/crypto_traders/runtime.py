@@ -120,6 +120,11 @@ async def _serve_api(orchestrator: Orchestrator, stop_signal: asyncio.Event) -> 
         port=settings.api_port,
         log_level=settings.log_level.lower(),
         access_log=False,
+        # O portao do Tailscale confere a ORIGEM da conexao (so o conteiner do
+        # serve pode trazer `Tailscale-User-Login`). Com `proxy_headers` ligado (o
+        # padrao do uvicorn), um `X-Forwarded-For` vindo de 127.0.0.1 trocaria essa
+        # origem antes do portao ver -- nenhum proxy deste sistema usa o cabecalho.
+        proxy_headers=False,
     )
     server = uvicorn.Server(config)
     # Uvicorn instala os proprios handlers de sinal; desligamos para que o
