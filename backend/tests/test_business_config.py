@@ -138,20 +138,24 @@ class TestPersistence:
         assert recarregado.timeframe == "4h"
         assert recarregado.symbols == ["SOL/USDT"]
 
-    async def test_a_corrupt_row_falls_back_to_safe_defaults(self, settings):
-        """Linha invalida no banco nao pode derrubar a subida.
+    async def test_a_corrupt_row_refuses_to_start(self, settings):
+        """Linha que nao valida recusa a subida, com erro que diz onde.
 
-        O estado alternativo aqui nao e "arriscado", e "arrisca de menos": os
-        padroes do modelo sao conservadores por construcao.
+        Este teste exigia o contrario -- cair nos padroes do modelo -- com a
+        justificativa de que eles "arriscam de menos". Nao arriscam: o padrao de
+        `TradingSettings` e USDT, 15m e duas estrategias, contra o USDC/1d de
+        hoje. O sistema subiria negociando outra moeda e as posicoes em USDC
+        ficariam sem preco para o stop (auditoria de 09/11/2026, P0 #10).
         """
+        from crypto_traders.business_config import ConfiguracaoGravadaInvalida
         from crypto_traders.db.repositories import TradingConfigRepository
         from crypto_traders.db.session import session_scope
 
         async with session_scope(settings) as session:
             await TradingConfigRepository(session).save({"timeframe": 42, "lixo": True})
 
-        trading, _ = await load_business_config(settings)
-        assert trading.timeframe == TradingSettings().timeframe
+        with pytest.raises(ConfiguracaoGravadaInvalida, match="trading_config"):
+            await load_business_config(settings)
 
     async def test_update_is_recorded_in_the_audit_log(self, settings):
         from crypto_traders.db.repositories import AuditLogRepository
@@ -186,3 +190,164 @@ class TestPersistence:
         # Enviado sozinho, `symbols` e valido; o merge precisa continuar valido.
         atualizado = await update_trading_config(settings, {"symbols": []}, actor="teste")
         assert atualizado.discovery_enabled is True
+
+
+# Configuracao gravada como a do dry_run de hoje (USDC, 1d, so ma_crossover):
+# diferente dos padroes do modelo em tudo que importa.
+GRAVADA_HOJE = {
+    "quote_currency": "USDC",
+    "symbols": ["BTC/USDC", "ETH/USDC"],
+    "timeframe": "1d",
+    "strategies": ["ma_crossover"],
+}
+
+
+async def _gravar_trading(settings, valores: dict) -> None:
+    from crypto_traders.db.repositories import TradingConfigRepository
+    from crypto_traders.db.session import session_scope
+
+    async with session_scope(settings) as session:
+        await TradingConfigRepository(session).save(valores)
+
+
+async def _gravar_risco(settings, valores: dict) -> None:
+    from crypto_traders.db.repositories import RiskConfigRepository
+    from crypto_traders.db.session import session_scope
+
+    async with session_scope(settings) as session:
+        await RiskConfigRepository(session).update_values(valores)
+
+
+class TestUmaAtualizacaoNaoDerrubaAConfiguracaoGravada:
+    """P0 #10: campo novo ou removido no modelo nao pode trocar o que se negocia.
+
+    Os dois modelos sao `extra="forbid"`. Antes, bastava um deploy remover um
+    campo de `TradingSettings` para a linha gravada ter uma chave a mais, nao
+    validar, e o sistema subir com os padroes de fabrica: BTC/USDT em 15m com
+    `rsi_reversion`, enquanto as posicoes abertas sao em USDC.
+    """
+
+    async def test_campo_que_saiu_do_modelo_e_ignorado_e_o_resto_vale(self, settings):
+        await _gravar_trading(settings, {**GRAVADA_HOJE, "campo_que_saiu_do_modelo": 7})
+
+        trading, _ = await load_business_config(settings)
+
+        assert trading.quote_currency == "USDC"
+        assert trading.symbols == ["BTC/USDC", "ETH/USDC"]
+        assert trading.timeframe == "1d"
+        assert trading.strategies == ["ma_crossover"]
+
+    async def test_campo_novo_no_modelo_recebe_o_padrao_e_o_resto_vale(self, settings):
+        # Linha gravada antes de `signal_batch_window_seconds` existir.
+        await _gravar_trading(settings, dict(GRAVADA_HOJE))
+
+        trading, _ = await load_business_config(settings)
+
+        assert trading.quote_currency == "USDC"
+        assert trading.signal_batch_window_seconds == 0.0
+
+    async def test_a_linha_gravada_nao_e_reescrita_na_subida(self, settings):
+        """A chave desconhecida fica no banco: voltar a versao anterior a reencontra."""
+        from crypto_traders.db.repositories import TradingConfigRepository
+        from crypto_traders.db.session import session_scope
+
+        await _gravar_trading(settings, {**GRAVADA_HOJE, "campo_que_saiu_do_modelo": 7})
+        await load_business_config(settings)
+
+        async with session_scope(settings) as session:
+            gravado = await TradingConfigRepository(session).get()
+        assert gravado["campo_que_saiu_do_modelo"] == 7
+
+    async def test_valor_invalido_recusa_subir_em_vez_de_operar_outra_moeda(self, settings):
+        from crypto_traders.business_config import ConfiguracaoGravadaInvalida
+
+        await _gravar_trading(settings, {**GRAVADA_HOJE, "strategies": ["estrategia_que_saiu"]})
+
+        with pytest.raises(ConfiguracaoGravadaInvalida) as erro:
+            await load_business_config(settings)
+        assert "trading_config" in str(erro.value)
+        assert "estrategia_que_saiu" in str(erro.value)
+
+    async def test_a_subida_falha_e_nada_e_instalado(self, settings):
+        """Quem sobe o sistema e o `install_business_config`: ele tem de propagar."""
+        from crypto_traders.business_config import ConfiguracaoGravadaInvalida
+
+        await _gravar_trading(settings, {**GRAVADA_HOJE, "timeframe": 42})
+        with pytest.raises(ConfiguracaoGravadaInvalida):
+            await install_business_config(settings)
+        assert settings.trading.quote_currency == "USDT"
+
+    async def test_risco_com_campo_que_saiu_preserva_os_limites(self, settings):
+        await _gravar_risco(
+            settings,
+            {"stop_loss_pct": 0.03, "take_profit_pct": 0.08, "min_order_notional": "5",
+             "campo_que_saiu_do_modelo": True},
+        )
+
+        _, risk = await load_business_config(settings)
+
+        assert risk.take_profit_pct == 0.08
+        assert risk.min_order_notional == Decimal("5")
+
+    async def test_risco_invalido_recusa_subir(self, settings):
+        from crypto_traders.business_config import ConfiguracaoGravadaInvalida
+
+        await _gravar_risco(settings, {"stop_loss_pct": 0.08, "take_profit_pct": 0.03})
+        with pytest.raises(ConfiguracaoGravadaInvalida, match="risk_config"):
+            await load_business_config(settings)
+
+
+class TestAuditoriaDaConfiguracaoDeNegocio:
+    async def test_antes_e_depois_sao_completos(self, settings):
+        """O `audit_log` precisa permitir reconstruir a configuracao inteira.
+
+        Antes gravava so os campos enviados. Depois de um fallback silencioso,
+        editar um campo persistia os padroes de fabrica em TODOS os outros e o
+        log nao mostrava nada disso.
+        """
+        from crypto_traders.db.repositories import AuditLogRepository
+        from crypto_traders.db.session import session_scope
+
+        await install_business_config(settings)
+        anterior = settings.trading.model_dump(mode="json")
+        await update_trading_config(settings, {"timeframe": "4h"}, actor="paulo")
+
+        async with session_scope(settings) as session:
+            entradas = await AuditLogRepository(session).list(limit=10)
+        alteracao = next(
+            e for e in entradas
+            if e.action == "trading_config_updated" and e.actor == "paulo"
+        )
+        assert alteracao.before == anterior
+        assert alteracao.after == {**anterior, "timeframe": "4h"}
+        assert "timeframe" in (alteracao.detail or "")
+
+
+class TestEdicaoRecusaOQueOSistemaNaoOpera:
+    """`PUT /trading/config` aceitava timeframe e pares que o sistema nao opera."""
+
+    async def test_timeframe_invalido_e_recusado(self, settings):
+        await install_business_config(settings)
+        with pytest.raises(ValueError, match="timeframe"):
+            await update_trading_config(settings, {"timeframe": "1x"}, actor="teste")
+        assert settings.trading.timeframe == "15m"
+
+    async def test_par_fora_da_moeda_de_cotacao_e_recusado(self, settings):
+        await install_business_config(settings)
+        antes = settings.trading.symbols
+        with pytest.raises(ValueError, match="BTC/USDC"):
+            await update_trading_config(settings, {"symbols": ["BTC/USDC"]}, actor="teste")
+        assert settings.trading.symbols == antes
+
+    async def test_trocar_a_moeda_sem_trocar_os_pares_e_recusado(self, settings):
+        await install_business_config(settings)
+        with pytest.raises(ValueError, match="USDC"):
+            await update_trading_config(settings, {"quote_currency": "USDC"}, actor="teste")
+        assert settings.trading.quote_currency == "USDT"
+
+    async def test_moeda_e_pares_juntos_passam(self, settings):
+        await install_business_config(settings)
+        novo = await update_trading_config(
+            settings, {"quote_currency": "USDC", "symbols": ["BTC/USDC"]}, actor="teste"
+        )
+        assert novo.symbols == ["BTC/USDC"]

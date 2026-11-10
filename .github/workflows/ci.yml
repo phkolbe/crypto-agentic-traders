@@ -1,0 +1,80 @@
+# CI do Sistema Cripto: backend (ruff e a suite inteira, com Postgres de verdade) e
+# frontend (typecheck, build e as verificacoes de tela).
+#
+# Postgres: com POSTGRES_TEST_URL a suite exercita o dialeto de producao (gatilhos
+# append-only em plpgsql, o usuario da aplicacao sem privilegio de DDL, a copia do
+# historico SQLite -> Postgres). O usuario e o superusuario do servico, porque os testes
+# criam um database e um usuario proprios e os apagam no fim.
+#
+# A suite roda de dentro de `backend/`: um teste do grupo de ataques le arquivos de
+# `src/` por caminho relativo (README, Testes).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend (ruff e pytest, com Postgres)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: crypto_teste
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      POSTGRES_TEST_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/crypto_teste
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - run: uv sync --all-extras --locked
+      - run: uv run ruff check src tests
+      - run: uv run pytest -q -rs
+
+  frontend:
+    name: Frontend (typecheck, build e verificacoes de tela)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - run: npm run check

@@ -5,8 +5,9 @@ from __future__ import annotations
 import csv
 import io
 from datetime import datetime
+from decimal import Decimal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...db.repositories import (
@@ -46,16 +47,79 @@ async def list_trades(
     )
 
 
+#: Distancia maxima entre o preco lancado e o ultimo preco conhecido do par
+#: antes de a rota pedir confirmacao propria. Larga o bastante para a variacao
+#: de um dia num ativo volatil; estreita o bastante para pegar o zero a mais ou
+#: a menos (que e um fator 10, e nao 20%).
+FAIXA_DE_PLAUSIBILIDADE = Decimal("0.20")
+
+
+def _preco_de_referencia(request: Request, symbol: str) -> Decimal | None:
+    """Ultimo preco conhecido do par, ou `None` quando o sistema nao o observa.
+
+    Le do `MarketDataAgent` do processo (ticker corrente; sem ele, o fechamento
+    do ultimo candle) pelo mesmo metodo que valoriza a carteira -- sem consultar
+    a exchange, para que lancar um trade nao dependa de rede nem gaste limite
+    de requisicao. A chave segue `MarketDataAgent._chave_de_preco`: o ativo base
+    para o par na moeda de cotacao, o nome completo do par para as demais.
+    """
+    orchestrator = getattr(request.app.state, "orchestrator", None)
+    market_data = getattr(orchestrator, "market_data", None)
+    if market_data is None:
+        return None
+    base, _, quote = symbol.partition("/")
+    cotacao = orchestrator.settings.trading.quote_currency.upper()
+    chave = base if quote == cotacao else symbol
+    return market_data.precos_para_avaliacao().get(chave)
+
+
+def _trade_completo(trade) -> dict:
+    """O lancamento inteiro, serializavel no `audit_log` (dinheiro como string)."""
+    return TradeOut.model_validate(trade).model_dump(mode="json")
+
+
 @router.post("/trades/manual", response_model=TradeOut, status_code=status.HTTP_201_CREATED)
 async def create_manual_trade(
-    payload: ManualTradeIn, session: AsyncSession = Depends(db_session)
+    payload: ManualTradeIn, request: Request, session: AsyncSession = Depends(db_session)
 ) -> TradeOut:
     """Registra uma operacao feita fora do sistema (ex.: pelo app da exchange).
 
     Entra na mesma tabela `trades`, o que mantem o dashboard, os filtros e a
     exportacao fiscal com uma unica fonte -- e faz o lancamento contar no
     calculo de preco medio junto com as operacoes dos agentes.
+
+    E esse preco medio que define o stop e o alvo. Por isso a rota exige
+    `confirm=true` e confere o preco contra o ultimo preco conhecido do par:
+    fora de +-20% devolve 409 e so grava com `aceitar_preco_fora_do_mercado`.
+    Cenario da auditoria de 09/11/2026 (P0 #12): preco medio 95.000, compra
+    lancada a 9.500 por um zero a menos -> stop de 3% de ~92.150 para ~50.680,
+    sem aviso. Sem preco conhecido (agentes parados, par fora do universo) nao
+    ha com o que comparar: grava, e o `audit_log` registra que nao conferiu.
     """
+    if not payload.confirm:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "o lancamento manual entra no preco medio e move o stop e o alvo "
+                "da posicao; envie confirm=true"
+            ),
+        )
+
+    referencia = _preco_de_referencia(request, payload.symbol)
+    if referencia is not None and referencia > 0:
+        desvio = abs(payload.price - referencia) / referencia
+        if desvio > FAIXA_DE_PLAUSIBILIDADE and not payload.aceitar_preco_fora_do_mercado:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"o preco {payload.price} esta {desvio:.0%} longe do ultimo preco "
+                    f"conhecido de {payload.symbol} ({referencia}). Confira se nao "
+                    "falta ou sobra um zero: este preco entra no preco medio e move "
+                    "o stop. Se a operacao e antiga e o preco esta certo, envie "
+                    "aceitar_preco_fora_do_mercado=true"
+                ),
+            )
+
     trade = await TradeRepository(session).record(
         executed_at=payload.executed_at,
         exchange=payload.exchange,
@@ -74,10 +138,9 @@ async def create_manual_trade(
         actor="user",
         target=trade.id,
         after={
-            "symbol": payload.symbol,
-            "side": payload.side,
-            "quantity": str(payload.quantity),
-            "price": str(payload.price),
+            **_trade_completo(trade),
+            "preco_de_referencia": str(referencia) if referencia is not None else None,
+            "aceitar_preco_fora_do_mercado": payload.aceitar_preco_fora_do_mercado,
         },
     )
     return TradeOut.model_validate(trade)
@@ -85,13 +148,33 @@ async def create_manual_trade(
 
 @router.delete("/trades/{trade_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_manual_trade(
-    trade_id: str, session: AsyncSession = Depends(db_session)
+    trade_id: str,
+    confirm: bool = Query(
+        default=False,
+        description="Confirmacao explicita: remover o lancamento reapura o preco medio e o stop.",
+    ),
+    session: AsyncSession = Depends(db_session),
 ) -> Response:
     """Remove um lancamento manual digitado errado.
 
     Operacoes dos agentes nunca sao removiveis: elas sao o registro do que o
     sistema de fato fez, e apagar isso destruiria a auditoria.
+
+    Remover tambem mexe no preco medio, e portanto no stop: exige
+    `?confirm=true` (na query, porque corpo em DELETE nao e confiavel entre
+    clientes e proxies) e grava o lancamento INTEIRO no `before` do
+    `audit_log`. Antes gravava so o id, e nao dava para saber o que foi apagado
+    nem reconstruir o efeito no stop.
     """
+    if not confirm:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "remover o lancamento reapura o preco medio e move o stop e o alvo "
+                "da posicao; envie confirm=true"
+            ),
+        )
+
     repository = TradeRepository(session)
     trade = await repository.get(trade_id)
     if trade is None:
@@ -103,9 +186,10 @@ async def delete_manual_trade(
             "operacoes dos agentes fazem parte da auditoria",
         )
 
+    antes = _trade_completo(trade)
     await repository.delete(trade_id)
     await AuditLogRepository(session).append(
-        action="manual_trade_deleted", actor="user", target=trade_id
+        action="manual_trade_deleted", actor="user", target=trade_id, before=antes
     )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 

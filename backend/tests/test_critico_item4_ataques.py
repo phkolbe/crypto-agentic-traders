@@ -180,7 +180,9 @@ class TestAtaque2SinaisSimultaneos:
             trades = await TradeRepository(session).list()
         assert len(ordens) == 2
         assert len(trades) == 2, "gastou duas vezes e registrou menos de duas"
-        assert (await paper.fetch_balances())["BTC"] == Decimal("0.002")
+        # Duas compras de 0,001, cada uma liquida da taxa de 0,1% cobrada no BTC
+        # recebido (o papel imita a Binance sem BNB).
+        assert (await paper.fetch_balances())["BTC"] == Decimal("0.001998")
 
 
 # ----------------------------------------------------------------------

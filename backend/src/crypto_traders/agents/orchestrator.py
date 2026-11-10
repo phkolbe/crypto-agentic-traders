@@ -11,14 +11,17 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
+
+from sqlalchemy import text
 
 from ..bus import EventBus, Topics, build_event_bus
 from ..business_config import install_business_config, update_trading_config
 from ..config import Settings, TradingSettings, get_settings
 from ..db.repositories import AuditLogRepository, RiskConfigRepository
-from ..db.session import init_db, session_scope
+from ..db.session import get_engine, init_db, session_scope
 from ..discovery import DiscoveryResult
 from ..domain.enums import AgentState, TradingMode
 from ..domain.models import PortfolioSnapshot
@@ -50,6 +53,31 @@ HEARTBEAT_TIMEOUT = timedelta(minutes=10)
 
 #: Intervalo da vigilancia de saude.
 WATCHDOG_INTERVAL_SECONDS = 60
+
+#: Sem completar um ciclo por mais que isso, o laco do watchdog esta parado e a
+#: sonda de saude do conteiner falha (`Orchestrator.vitalidade`). Tres ciclos: um
+#: ciclo lento (banco demorando no `_audit`) nao derruba o conteiner.
+WATCHDOG_ATRASO_MAXIMO_SEGUNDOS = 3 * WATCHDOG_INTERVAL_SECONDS
+
+#: Os agentes sem os quais o stop-loss nao roda: preco corrente, decisao de
+#: protecao, ordem e retrato da carteira. `strategy` fica de fora de proposito:
+#: sem ela nada novo abre, mas o que esta aberto continua protegido.
+AGENTES_CRITICOS = ("market_data", "risk_manager", "execution", "portfolio")
+
+#: Quanto o proprio watchdog pode se ATRASAR antes de concluir que a maquina inteira
+#: parou (suspensao do notebook, VM pausada). Um `sleep(60)` que volta horas depois
+#: nao e agente travado: e o processo inteiro congelado. Medido em 28/10/2026: o
+#: notebook suspendeu, na volta os cinco agentes estavam "sem sinal de vida" no mesmo
+#: instante, sem erro nenhum, e o watchdog desistiu da execucao e pausou o sistema --
+#: que ficou parado sete dias.
+SUSPENSAO_MINIMA = timedelta(minutes=3)
+
+#: Uma carencia por hora, no maximo. O detector mede relogio de parede em volta do
+#: `sleep` e nao distingue maquina suspensa de processo engasgado (swap, CPU
+#: estrangulada, `docker pause`): sem este teto, engasgos de 4 min em serie
+#: renovavam a carencia para sempre e um agente travado DE VERDADE nunca era
+#: reiniciado (medido pelo critico: 60 engasgos, 0 reinicios, 60 alertas).
+CARENCIA_INTERVALO_MINIMO = timedelta(hours=1)
 
 #: Quantos reinicios DENTRO DA JANELA antes de desistir de um agente.
 #:
@@ -85,6 +113,16 @@ SUBSCRIPTION_WAIT_SECONDS = 5.0
 #: e barato: quase sempre nao faz nada, e cobre o caso de a busca ter falhado.
 ONCHAIN_REFRESH_INTERVAL_SECONDS = 3600
 
+#: Chave do bloqueio consultivo do Postgres que garante UM `crypto-traders run` por
+#: banco ("crypto" em ASCII). O bloqueio de sessao vale por database, entao hml e
+#: prd no mesmo servidor de Postgres nao se enxergam.
+CHAVE_INSTANCIA_UNICA = 0x63727970746F
+
+
+class InstanciaDuplicada(RuntimeError):
+    """Outro `crypto-traders run` ja opera sobre este banco (M3 da orquestracao)."""
+
+
 #: O que se perde enquanto cada tarefa do orquestrador esta morta. Dizer so
 #: "tarefa morreu" nao ajuda quem opera; dizer o que deixou de funcionar, sim.
 _OWN_TASK_CONSEQUENCE = {
@@ -107,10 +145,26 @@ _OWN_TASK_CONSEQUENCE = {
 class Orchestrator:
     """Dono do ciclo de vida de todos os agentes."""
 
-    def __init__(self, settings: Settings | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        *,
+        fonte_de_mercado: MarketDataSource | None = None,
+        onchain: OnChainProvider | None = None,
+    ) -> None:
         self.settings = settings or get_settings()
         self.bus: EventBus = build_event_bus(self.settings)
         self.notifier: Notifier = build_notifier(self.settings)
+
+        self._fonte_injetada = fonte_de_mercado
+        self._onchain_injetado = onchain
+        """Fonte de mercado e provedor on-chain no lugar dos de rede.
+
+        Existem para o simulador de cenarios (`crypto_traders.simulacao`) subir
+        o sistema REAL contra um mercado roteirizado. Em producao ficam vazios e
+        `start()` monta os de sempre; a fonte injetada continua sendo uma
+        `MarketDataSource`, que nao tem metodo nenhum que gaste dinheiro.
+        """
 
         self._source: MarketDataSource | None = None
         self._broker: Broker | None = None
@@ -124,6 +178,15 @@ class Orchestrator:
 
         self._restart_history: dict[str, list[datetime]] = {}
         """Quando cada agente foi reiniciado, dentro da janela corrente."""
+
+        self._carencia_ate: float | None = None
+        """Ate quando (em `time.monotonic()`) nenhum agente e julgado por falta de
+        sinal de vida: a janela que a maquina recem-acordada tem para os agentes
+        voltarem a bater. Monotonico de proposito: um passo do relogio de parede
+        (NTP) nao pode esticar a carencia."""
+
+        self._carencia_concedida_em: float | None = None
+        """Quando a ultima carencia foi concedida (monotonico), para o teto por hora."""
 
         self._restart_alerted: set[str] = set()
         """Agentes que ja avisaram neste episodio -- um alerta por episodio (D19)."""
@@ -156,6 +219,22 @@ class Orchestrator:
         self._alert_path_alerted = False
         """Se o operador ja foi avisado de que o caminho de alertas caiu."""
 
+        self._conexao_da_trava: Any = None
+        """Conexao dedicada que segura o bloqueio de instancia unica (Postgres)."""
+
+        self._instancia_recusada = False
+        """A subida foi recusada por haver outra instancia: o `stop()` nao marca nada."""
+
+        self._alertas_assinados = asyncio.Event()
+        """A assinatura de ALERTS ja existe no bus (ver `_esperar_assinatura_de_alertas`)."""
+
+        self._watchdog_ultimo_ciclo: float | None = None
+        """Fim do ultimo ciclo completo do watchdog (`time.monotonic()`).
+
+        E a prova de que o laco do orquestrador anda, para a sonda de saude do
+        conteiner (`vitalidade`): tarefa viva nao basta, um watchdog pendurado
+        num `_audit` sem resposta do banco continua "vivo"."""
+
         self.market_data: MarketDataAgent
         self.strategy: StrategyAgent
         self.risk_manager: RiskManagerAgent
@@ -181,6 +260,11 @@ class Orchestrator:
     async def start(self) -> None:
         await init_db(self.settings)
 
+        # Antes de ler ou escrever qualquer coisa: com outra instancia de pe, esta
+        # nao pode nem gravar `system_started` (confundiria a deteccao de morte
+        # da outra), quanto mais operar a mesma conta em dobro.
+        await self._tomar_instancia_unica()
+
         # Antes de qualquer coisa: a execucao anterior desligou ou foi derrubada?
         # A resposta so existe agora, com o banco aberto e nada escrito ainda.
         self._unclean_previous_run = await self._detect_unclean_shutdown()
@@ -192,25 +276,50 @@ class Orchestrator:
 
         await self.bus.start()
 
-        self._source = build_market_data_source(
-            self.settings.exchange, testnet=self.settings.trading_mode is TradingMode.TESTNET
-        )
+        # O carteiro antes de qualquer carta. O primeiro `_on_snapshot` roda
+        # dentro de `_prime_portfolio`, e o bus em memoria descarta o que e
+        # publicado sem assinante: com o listener subindo depois, o aviso de
+        # dimensionamento inviavel (22 USDC na conta) era publicado no vazio e a
+        # flag de episodio ja ficava armada -- o sistema subia verde rejeitando
+        # todo sinal e o aviso NUNCA saia (P0 #9). O mesmo valia para stop
+        # disparado, circuit breaker e posicao sem stop no primeiro retrato.
+        self._alert_listener = asyncio.create_task(self._listen_alerts(), name="alert-listener")
+        await self._esperar_assinatura_de_alertas()
+
+        if self._fonte_injetada is not None:
+            self._source = self._fonte_injetada
+        else:
+            self._source = build_market_data_source(
+                self.settings.exchange, testnet=self.settings.trading_mode is TradingMode.TESTNET
+            )
         self._broker = build_broker(self.settings)
 
         self.market_data = MarketDataAgent(
             self.bus, self._source, self.settings, on_universe_change=self._on_universe_change
         )
+        definir_fonte = getattr(self._broker, "set_price_source", None)
+        if definir_fonte is not None:
+            # Broker de papel: a ordem le o preco corrente no instante em que sai.
+            definir_fonte(self.market_data.precos_para_avaliacao)
         self.strategy = StrategyAgent(
             self.bus, build_strategies(self.settings.trading.strategies), self.settings
         )
-        self.onchain = OnChainProvider(self.settings)
+        self.onchain = self._onchain_injetado or OnChainProvider(self.settings)
         self.risk_manager = RiskManagerAgent(self.bus, self.settings, onchain=self.onchain)
+        self.risk_manager.definir_precos_de_mercado(self.market_data.precos_de_mercado)
+        # Passo e minimo do par vem do broker (catalogo ao vivo ou versionado): e
+        # o que separa poeira invendavel de posicao que precisa de stop.
+        filtros = getattr(self._broker, "market_filter", None)
+        if callable(filtros):
+            self.risk_manager.definir_filtros_de_mercado(filtros)
         self.execution = ExecutionAgent(self.bus, self._broker, self.settings)
         self.portfolio = PortfolioAgent(
             self.bus,
             self._broker,
             self.settings,
-            price_source=lambda: dict(self.market_data.latest_prices),
+            # Preco CORRENTE (ticker), nao o fechamento do candle: e com ele que o
+            # stop e o alvo sao comparados (ver `MarketDataAgent.precos_correntes`).
+            price_source=lambda: self.market_data.precos_para_avaliacao(),
             on_snapshot=self._on_snapshot,
         )
 
@@ -242,7 +351,7 @@ class Orchestrator:
         # padrao de fabrica de uma trava nunca pode ser "solta".
         await self._apply_persisted_circuit_breaker()
 
-        self._alert_listener = asyncio.create_task(self._listen_alerts(), name="alert-listener")
+        self._watchdog_ultimo_ciclo = time.monotonic()
         self._watchdog = asyncio.create_task(self._watch_health(), name="watchdog")
         self._onchain_refresher = asyncio.create_task(
             self._refresh_onchain_forever(), name="onchain-refresher"
@@ -259,6 +368,9 @@ class Orchestrator:
                     # Universo real, ja resolvido pela descoberta: registrar a
                     # config estatica gravaria uma lista vazia em "mar aberto".
                     "symbols": self.market_data.active_symbols,
+            # Ativos cujo stop e alvo NAO estao sendo avaliados agora (sem preco
+            # corrente recente). Lista vazia e o normal.
+            "sem_preco_corrente": list(self.market_data.pares_sem_preco_corrente),
                     "symbols_source": (
                         "descoberta" if self.settings.trading.discovery_enabled else "configurado"
                     ),
@@ -267,9 +379,93 @@ class Orchestrator:
             )
         log.info("orchestrator.started", mode=str(self.settings.trading_mode))
 
-        # Depois do `_listen_alerts` existir, senao o alerta seria publicado sem
-        # ninguem escutando e nao chegaria ao operador.
+        # O `_listen_alerts` ja existe desde o inicio da subida: o alerta chega.
         await self._report_unclean_shutdown()
+
+    async def _esperar_assinatura_de_alertas(self) -> None:
+        """So segue a subida com a assinatura de ALERTS registrada no bus.
+
+        Criar a tarefa nao basta: ela so assina quando roda. Mesmo desenho de
+        `_Inbox.ready` -- o evento e marcado antes do primeiro `anext`, e quem
+        espera so volta a rodar com a assinatura ja no lugar.
+        """
+        try:
+            await asyncio.wait_for(
+                self._alertas_assinados.wait(), timeout=SUBSCRIPTION_WAIT_SECONDS
+            )
+        except TimeoutError:
+            log.error(
+                "orchestrator.alert_subscription_not_ready",
+                detail="alertas da subida podem nao chegar ao operador",
+            )
+
+    async def _tomar_instancia_unica(self) -> None:
+        """Recusa subir se outro `crypto-traders run` ja opera sobre este banco.
+
+        Nada impedia duas instancias: `docker compose run --rm crypto
+        crypto-traders run` com o conteiner do sistema de pe sobe um segundo
+        orquestrador, e os dois avaliam o mesmo snapshot e emitem compra e
+        protecao em dobro -- o `client_order_id` e gerado por instancia, entao o
+        UNIQUE nao pega. Um comando plausivel e ordem dobrada com dinheiro real.
+
+        `pg_try_advisory_lock` de SESSAO numa conexao dedicada, mantida pela vida
+        do processo: a trava some sozinha quando o processo morre (a conexao cai),
+        sem arquivo de trava para limpar. Se a conexao cair com o processo vivo
+        (Postgres reiniciado), a trava se perde em silencio e uma segunda
+        instancia passaria -- limite conhecido, que nao piora o que havia.
+
+        SQLite fica de fora: o arquivo e local da maquina, e o risco medido e o
+        Postgres compartilhado do servidor.
+        """
+        engine = get_engine(self.settings)
+        if engine.dialect.name != "postgresql":
+            return
+        conexao = await engine.connect()
+        try:
+            livre = (
+                await conexao.execute(
+                    text("SELECT pg_try_advisory_lock(:chave)"),
+                    {"chave": CHAVE_INSTANCIA_UNICA},
+                )
+            ).scalar()
+            # A trava e de sessao, sobrevive ao commit; a transacao aberta nao
+            # pode ficar "idle in transaction" pela vida do processo.
+            await conexao.commit()
+        except Exception:
+            await conexao.close()
+            raise
+        if not livre:
+            await conexao.close()
+            self._instancia_recusada = True
+            log.error(
+                "orchestrator.instancia_duplicada",
+                detail="outro crypto-traders run ja opera sobre este banco; esta nao sobe",
+            )
+            raise InstanciaDuplicada(
+                "outro 'crypto-traders run' ja opera sobre este banco (bloqueio consultivo "
+                f"{CHAVE_INSTANCIA_UNICA} do Postgres). Duas instancias operariam a mesma "
+                "conta em dobro; pare a outra antes de subir esta."
+            )
+        self._conexao_da_trava = conexao
+
+    async def _soltar_instancia_unica(self) -> None:
+        """Solta a trava e DESCARTA a conexao.
+
+        Devolve-la ao pool manteria a sessao do Postgres -- e com ela a trava --
+        viva dentro do pool.
+        """
+        conexao, self._conexao_da_trava = self._conexao_da_trava, None
+        if conexao is None:
+            return
+        with contextlib.suppress(Exception):
+            await conexao.execute(
+                text("SELECT pg_advisory_unlock(:chave)"), {"chave": CHAVE_INSTANCIA_UNICA}
+            )
+            await conexao.commit()
+        with contextlib.suppress(Exception):
+            await conexao.invalidate()
+        with contextlib.suppress(Exception):
+            await conexao.close()
 
     async def _apply_persisted_circuit_breaker(self) -> None:
         """Repoe a parada geral se a trava ficou armada da execucao anterior.
@@ -402,23 +598,32 @@ class Orchestrator:
             },
         )
 
-    async def _mark_clean_shutdown(self, reason: str) -> None:
+    async def _mark_clean_shutdown(
+        self, reason: str, deixados: dict[str, list[str]] | None = None
+    ) -> None:
         """Deixa no `audit_log` a prova de que este desligamento foi pedido.
 
         E a contraparte de `_detect_unclean_shutdown`: sem esta marca, todo
         desligamento normal seria denunciado como morte na proxima subida, e um
         alerta que chega sempre deixa de ser lido.
+
+        `deixados` e o que a parada cortou no meio ou deixou na fila, por agente
+        (`BaseAgent.deixados_na_parada`): uma parada que corta uma ordem no meio
+        nao e "limpa" so porque foi pedida.
         """
+        after: dict[str, Any] = {
+            "mode": str(self.settings.trading_mode),
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+        }
+        if deixados:
+            after["deixados_na_parada"] = deixados
         try:
             async with session_scope(self.settings) as session:
                 await AuditLogRepository(session).append(
                     action="system_stopped",
                     target="orchestrator",
                     detail=reason,
-                    after={
-                        "mode": str(self.settings.trading_mode),
-                        "started_at": self.started_at.isoformat() if self.started_at else None,
-                    },
+                    after=after,
                 )
         except Exception as exc:
             # Falhar aqui nao pode impedir o desligamento; o preco e um falso
@@ -430,18 +635,33 @@ class Orchestrator:
         # desligamento, e nao morte. Sem esta marca a supervisao ressuscitaria o
         # que o `stop()` acabou de derrubar.
         self._shutting_down = True
-        await self._mark_clean_shutdown("desligamento solicitado")
 
-        for task in (self._watchdog, self._alert_listener, self._onchain_refresher):
-            if task is not None:
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
-        self._watchdog = self._alert_listener = self._onchain_refresher = None
+        # O watchdog sai primeiro: ele veria os agentes parando como mortos e os
+        # reiniciaria. O listener de alertas fica ate os agentes pararem, para que
+        # o que eles publicarem durante a drenagem ainda chegue ao operador.
+        await self._cancelar_tarefas_proprias(("_watchdog", "_onchain_refresher"))
 
-        for agent in self.agents.values():
+        # Drenagem em paralelo, um prazo so para todos (`base.PRAZO_DRENAGEM_SEGUNDOS`,
+        # dentro do `stop_grace_period`): o evento em processamento -- a ordem no
+        # meio do `place_order` -- termina antes do cancelamento.
+        agentes = list(self.agents.values())
+        await asyncio.gather(*(agent.drenar() for agent in agentes), return_exceptions=True)
+        for agent in agentes:
             with contextlib.suppress(Exception):
                 await agent.stop()
+        await self._cancelar_tarefas_proprias(("_alert_listener",))
+
+        if not self._instancia_recusada:
+            # Depois de parar os agentes, e nao antes: um processo morto no meio
+            # da drenagem (SIGKILL ao fim do grace) fica sem a marca e a proxima
+            # subida o denuncia, que e o lado certo do erro. A instancia recusada
+            # nunca operou: marcar aqui escreveria por cima da que esta de pe.
+            deixados = {
+                agent.name: agent.deixados_na_parada
+                for agent in agentes
+                if getattr(agent, "deixados_na_parada", None)
+            }
+            await self._mark_clean_shutdown("desligamento solicitado", deixados)
 
         # O broker e compartilhado entre Execution e Portfolio, entao quem o
         # criou e quem o fecha -- uma unica vez.
@@ -451,7 +671,19 @@ class Orchestrator:
                     await resource.close()
 
         await self.bus.stop()
+        await self._soltar_instancia_unica()
         log.info("orchestrator.stopped")
+
+    async def _cancelar_tarefas_proprias(self, atributos: tuple[str, ...]) -> None:
+        for atributo in atributos:
+            task: asyncio.Task[None] | None = getattr(self, atributo, None)
+            if task is not None:
+                task.cancel()
+                # Tambem a excecao de uma tarefa que morreu sozinha (e ainda nao
+                # foi recriada): ela nao pode abortar o desligamento no meio.
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+            setattr(self, atributo, None)
 
     # ------------------------------------------------------------------
     # Controle (usado pela API)
@@ -549,22 +781,49 @@ class Orchestrator:
         agent = self.agents.get(name)
         if agent is None:
             return False
+        # Medido ANTES do `resume()`, que sobrescreve ERROR por RUNNING: retomar um
+        # agente em erro deixava o dashboard verde com ele quebrado.
+        quebrado = self._precisa_reviver(agent)
+        self._reabilitar(name, actor, quebrado=quebrado)
         if name == "execution":
             await self._allow_openings_for(agent, actor)
         agent.resume()
 
         # Retomar um agente cuja tarefa morreu apenas liberava um gate vazio: o
-        # dashboard passava a mostrar "running" e nada rodava. Se o watchdog
-        # desistiu dele, e aqui que o operador o traz de volta.
-        if not agent.is_running:
-            self._given_up.discard(name)
-            self._restart_history.pop(name, None)
-            self._restart_alerted.discard(name)
+        # dashboard passava a mostrar "running" e nada rodava.
+        if quebrado:
             log.warning("orchestrator.reviving_agent", agent=name, actor=actor)
             await agent.restart()
 
         await self._audit("agent_resumed", name, actor)
         return True
+
+    @staticmethod
+    def _precisa_reviver(agent: BaseAgent) -> bool:
+        """Tarefa morta, estado de erro ou surdo: o mesmo "crashed" do watchdog."""
+        return (
+            not agent.is_running or agent.state is AgentState.ERROR or bool(agent.deaf_topics)
+        )
+
+    def _reabilitar(self, name: str, actor: str, *, quebrado: bool) -> None:
+        """Devolve o agente a vigilancia do watchdog quando o operador o retoma.
+
+        O watchdog desiste logo DEPOIS de um `restart()` bem-sucedido
+        (`_restart_agent`), entao o desistido esta quase sempre com a tarefa
+        viva. Limpar `_given_up` so com a tarefa morta -- como era -- deixava o
+        botao "retomar" respondendo 200 sem retomar nada: com a execucao,
+        `_execution_unavailable` seguia dizendo "o watchdog desistiu" e o
+        stop-loss nao rodava ate reiniciar o processo (P0 #8). A contagem de
+        reinicios recomeca: o operador assumiu o episodio.
+        """
+        desistido = name in self._given_up
+        if not (desistido or quebrado):
+            return
+        self._given_up.discard(name)
+        self._restart_history.pop(name, None)
+        self._restart_alerted.discard(name)
+        if desistido:
+            log.warning("orchestrator.agent_rehabilitated", agent=name, actor=actor)
 
     async def _allow_openings_for(self, agent: BaseAgent, actor: str) -> None:
         """Contraparte de `_block_openings_for`, com uma recusa importante.
@@ -635,9 +894,26 @@ class Orchestrator:
         log.warning("orchestrator.paused_all", reason=reason)
 
     async def resume_all(self, actor: str = "user") -> None:
+        """Retoma todos, inclusive os que o watchdog desistiu (ver `_reabilitar`).
+
+        So o desistido quebrado e reiniciado aqui. O que nao foi desistido segue
+        com o watchdog, que o reinicia no proprio ciclo -- e um agente que nunca
+        subiu (API sem os agentes) nao pode ser posto para rodar por um rearme.
+        """
         agents = self.agents
-        for agent in agents.values():
+        for name, agent in agents.items():
+            desistido = name in self._given_up
+            quebrado = desistido and self._precisa_reviver(agent)
+            if desistido:
+                self._reabilitar(name, actor, quebrado=quebrado)
             agent.resume()
+            if quebrado:
+                log.warning("orchestrator.reviving_agent", agent=name, actor=actor)
+                try:
+                    await agent.restart()
+                except Exception as exc:
+                    # Um agente que nao volta nao pode impedir a retomada dos outros.
+                    log.error("orchestrator.revive_failed", agent=name, error=str(exc))
 
         execution = agents.get("execution")
         unblocker = getattr(execution, "allow_openings", None)
@@ -693,6 +969,46 @@ class Orchestrator:
             # visivel onde o operador olha, e nao so no log.
             "tasks": self._own_tasks_alive(),
         }
+
+    def vitalidade(self) -> list[str]:
+        """O que impede o sistema de proteger a carteira agora; lista vazia e saude.
+
+        E a resposta da sonda de saude do conteiner (`GET /api/health?sonda=1`).
+        A sonda antiga so provava que o objeto orquestrador existia: com o laco
+        de eventos de pe e os agentes mortos, o conteiner seguia `healthy` e o
+        stop -- que e so software -- nao rodava sem ninguem saber (P0 #11).
+
+        Pausa NAO e problema: e pedido do operador (ou do circuit breaker), e
+        reiniciar o conteiner por causa dela desfaria o pedido.
+        """
+        agora = datetime.now(UTC)
+        problemas: list[str] = []
+        agentes = self.agents
+        for nome in AGENTES_CRITICOS:
+            agente = agentes.get(nome)
+            if agente is None:
+                problemas.append(f"{nome}: nao montado")
+            elif nome in self._given_up:
+                problemas.append(f"{nome}: o watchdog desistiu dele")
+            elif not agente.is_running:
+                problemas.append(f"{nome}: tarefa parada")
+            elif self._is_stale(agente, agora):
+                minutos = round(HEARTBEAT_TIMEOUT.total_seconds() / 60)
+                problemas.append(f"{nome}: sem sinal de vida ha mais de {minutos} min")
+
+        tarefas = self._own_tasks_alive()
+        for nome in ("watchdog", "alert-listener"):
+            if not tarefas.get(nome):
+                problemas.append(f"tarefa '{nome}' do orquestrador parada")
+        if tarefas.get("watchdog"):
+            ultimo = self._watchdog_ultimo_ciclo
+            atraso = None if ultimo is None else time.monotonic() - ultimo
+            if atraso is None or atraso > WATCHDOG_ATRASO_MAXIMO_SEGUNDOS:
+                problemas.append(
+                    "watchdog sem completar um ciclo ha "
+                    + ("tempo indeterminado" if atraso is None else f"{atraso:.0f}s")
+                )
+        return problemas
 
     # ------------------------------------------------------------------
     async def _on_snapshot(self, snapshot: PortfolioSnapshot) -> None:
@@ -1041,7 +1357,7 @@ class Orchestrator:
         """
         setter = getattr(self._broker, "set_prices", None)
         if setter is not None:
-            setter(dict(self.market_data.latest_prices))
+            setter(self.market_data.precos_para_avaliacao())
 
     async def _listen_alerts(self) -> None:
         """Caminho único de notificação: tudo que é crítico passa por aqui.
@@ -1096,7 +1412,12 @@ class Orchestrator:
             log.error("orchestrator.direct_notify_failed", error=str(exc))
 
     async def _drain_alerts(self) -> None:
-        async for alert in self.bus.subscribe(Topics.ALERTS):
+        assinatura = self.bus.subscribe(Topics.ALERTS)
+        # Antes do primeiro `anext`: o gerador do bus registra a assinatura antes
+        # da primeira suspensao, entao quem espera este evento (a subida) so volta
+        # a rodar com ela no lugar.
+        self._alertas_assinados.set()
+        async for alert in assinatura:
             # Alerta chegando de verdade e a prova de que o caminho voltou: e o
             # que rearma o aviso de "o caminho de alertas caiu".
             self._alert_path_alerted = False
@@ -1140,13 +1461,75 @@ class Orchestrator:
         enquanto uma etapa da cadeia deixou de existir.
         """
         while True:
+            antes = datetime.now(UTC)
             await asyncio.sleep(WATCHDOG_INTERVAL_SECONDS)
             try:
+                await self._observar_relogio(
+                    antes, datetime.now(UTC), timedelta(seconds=WATCHDOG_INTERVAL_SECONDS)
+                )
                 await self._check_health_once()
             except Exception as exc:
                 # A vigilancia nunca pode morrer por um erro dela mesma: sem
                 # watchdog, um agente travado deixa de ser detectado.
                 log.error("orchestrator.watchdog_cycle_failed", error=str(exc))
+            # Ciclo que terminou, com ou sem erro: o laco anda. Pendurado no
+            # meio do ciclo, nao chega aqui e a sonda de saude ve o atraso.
+            self._watchdog_ultimo_ciclo = time.monotonic()
+
+    async def _observar_relogio(
+        self, antes: datetime, depois: datetime, esperado: timedelta
+    ) -> bool:
+        """Reconhece a maquina parada pelo atraso do proprio watchdog.
+
+        Se o `sleep` voltou muito depois do pedido, o processo inteiro ficou
+        congelado -- e a falta de batida dos agentes nesse intervalo nao diz nada
+        sobre eles. Em vez de reiniciar (e, em tres ciclos, desistir e pausar tudo),
+        os agentes ganham um timeout inteiro de carencia. Travamento DE VERDADE
+        continua sendo pego: passada a carencia, quem nao bateu e reiniciado.
+
+        A deteccao usa relogio de parede (no Linux o `sleep` corre no monotonico,
+        que PARA durante a suspensao), mas o prazo da carencia corre no
+        monotonico. No maximo uma carencia por `CARENCIA_INTERVALO_MINIMO`, e o
+        historico de reinicios NAO e zerado: um falso positivo (processo
+        engasgado) nao pode apagar a contagem de um agente em laco de queda.
+        Devolve True quando concedeu a carencia.
+        """
+        atraso = (depois - antes) - esperado
+        if atraso < SUSPENSAO_MINIMA:
+            return False
+        minutos = round(atraso.total_seconds() / 60)
+        agora = time.monotonic()
+        teto = CARENCIA_INTERVALO_MINIMO.total_seconds()
+        if self._carencia_concedida_em is not None and agora - self._carencia_concedida_em < teto:
+            log.warning(
+                "orchestrator.parada_repetida",
+                parada_minutos=minutos,
+                detail="nova parada dentro da hora: sem nova carencia, o watchdog segue julgando",
+            )
+            return False
+        self._carencia_concedida_em = agora
+        self._carencia_ate = agora + HEARTBEAT_TIMEOUT.total_seconds()
+        carencia_min = round(HEARTBEAT_TIMEOUT.total_seconds() / 60)
+        log.warning(
+            "orchestrator.maquina_suspensa",
+            parada_minutos=minutos,
+            carencia_minutos=carencia_min,
+            detail="o processo ficou congelado; agentes nao sao julgados ate a carencia acabar",
+        )
+        await self.bus.publish(
+            Topics.ALERTS,
+            {
+                "type": "host_suspended",
+                "title": f"Maquina parada por ~{minutos} min",
+                "message": (
+                    f"O sistema ficou congelado por cerca de {minutos} minutos (suspensao da "
+                    "maquina ou VM pausada). Nesse intervalo nenhum preco foi lido e nenhum "
+                    f"stop foi avaliado. Os agentes tem {carencia_min} min para voltar a "
+                    "dar sinal de vida antes de qualquer reinicio."
+                ),
+            },
+        )
+        return True
 
     def _is_stale(self, agent: BaseAgent, now: datetime) -> bool:
         """Ha quanto tempo o agente nao da sinal de vida.
@@ -1158,10 +1541,17 @@ class Orchestrator:
         """
         if agent.is_paused:
             return False
-        reference = agent.last_beat or agent.started_at
-        if reference is None:
+        # A referencia mais RECENTE entre a batida e a (re)subida. Era
+        # `last_beat or started_at`: com batida antiga, o agente recem-reiniciado
+        # continuava medido pela batida de antes do reinicio, nascia "sem sinal de
+        # vida" e era reiniciado de novo no ciclo seguinte -- tres reinicios em tres
+        # minutos e a desistencia, sem dar a ele o prazo que o timeout promete.
+        referencias = [r for r in (agent.last_beat, agent.started_at) if r is not None]
+        if not referencias:
             return False
-        return (now - reference) > HEARTBEAT_TIMEOUT
+        if self._carencia_ate is not None and time.monotonic() < self._carencia_ate:
+            return False
+        return (now - max(referencias)) > HEARTBEAT_TIMEOUT
 
     async def _check_health_once(self) -> None:
         """Um ciclo de vigilancia.

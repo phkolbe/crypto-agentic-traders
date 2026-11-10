@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import math
 from collections import Counter
+from collections.abc import Awaitable
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
@@ -33,13 +34,53 @@ from ..domain.enums import (
     Side,
     SignalDirection,
 )
-from ..domain.models import Candle, OrderRequest
+from ..domain.models import Candle, OrderRequest, OrderResult
+from ..exchanges.base import InsufficientFunds
 from ..exchanges.paper import PaperBroker
 from ..logging_setup import get_logger
 from ..risk.rules import PortfolioState, RiskEngine
 from ..strategies import MarketFrame, Strategy
 
 log = get_logger(__name__)
+
+
+async def preenchimento(
+    chamada: Awaitable[OrderResult], request: OrderRequest
+) -> OrderResult:
+    """Saldo insuficiente vira REJECTED, o mesmo desfecho que o dry_run grava.
+
+    O `PaperBroker` levanta `InsufficientFunds`, como o `CcxtExchange`, e quem
+    converte isso em recusa na producao e o Execution Agent. O backtest nao tem
+    Execution Agent: sem esta conversao, uma compra que o deslizamento empurra
+    acima do caixa derrubaria a simulacao inteira.
+    """
+    try:
+        return await chamada
+    except InsufficientFunds as exc:
+        return OrderResult(
+            order_request_id=request.id,
+            client_order_id=request.client_order_id,
+            exchange_order_id=None,
+            status=OrderStatus.REJECTED,
+            error=str(exc),
+        )
+
+
+def liquido_e_taxa(
+    order: OrderResult, side: Side, base: str, preco: Decimal
+) -> tuple[Decimal, Decimal]:
+    """(quantidade que moveu o saldo do ativo, taxa na moeda de cotacao).
+
+    Mesma regra de `agents.portfolio._quantidade_e_taxa`: o `PaperBroker` cobra a
+    taxa da COMPRA no ativo recebido, como a Binance sem BNB, entao a posicao
+    entra liquida e a taxa vale `taxa x preco` do proprio preenchimento. Somar a
+    taxa em BTC ao custo em USDC seria erro de unidade.
+    """
+    quantidade = order.filled_quantity
+    if order.fee_currency != base:
+        return quantidade, order.fee
+    no_saldo = quantidade - order.fee if side is Side.BUY else quantidade + order.fee
+    return no_saldo, order.fee * preco
 
 
 @dataclass
@@ -228,42 +269,49 @@ class BacktestEngine:
                     else:
                         motivo, saida = None, None
                     if motivo is not None:
-                        exit_order = await broker.place_order(
-                            OrderRequest(
-                                client_order_id=f"bt-{motivo}-{index}",
-                                signal_id=None,
-                                risk_event_id=f"protecao-{index}",
-                                exchange=ExchangeName.PAPER,
-                                symbol=result.symbol,
-                                side=Side.SELL,
-                                order_type=OrderType.LIMIT,
-                                price=saida,
-                                quantity=held_now,
-                                notional=held_now * saida,
-                                strategy=self.strategy.name,
-                            )
+                        pedido_de_saida = OrderRequest(
+                            client_order_id=f"bt-{motivo}-{index}",
+                            signal_id=None,
+                            risk_event_id=f"protecao-{index}",
+                            exchange=ExchangeName.PAPER,
+                            symbol=result.symbol,
+                            side=Side.SELL,
+                            order_type=OrderType.LIMIT,
+                            price=saida,
+                            quantity=held_now,
+                            notional=held_now * saida,
+                            strategy=self.strategy.name,
+                        )
+                        exit_order = await preenchimento(
+                            broker.place_order(pedido_de_saida), pedido_de_saida
                         )
                         if exit_order.status is OrderStatus.FILLED:
                             preco = exit_order.average_price or saida
                             medio = cost_basis / held_now if held_now > 0 else Decimal(0)
+                            # O papel trunca ao passo do par: o vendido pode ser
+                            # menor que o saldo, e a sobra (poeira) fica com o
+                            # custo dela e sem protecao -- como no live.
+                            vendido, taxa = liquido_e_taxa(exit_order, Side.SELL, base, preco)
                             result.trades.append(
                                 BacktestTrade(
                                     timestamp=current.open_time,
                                     side=str(Side.SELL),
-                                    quantity=held_now,
+                                    quantity=exit_order.filled_quantity,
                                     price=preco,
-                                    notional=held_now * preco,
-                                    fee=exit_order.fee,
+                                    notional=exit_order.filled_quantity * preco,
+                                    fee=taxa,
                                     reason=f"protecao: {motivo}",
                                     realized_pnl=(
-                                        held_now * preco - exit_order.fee - held_now * medio
+                                        exit_order.filled_quantity * preco
+                                        - taxa
+                                        - vendido * medio
                                     ),
                                     exit_reason=motivo,
                                 )
                             )
                             result.exits[motivo] += 1
-                            cost_basis = Decimal(0)
-                            held = Decimal(0)
+                            held = max(Decimal(0), held_now - vendido)
+                            cost_basis = held * medio
                             protection = None
                             last_order_at[result.symbol] = current.open_time
 
@@ -307,17 +355,20 @@ class BacktestEngine:
                         take_profit=assessment.take_profit,
                         strategy=self.strategy.name,
                     )
-                    order_result = await broker.place_order(request)
+                    order_result = await preenchimento(broker.place_order(request), request)
 
                     if order_result.status is OrderStatus.FILLED:
                         fill_price = order_result.average_price or price
                         quantity = order_result.filled_quantity
+                        no_saldo, taxa = liquido_e_taxa(order_result, side, base, fill_price)
                         last_order_at[signal.symbol] = current.open_time
 
                         realized: Decimal | None = None
                         if side is Side.BUY:
-                            cost_basis += quantity * fill_price + order_result.fee
-                            held += quantity
+                            # Taxa no ativo recebido: a posicao entra liquida e o
+                            # custo e o bruto pago (a taxa fica embutida no medio).
+                            cost_basis += no_saldo * fill_price + taxa
+                            held += no_saldo
                             # Niveis sobre o preco medio: protegem a posicao,
                             # nao o lote. Ver `portfolio.py`.
                             medio_compra = cost_basis / held if held > 0 else fill_price
@@ -330,10 +381,10 @@ class BacktestEngine:
                         else:
                             average_cost = (cost_basis / held) if held > 0 else Decimal(0)
                             realized = (
-                                quantity * fill_price - order_result.fee - quantity * average_cost
+                                quantity * fill_price - taxa - no_saldo * average_cost
                             )
-                            cost_basis -= quantity * average_cost
-                            held -= quantity
+                            cost_basis -= no_saldo * average_cost
+                            held -= no_saldo
                             result.exits["estrategia"] += 1
                             if held <= 0:
                                 protection = None
@@ -345,7 +396,7 @@ class BacktestEngine:
                                 quantity=quantity,
                                 price=fill_price,
                                 notional=quantity * fill_price,
-                                fee=order_result.fee,
+                                fee=taxa,
                                 reason=signal.reason,
                                 realized_pnl=realized,
                                 exit_reason="estrategia" if side is Side.SELL else None,

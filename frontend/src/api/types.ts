@@ -39,9 +39,43 @@ export interface PortfolioSummary {
   trades_today: number
 }
 
+/** Ultimo retrato de uma faixa de tempo (o "fechamento" dela). */
 export interface EquityPoint {
   timestamp: string
   total_value: Money
+  cash_value?: Money | null
+  positions_value?: Money | null
+  realized_pnl?: Money | null
+  unrealized_pnl?: Money | null
+  allocations?: Record<string, number>
+}
+
+export interface ResultadoDoPar {
+  simbolo: string
+  moeda: string
+  realizado: Money
+  vendas: number
+  ganhos: number
+  perdas: number
+  compras: number
+  taxas: Money
+  vendas_sem_base: number
+}
+
+export interface AnalisePortfolio {
+  inicio: string
+  fim: string
+  moeda: string
+  modo: string
+  /** Um por dia UTC, desde o dia anterior ao inicio (base do 1o retorno). */
+  fechamentos_diarios: EquityPoint[]
+  benchmark: { simbolo: string; fechamentos: { timestamp: string; close: Money }[] } | null
+  pares: ResultadoDoPar[]
+  risco: {
+    aprovadas: number
+    rejeitadas: number
+    motivos: { motivo: string; total: number; exemplo: string }[]
+  }
 }
 
 export interface Trade {

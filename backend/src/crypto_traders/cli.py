@@ -3,14 +3,18 @@
     crypto-traders check                      diagnostico do ambiente
     crypto-traders backtest --symbol BTC/USDT valida uma estrategia
     crypto-traders run                        sobe agentes + API
+    crypto-traders migrar                     cria schema e gatilhos (usuario dono)
+    crypto-traders copiar-sqlite ARQUIVO      leva o historico do SQLite ao Postgres
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 from decimal import Decimal
+from pathlib import Path
 
 from .config import get_settings
 from .db.session import init_db, session_scope
@@ -50,7 +54,38 @@ def main(argv: list[str] | None = None) -> int:
     run = subparsers.add_parser("run", help="Sobe os agentes e a API")
     run.add_argument("--no-api", action="store_true", help="Sobe apenas os agentes")
 
+    migrar = subparsers.add_parser(
+        "migrar", help="Cria o schema e os gatilhos append-only (com o usuario dono do banco)"
+    )
+    migrar.add_argument(
+        "--usuario-aplicacao",
+        default=None,
+        help="Postgres: usuario da aplicacao que recebe so leitura e escrita de linhas",
+    )
+
+    copiar = subparsers.add_parser(
+        "copiar-sqlite", help="Copia o historico de um SQLite para o banco de DATABASE_URL (vazio)"
+    )
+    copiar.add_argument("arquivo", type=Path, help="Arquivo .db de origem (aberto so leitura)")
+
+    ensaio = subparsers.add_parser(
+        "ensaio-testnet",
+        help="Compra, venda e recusa reais na Binance Spot Testnet (chave BINANCE_TESTNET__*)",
+    )
+    ensaio.add_argument("--par", default="BTC/USDT", help="Par da testnet, ex.: BTC/USDT")
+    ensaio.add_argument(
+        "--valor", type=Decimal, default=Decimal(20), help="Valor da compra na moeda de cotacao"
+    )
+
     args = parser.parse_args(argv)
+    try:
+        cmdline = Path("/proc/1/cmdline").read_bytes()
+    except OSError:
+        cmdline = None
+    recusa = recusa_no_conteiner_do_sistema(args.command, cmdline, os.getpid())
+    if recusa:
+        print(recusa, file=sys.stderr)
+        return 2
     settings = get_settings()
     configure_logging(settings.log_level, settings.log_json)
 
@@ -62,10 +97,99 @@ def main(argv: list[str] | None = None) -> int:
         from .runtime import run_system
 
         return asyncio.run(run_system(with_api=not args.no_api))
+    if args.command == "migrar":
+        return asyncio.run(_migrar(settings, args.usuario_aplicacao))
+    if args.command == "copiar-sqlite":
+        return asyncio.run(_copiar_sqlite(settings, args.arquivo))
+    if args.command == "ensaio-testnet":
+        from .ensaio_testnet import ensaiar, imprimir
+
+        relatorio = asyncio.run(ensaiar(settings, args.par, args.valor))
+        imprimir(relatorio)
+        return 0 if relatorio.ok else 1
     return 1
 
 
 # ---------------------------------------------------------------------------
+async def _migrar(settings, usuario_aplicacao: str | None) -> int:
+    """Schema, gatilhos e privilegios. Roda e sai, antes do `run` (Docker).
+
+    No Postgres, quem roda isto e o DONO do banco; a aplicacao roda com
+    `usuario_aplicacao`, que recebe SELECT/INSERT/UPDATE/DELETE nas tabelas e uso
+    das sequencias -- e nada de TRIGGER nem CREATE, entao nao derruba a propria
+    trilha append-only (`db.models.conceder_a_aplicacao`).
+    """
+    from .db.session import dispose_engine
+
+    try:
+        await init_db(settings, migrar=True, usuario_aplicacao=usuario_aplicacao)
+    except Exception as exc:
+        log.error("migrar.falhou", error=str(exc))
+        return 1
+    finally:
+        await dispose_engine()
+    print("migrar: schema e gatilhos prontos")
+    return 0
+
+
+async def _copiar_sqlite(settings, arquivo: Path) -> int:
+    from .db.copia import copiar_sqlite_para
+    from .db.session import dispose_engine, get_engine
+
+    try:
+        copiadas = await copiar_sqlite_para(get_engine(settings), arquivo)
+    except Exception as exc:
+        log.error("copia.falhou", error=str(exc))
+        print(f"copia recusada: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        await dispose_engine()
+    largura = max(len(nome) for nome in copiadas)
+    for nome, linhas in copiadas.items():
+        print(f"  {nome:<{largura}}  {linhas:>9}")
+    print(f"copia concluida: {sum(copiadas.values())} linhas em {len(copiadas)} tabelas")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+def dividindo_conteiner_com_o_sistema(cmdline_pid1: bytes | None, meu_pid: int) -> bool:
+    """Este processo esta DENTRO do conteiner em que o sistema opera?
+
+    O `check` carrega o catalogo inteiro de mercados da exchange (~200 MB). Rodado
+    com `docker exec` no conteiner do sistema, ele divide os 512 MB do conteiner e
+    o kernel mata o conteiner INTEIRO -- medido em 04/11/2026: o sistema caiu e
+    reiniciou. Em producao, isso e o processo que executa o stop caindo. A pista e
+    o PID 1: no conteiner do sistema ele e o `crypto-traders run`.
+    """
+    if not cmdline_pid1 or meu_pid == 1:
+        return False
+    partes = [p for p in cmdline_pid1.split(b"\x00") if p]
+    return b"crypto-traders" in b" ".join(partes) and b"run" in partes
+
+
+#: Comandos que carregam o catalogo da exchange ou copiam o banco inteiro: nunca
+#: dentro do conteiner do sistema. `run` e o proprio sistema; `migrar` roda no
+#: conteiner dele, antes do sistema subir.
+COMANDOS_PESADOS = frozenset({"check", "backtest", "ensaio-testnet", "copiar-sqlite"})
+
+
+def recusa_no_conteiner_do_sistema(
+    comando: str, cmdline_pid1: bytes | None, meu_pid: int
+) -> str | None:
+    """Mensagem de recusa, ou None quando o comando pode rodar aqui."""
+    if comando not in COMANDOS_PESADOS:
+        return None
+    if not dividindo_conteiner_com_o_sistema(cmdline_pid1, meu_pid):
+        return None
+    return (
+        f"{comando} recusado: este conteiner e o do sistema em operacao, e o comando\n"
+        "dividiria a memoria dele (o conteiner inteiro ja foi morto assim pelo check).\n"
+        "Rode num conteiner proprio:\n"
+        f"  desenvolvimento: docker compose run --rm --no-deps crypto crypto-traders {comando}\n"
+        "  producao (check): implantacao/producao/diagnostico.sh"
+    )
+
+
 async def _check(settings) -> int:
     """Diagnostico: o que esta configurado, e o que ainda falta."""
     print("=" * 68)
@@ -247,7 +371,11 @@ async def _load_business_config(settings) -> None:
         settings.with_business_config(trading, risk)
     except Exception as exc:
         print(f"\n  Configuracao de negocio : FALHOU ao ler do banco — {exc}")
-        print("    Seguindo com os padroes conservadores do codigo.")
+        # Os padroes do codigo NAO sao conservadores (USDT, 15m, duas estrategias),
+        # e o `run` recusa subir nesse estado desde 09/11/2026. O diagnostico
+        # segue so para mostrar o resto, e diz isso.
+        print("    O sistema NAO sobe assim: corrija a configuracao gravada antes do `run`.")
+        print("    (o restante deste diagnostico usa os padroes do codigo, so para referencia)")
         return
 
     origem = "banco" if existia else "padroes de fabrica (linha criada agora)"

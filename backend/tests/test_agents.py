@@ -608,6 +608,9 @@ class TestCircuitBreakerDePontaAPonta:
         def __init__(self, precos: dict[str, Decimal]) -> None:
             self.latest_prices = dict(precos)
 
+        def precos_para_avaliacao(self) -> dict[str, Decimal]:
+            return dict(self.latest_prices)
+
         def pause(self) -> None:
             return None
 

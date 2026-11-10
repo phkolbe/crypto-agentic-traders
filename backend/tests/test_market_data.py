@@ -403,7 +403,9 @@ class TestPublicacaoUnica:
         await agente.refresh()
 
         topicos = {t for t, _ in bus.publicados}
-        assert topicos == {Topics.CANDLES}
+        # Alerta (preco corrente ausente) e permitido; pedido de ordem e sinal, nunca.
+        assert topicos <= {Topics.CANDLES, Topics.ALERTS}
+        assert Topics.CANDLES in topicos
         assert Topics.ORDER_REQUESTS not in topicos
         assert Topics.SIGNALS not in topicos
 

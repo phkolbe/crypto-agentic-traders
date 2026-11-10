@@ -261,7 +261,11 @@ class TestPerdaDeMensagem:
             await subida_original()
 
         agente.start = sobe_publicando_no_meio
+        # Travado ha uma hora: sem batida E sem subida recente. Recuar so a batida
+        # deixava um agente que acabou de subir parecer travado -- a regra que
+        # reiniciava em laco o agente recem-reiniciado (corrigida em 04/11/2026).
         agente.last_beat = datetime.now(UTC) - timedelta(hours=1)
+        agente.started_at = datetime.now(UTC) - timedelta(hours=1)
 
         await orquestrador._check_health_once()
         await asyncio.sleep(0.2)
@@ -579,6 +583,9 @@ class _FalsoMarketData:
     def __init__(self) -> None:
         self.active_symbols = ["BTC/USDT"]
         self.latest_prices: dict = {}
+
+    def precos_para_avaliacao(self) -> dict:
+        return dict(self.latest_prices)
 
 
 class _FalsaStrategy:
@@ -1808,3 +1815,463 @@ async def _geradora_vazia():
     """Gerador que termina de imediato, sem levantar nada."""
     return
     yield  # pragma: no cover - inalcancavel, so marca a funcao como geradora
+
+
+# ---------------------------------------------------------------------------
+# P0 #8 -- retomar um agente desistido tem que retoma-lo de verdade
+# ---------------------------------------------------------------------------
+async def _desistir_de_verdade(orquestrador, nome: str, agente) -> None:
+    """Leva o agente a desistencia pelo caminho real do watchdog.
+
+    `_restart_agent` reinicia ANTES de desistir, entao o agente desistido fica
+    quase sempre com a tarefa VIVA -- o caso que `_given_up.add(...)` na mao
+    nao exercia.
+    """
+    agora = datetime.now(UTC)
+    for _ in range(orch_mod.MAX_RESTART_ATTEMPTS):
+        await orquestrador._restart_agent(nome, agente, crashed=False, stale=True, now=agora)
+    assert nome in orquestrador._given_up
+    assert agente.is_running, "o cenario do relatorio e o desistido com a tarefa viva"
+
+
+class TestRetomarODesistido:
+    """Achado H1 da orquestracao (P0 #8).
+
+    Medido no codigo anterior: o watchdog desiste da execucao logo depois de um
+    `restart()` bem-sucedido, o operador clica em "retomar", a rota responde 200
+    e `_given_up` continua com `execution` (so era limpo com a tarefa morta). A
+    cada snapshot `_execution_unavailable` dizia "o watchdog desistiu" e o
+    stop-loss NAO rodava, com o agente saudavel, ate reiniciar o processo.
+    """
+
+    async def test_retomar_a_execucao_desistida_devolve_o_stop(
+        self, settings, relogio_apertado
+    ):
+        from crypto_traders.db.repositories import OrderRepository
+
+        bus = InMemoryEventBus()
+        await bus.start()
+        _, execucao, orquestrador = await _bancada_execucao(settings, bus)
+        await execucao.start()
+        await asyncio.sleep(0.05)
+        await _desistir_de_verdade(orquestrador, "execution", execucao)
+
+        assert await orquestrador.resume_agent("execution", actor="user")
+
+        assert "execution" not in orquestrador._given_up, (
+            "o operador retomou e o agente continuou desistido"
+        )
+        assert orquestrador._execution_unavailable() is None
+        assert execucao.openings_blocked is None, (
+            "retomar a execucao (sem circuit breaker) tem que soltar a abertura"
+        )
+
+        await orquestrador._on_snapshot(_snapshot_com_stop_rompido())
+        await asyncio.sleep(0.5)
+        async with session_scope(settings) as session:
+            ordens = await OrderRepository(session).list()
+        await execucao.stop()
+
+        assert [o for o in ordens if o.side == "sell"], (
+            "a execucao retomada nao voltou a executar o stop-loss"
+        )
+
+    async def test_retomar_tudo_reabilita_os_desistidos_e_o_watchdog_volta_a_vigiar(
+        self, settings, relogio_apertado
+    ):
+        bus = InMemoryEventBus()
+        await bus.start()
+        agente = AgenteDeEvento(bus)
+        orquestrador = BancadaOrquestrador(settings, {"consumidor": agente}, bus)
+        await agente.start()
+        await asyncio.sleep(0.05)
+        await _desistir_de_verdade(orquestrador, "consumidor", agente)
+
+        await orquestrador.resume_all(actor="user")
+        assert "consumidor" not in orquestrador._given_up
+
+        # Volta a ser vigiado: travado de novo, o watchdog reinicia.
+        antes = agente.restarts
+        agente.last_beat = datetime.now(UTC) - timedelta(hours=1)
+        agente.started_at = agente.last_beat
+        await orquestrador._check_health_once()
+        await agente.stop()
+
+        assert agente.restarts == antes + 1, "o watchdog seguiu ignorando o agente retomado"
+
+    async def test_retomar_agente_em_erro_com_a_tarefa_viva_o_reinicia(
+        self, settings, relogio_apertado
+    ):
+        """`resume()` sobrescrevia ERROR por RUNNING: o dashboard ficava verde
+        com o agente quebrado, e o watchdog deixava de ve-lo como falha."""
+        bus = InMemoryEventBus()
+        await bus.start()
+        agente = AgenteDeEvento(bus)
+        orquestrador = BancadaOrquestrador(settings, {"consumidor": agente}, bus)
+        await agente.start()
+        await asyncio.sleep(0.05)
+        agente.state = AgentState.ERROR
+        agente.last_error = "tarefa interna morreu"
+        antes = agente.restarts
+
+        assert await orquestrador.resume_agent("consumidor")
+        await agente.stop()
+
+        assert agente.restarts == antes + 1
+
+
+# ---------------------------------------------------------------------------
+# P0 #9 -- alerta do primeiro retrato chega ao operador
+# ---------------------------------------------------------------------------
+class TestAlertasDaSubida:
+    """Achado H2 da orquestracao (P0 #9).
+
+    O primeiro `_on_snapshot` roda dentro de `_prime_portfolio`, e o assinante
+    de ALERTS so era criado depois. O bus em memoria sem assinante descarta, e
+    a flag de episodio (`_sizing_alerted`) ja ficava armada: com 22 USDC na
+    conta o sistema subia verde rejeitando todo sinal, e o aviso NUNCA saia.
+    """
+
+    async def test_alerta_emitido_no_primeiro_retrato_chega_ao_canal(self, tmp_path):
+        from crypto_traders.config import RiskSettings, Settings, TradingSettings
+        from crypto_traders.db.session import dispose_engine
+        from crypto_traders.simulacao import AgenteDeCenario, MercadoSimulado
+
+        await dispose_engine()
+        settings = Settings(
+            database_url=f"sqlite+aiosqlite:///{(tmp_path / 'subida.db').as_posix()}",
+            trading=TradingSettings(
+                symbols=["BTC/USDT"],
+                timeframe="1d",
+                strategies=["ma_crossover"],
+                quote_currency="USDT",
+                candle_history_limit=100,
+                market_data_interval_seconds=3600,
+                portfolio_interval_seconds=3600,
+                paper_initial_balance=Decimal("22"),
+            ),
+            risk=RiskSettings(
+                max_order_notional=Decimal("100"),
+                max_order_pct_portfolio=0.10,
+                max_asset_exposure_pct=0.50,
+                min_order_notional=Decimal("10"),
+                asset_whitelist=["BTC", "USDT"],
+                symbol_whitelist=["BTC/USDT"],
+            ),
+        )
+        mercado = MercadoSimulado(timeframe="1d")
+        mercado.adicionar_par("BTC/USDT", [Decimal(50000 + 10 * i) for i in range(61)])
+        cenario = AgenteDeCenario(settings, mercado)
+
+        entregues: list[tuple[str, str]] = []
+
+        class CanalDeTeste:
+            async def send(self, titulo, mensagem):
+                entregues.append((titulo, mensagem))
+                return []
+
+        cenario.orquestrador.notifier = CanalDeTeste()
+        await cenario.iniciar()
+        try:
+            await asyncio.sleep(0.1)
+            publicados = cenario.alertas_do_tipo("sizing_infeasible")
+        finally:
+            await cenario.encerrar()
+
+        assert publicados, "o cenario depende do aviso de dimensionamento na subida"
+        titulo = publicados[0]["title"]
+        assert titulo in [t for t, _ in entregues], (
+            f"o alerta do primeiro retrato foi publicado e nao chegou ao canal: {entregues}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# P0 #11 -- a vitalidade que a sonda do conteiner consulta
+# ---------------------------------------------------------------------------
+class TestVitalidade:
+    """`vitalidade()` e o que a sonda de saude do conteiner pergunta.
+
+    A sonda antiga provava so que o objeto orquestrador existia. Aqui cada
+    estado que deixa o stop parado tem que aparecer como problema -- e a pausa
+    do operador, que nao e falha, nao.
+    """
+
+    async def _sistema(self, settings):
+        bus = InMemoryEventBus()
+        await bus.start()
+        agentes = {nome: AgenteDeEvento(bus) for nome in orch_mod.AGENTES_CRITICOS}
+        orquestrador = BancadaOrquestrador(settings, agentes, bus)
+        for agente in agentes.values():
+            await agente.start()
+
+        async def para_sempre() -> None:
+            await asyncio.Event().wait()
+
+        orquestrador._watchdog = asyncio.create_task(para_sempre())
+        orquestrador._alert_listener = asyncio.create_task(para_sempre())
+        orquestrador._watchdog_ultimo_ciclo = orch_mod.time.monotonic()
+        await asyncio.sleep(0.05)
+        return orquestrador, agentes
+
+    async def _desmontar(self, orquestrador, agentes):
+        for tarefa in (orquestrador._watchdog, orquestrador._alert_listener):
+            if tarefa is not None:
+                tarefa.cancel()
+        for agente in agentes.values():
+            await agente.stop()
+
+    async def test_sistema_de_pe_e_saudavel(self, settings, relogio_apertado):
+        orquestrador, agentes = await self._sistema(settings)
+        try:
+            assert orquestrador.vitalidade() == []
+        finally:
+            await self._desmontar(orquestrador, agentes)
+
+    async def test_agente_critico_sem_batida_e_problema(self, settings, relogio_apertado):
+        orquestrador, agentes = await self._sistema(settings)
+        try:
+            velho = datetime.now(UTC) - timedelta(hours=1)
+            agentes["execution"].last_beat = velho
+            agentes["execution"].started_at = velho
+            problemas = orquestrador.vitalidade()
+        finally:
+            await self._desmontar(orquestrador, agentes)
+        assert any(p.startswith("execution") for p in problemas), problemas
+
+    async def test_agente_critico_morto_ou_desistido_e_problema(
+        self, settings, relogio_apertado
+    ):
+        orquestrador, agentes = await self._sistema(settings)
+        try:
+            await agentes["portfolio"]._cancel_task()
+            orquestrador._given_up.add("market_data")
+            problemas = orquestrador.vitalidade()
+        finally:
+            await self._desmontar(orquestrador, agentes)
+        assert any(p.startswith("portfolio") for p in problemas), problemas
+        assert any(p.startswith("market_data") for p in problemas), problemas
+
+    async def test_laco_do_watchdog_parado_e_problema(self, settings, relogio_apertado):
+        orquestrador, agentes = await self._sistema(settings)
+        try:
+            orquestrador._watchdog_ultimo_ciclo = orch_mod.time.monotonic() - 3600
+            problemas = orquestrador.vitalidade()
+        finally:
+            await self._desmontar(orquestrador, agentes)
+        assert any("watchdog" in p for p in problemas), (
+            "watchdog vivo e pendurado parecia saudavel"
+        )
+
+    async def test_pausa_do_operador_nao_e_problema(self, settings, relogio_apertado):
+        """Reiniciar o conteiner por causa de uma pausa desfaria o pedido."""
+        orquestrador, agentes = await self._sistema(settings)
+        try:
+            agentes["risk_manager"].pause()
+            velho = datetime.now(UTC) - timedelta(hours=1)
+            agentes["risk_manager"].last_beat = velho
+            assert orquestrador.vitalidade() == []
+        finally:
+            await self._desmontar(orquestrador, agentes)
+
+    async def test_o_ciclo_do_watchdog_marca_que_o_laco_anda(
+        self, settings, relogio_apertado, monkeypatch
+    ):
+        monkeypatch.setattr(orch_mod, "WATCHDOG_INTERVAL_SECONDS", 0.01)
+        bus = InMemoryEventBus()
+        await bus.start()
+        orquestrador = BancadaOrquestrador(settings, {}, bus)
+        tarefa = asyncio.create_task(orquestrador._watch_health())
+        await asyncio.sleep(0.1)
+        tarefa.cancel()
+        assert orquestrador._watchdog_ultimo_ciclo is not None
+
+
+# ---------------------------------------------------------------------------
+# M3 da orquestracao -- um so `crypto-traders run` por banco
+# ---------------------------------------------------------------------------
+class _ResultadoFalso:
+    def __init__(self, valor):
+        self._valor = valor
+
+    def scalar(self):
+        return self._valor
+
+
+class _ConexaoFalsa:
+    def __init__(self, livre: bool) -> None:
+        self.livre = livre
+        self.sql: list[str] = []
+        self.fechada = False
+        self.invalidada = False
+
+    async def execute(self, clausula, parametros=None):
+        self.sql.append(str(clausula))
+        return _ResultadoFalso(self.livre if "try_advisory" in str(clausula) else True)
+
+    async def commit(self):
+        return None
+
+    async def invalidate(self):
+        self.invalidada = True
+
+    async def close(self):
+        self.fechada = True
+
+
+class _MotorPostgresFalso:
+    """So o que a trava usa do engine: o dialeto e uma conexao dedicada."""
+
+    def __init__(self, livre: bool) -> None:
+        self.conexao = _ConexaoFalsa(livre)
+        self.dialect = type("Dialeto", (), {"name": "postgresql"})()
+
+    async def connect(self):
+        return self.conexao
+
+
+class TestInstanciaUnica:
+    """Dois `crypto-traders run` contra o mesmo banco sao duas execucoes.
+
+    `docker compose run --rm crypto crypto-traders run` com o contêiner do
+    sistema de pe sobe um segundo orquestrador: os dois avaliam o mesmo
+    snapshot e emitem compra e protecao em dobro (o `client_order_id` e por
+    instancia, o UNIQUE nao pega). E a subida da segunda grava `system_started`
+    e confunde a deteccao de morte da primeira.
+    """
+
+    async def test_segunda_instancia_recusa_subir_sem_escrever_nada(
+        self, settings, monkeypatch
+    ):
+        motor = _MotorPostgresFalso(livre=False)
+        monkeypatch.setattr(orch_mod, "get_engine", lambda _settings=None: motor)
+        segunda = Orchestrator(settings)
+
+        with pytest.raises(orch_mod.InstanciaDuplicada):
+            await segunda.start()
+        # O que o runtime faz quando a subida falha.
+        await segunda.stop()
+
+        async with session_scope(settings) as session:
+            acoes = [r.action for r in await AuditLogRepository(session).list(limit=20)]
+        assert "system_started" not in acoes
+        assert "system_stopped" not in acoes, (
+            "a recusa gravou uma parada 'limpa' por cima da execucao que esta de pe"
+        )
+        assert motor.conexao.fechada
+
+    async def test_a_trava_e_mantida_e_solta_no_desligamento(self, settings, monkeypatch):
+        motor = _MotorPostgresFalso(livre=True)
+        monkeypatch.setattr(orch_mod, "get_engine", lambda _settings=None: motor)
+        orquestrador = Orchestrator(settings)
+
+        await orquestrador._tomar_instancia_unica()
+        assert not motor.conexao.fechada, "a trava de sessao morre com a conexao"
+        await orquestrador._soltar_instancia_unica()
+
+        assert any("advisory_unlock" in sql for sql in motor.conexao.sql)
+        # De volta ao pool a sessao (e a trava) sobreviveria: a conexao e descartada.
+        assert motor.conexao.invalidada
+
+    async def test_sqlite_nao_usa_a_trava(self, settings):
+        orquestrador = Orchestrator(settings)
+        await orquestrador._tomar_instancia_unica()
+        assert orquestrador._conexao_da_trava is None
+
+
+@pytest.mark.skipif(
+    not __import__("os").getenv("POSTGRES_TEST_URL"), reason="POSTGRES_TEST_URL nao definida"
+)
+async def test_postgres_real_recusa_a_segunda_instancia():
+    import os
+
+    from crypto_traders.config import Settings
+    from crypto_traders.db.session import dispose_engine
+
+    await dispose_engine()
+    configurado = Settings(database_url=os.environ["POSTGRES_TEST_URL"])
+    primeira, segunda = Orchestrator(configurado), Orchestrator(configurado)
+    await primeira._tomar_instancia_unica()
+    try:
+        with pytest.raises(orch_mod.InstanciaDuplicada):
+            await segunda._tomar_instancia_unica()
+    finally:
+        await primeira._soltar_instancia_unica()
+    # Solta de verdade: agora a segunda sobe.
+    await segunda._tomar_instancia_unica()
+    await segunda._soltar_instancia_unica()
+    await dispose_engine()
+
+
+# ---------------------------------------------------------------------------
+# M1 da orquestracao -- a parada drena o que esta em voo, com prazo
+# ---------------------------------------------------------------------------
+class TestParadaDrena:
+    """`stop()` cancelava na hora o evento em processamento.
+
+    Medido no codigo anterior: `docker stop` no meio do `place_order` levava o
+    `CancelledError` por cima do `except Exception` da execucao, a ordem ficava
+    PENDING sem o alerta de "desfecho desconhecido", nenhuma linha
+    `agent.event_lost_*` saia (o registro so existia no restart) e o audit_log
+    dizia "desligamento solicitado" -- enquanto o docstring do runtime prometia
+    que os agentes terminam o ciclo corrente antes de parar.
+    """
+
+    async def _em_voo(self, settings):
+        bus = InMemoryEventBus()
+        await bus.start()
+        trava = asyncio.Event()
+        agente = AgenteDeEvento(bus, trava=trava)
+        await agente.start()
+        await asyncio.sleep(0.05)
+        await bus.publish(Topics.CANDLES, make_candles([100.0])[0])
+        await asyncio.sleep(0.05)
+        assert agente.recebidos, "o cenario depende do evento em processamento"
+        return bus, agente, trava
+
+    async def test_o_evento_em_processamento_termina_antes_da_parada(self, settings):
+        _, agente, trava = await self._em_voo(settings)
+        caixa = agente._inboxes[Topics.CANDLES]
+
+        parada = asyncio.create_task(agente.stop())
+        await asyncio.sleep(0.1)
+        assert not parada.done(), "a parada cancelou o evento no meio em vez de drenar"
+        trava.set()
+        await asyncio.wait_for(parada, timeout=5)
+
+        assert agente.lost_events == 0
+        assert caixa.handled == 1, "o evento em voo nao chegou ao fim"
+        assert agente.deixados_na_parada == []
+
+    async def test_passado_o_prazo_cancela_e_registra_o_que_ficou(
+        self, settings, monkeypatch
+    ):
+        monkeypatch.setattr(base_mod, "PRAZO_DRENAGEM_SEGUNDOS", 0.2)
+        bus, agente, _ = await self._em_voo(settings)
+        await bus.publish(Topics.CANDLES, make_candles([100.0, 101.0])[1])
+        await asyncio.sleep(0.05)
+
+        await asyncio.wait_for(agente.stop(), timeout=5)
+
+        assert agente.lost_events == 1
+        assert any("candles" in d for d in agente.deixados_na_parada), (
+            agente.deixados_na_parada
+        )
+        assert any("pendente" in d for d in agente.deixados_na_parada), (
+            "o pedido que ficou na fila sumia sem contagem"
+        )
+
+    async def test_a_parada_do_sistema_registra_o_que_ficou_no_audit_log(
+        self, settings, monkeypatch
+    ):
+        monkeypatch.setattr(base_mod, "PRAZO_DRENAGEM_SEGUNDOS", 0.2)
+        bus, agente, _ = await self._em_voo(settings)
+        orquestrador = BancadaOrquestrador(settings, {"consumidor": agente}, bus)
+
+        await asyncio.wait_for(orquestrador.stop(), timeout=5)
+
+        async with session_scope(settings) as session:
+            registros = await AuditLogRepository(session).list(limit=10)
+        parada = next(r for r in registros if r.action == "system_stopped")
+        assert parada.after and parada.after.get("deixados_na_parada"), (
+            "a parada se declarava limpa com um evento cortado no meio"
+        )

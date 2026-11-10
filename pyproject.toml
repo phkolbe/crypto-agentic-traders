@@ -23,6 +23,10 @@ dependencies = [
     "httpx>=0.28",
     "python-dotenv>=1.0",
     "websockets>=14.0",
+    "opentelemetry-sdk>=1.30",
+    "opentelemetry-exporter-otlp-proto-http>=1.30",
+    "opentelemetry-instrumentation-fastapi>=0.60b0",
+    "opentelemetry-instrumentation-sqlalchemy>=0.60b0",
 ]
 
 [project.optional-dependencies]
@@ -52,6 +56,9 @@ testpaths = ["backend/tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 filterwarnings = ["ignore::DeprecationWarning"]
+markers = [
+    "cenario: sistema real contra o mercado simulado (crypto_traders.simulacao); roda na suite padrao",
+]
 
 [tool.coverage.run]
 source = ["backend/src/crypto_traders"]

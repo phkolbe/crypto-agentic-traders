@@ -72,6 +72,11 @@ como causa provável nesse código, mas não em `-2014` (formato da chave) nem e
 `-1022` (assinatura), que são problemas da credencial e mandariam investigar o
 lugar errado.
 
+O `-2015` é reconhecido **pelo código**, não só pela classe de erro do ccxt
+(auditoria de 09/11/2026): no ccxt 4.5.78, depois da primeira chamada autenticada
+que deu certo, ele chega como `DDoSProtection` — que era tratado como limite de
+taxa, retentado três vezes e registrado como falha comum, sem o alerta acima.
+
 **A solução real é um IP de saída estável**: VPN pessoal com *exit node*
 (Tailscale), IP fixo contratado, ou rodar numa VPS. Whitelist do bloco inteiro do
 provedor não serve — autoriza milhares de clientes e esvazia a proteção.
@@ -244,7 +249,18 @@ que a compra está barrada.
 ## 3. Execução
 
 - **Idempotência**: cada ordem tem um `client_order_id` único, com constraint
-  `UNIQUE` no banco e enviado à exchange. Um retry de rede não vira ordem dupla.
+  `UNIQUE` no banco e enviado à exchange. **O `clientOrderId` sozinho não impede a
+  ordem dupla**: na Binance ele é único só entre ordens *abertas*, e uma MARKET
+  preenche na hora. Até 09/11/2026 o envio passava pelo mesmo retry das leituras, e
+  um timeout depois de a Binance aceitar reenviava a ordem — a segunda compra
+  preenchia de novo. Hoje o envio **não é reenviado às cegas**: em desfecho incerto
+  (timeout, `-1006`, 5xx, conexão caída) o adaptador consulta a ordem pelo
+  `clientOrderId`; achou, registra o estado real; não achou ou não conseguiu
+  consultar, a ordem fica `PENDING` com o alerta *desfecho desconhecido* e
+  **não** é reenviada. Só se reenvia o que a Binance recusou na porta sem processar
+  (429/418, e `-1021` depois de ressincronizar o relógio). Prova:
+  `tests/test_ordem_real_binance.py`, contra uma Binance dublada que deduplica só
+  ordens abertas.
 - **Grava antes de enviar**: a ordem nasce `PENDING` no banco *antes* da chamada
   à exchange. Se o processo morrer no meio, resta o rastro para reconciliar — em
   vez de uma ordem existindo na exchange e em lugar nenhum aqui.
@@ -373,6 +389,11 @@ Dois furos medidos, e a correção de cada um:
 passava pelo contrato do repositório e pelo gatilho de `UPDATE`. Hoje há gatilho
 no banco, não só disciplina no repositório: `audit_log` recusa `UPDATE` e
 `DELETE`, e `trades` recusa `UPDATE` e só aceita `DELETE` de lançamento manual.
+Lançar e excluir mexem no preço médio, e portanto no stop: desde 09/11/2026 os dois
+exigem `confirm` (a tela pede confirmação antes), o lançamento é conferido contra o
+preço corrente do par (fora de ±20% devolve 409 e só passa com o campo explícito
+`aceitar_preco_fora_do_mercado`), a data precisa de fuso e não pode estar no
+futuro, e a exclusão guarda no `audit_log` o lançamento inteiro.
 
 **2. A barreira que protegia os gatilhos era regex sobre o texto do comando** — e
 regex perde essa corrida sempre, porque a próxima grafia sempre existe. Medido,
@@ -524,7 +545,11 @@ comparação de qualidade.
 **fechamentos primeiro** (fechar libera caixa e vaga, e travar a saída é a
 armadilha que o sistema evita em todas as camadas) e depois as **aberturas por
 confiança decrescente**, simulando cada aprovação para que a próxima veja o
-caixa já consumido.
+caixa já consumido. **Entre lotes** — e com a janela em 0, o padrão, cada sinal é
+um lote — o Risk Manager reserva as compras que publicou até o retrato da carteira
+mostrá-las (ou a ordem terminar sem preencher). Até 09/11/2026 isso não existia:
+três compras no mesmo fechamento enxergavam o mesmo caixa e estouravam o capital
+autorizado e a exposição por ativo.
 
 **E a medição não sustentou o ganho.** Ligado, o resultado piorou em 8 de 10
 combinações testadas (4h, 5 e 16 pares BRL). A causa aparece ao correlacionar a
@@ -835,6 +860,43 @@ nenhum registro de risco.
 inteiramente do lado do sistema. Não há trava impedindo o LIVE — a decisão de
 subir com as limitações abaixo é do operador, e este é o registro dela.
 
+#### Contra qual preço o stop é comparado (corrigido em 04/11/2026)
+
+**Até 04/11/2026 o "a cada 60s" acima era falso.** O preço comparado com o stop
+era o fechamento do último candle **fechado** do timeframe da estratégia — com
+`1d`, ele andava uma vez por dia. O stop de 3% só podia agir no fechamento
+diário, e o broker de papel executava no mesmo preço velho: o dry_run comprou XRP
+a 1,2957 (fechamento da véspera) com o mercado a 1,3962 e registrou um "take
+profit" de +7,7% 38 segundos depois, que nunca existiu. O histórico do dry_run até
+essa data foi arquivado por isso (`data/arquivo/`, ver `andamento` no cofre).
+
+Como funciona agora:
+
+- O Market Data lê o **ticker** de todos os pares a cada ciclo (60s), numa chamada
+  só; se o lote falhar (um par deslistado derruba o lote inteiro no ccxt), lê par a
+  par, para um símbolo ruim não cegar os outros. Também lê, par a par, o ticker
+  das **posições com preço médio cujo par saiu da lista** (revarredura ou edição
+  de `SYMBOLS`): a lista define o que se pode abrir, não o que se protege. Até
+  09/11/2026 esses ativos ficavam sem stop e sem aviso.
+- **Stop, alvo e dimensionamento da ordem** usam só o preço corrente **recente**
+  (até 3 ciclos, mínimo 3 min). Sem ele, o par fica **sem avaliação** e o operador
+  recebe o alerta *"Sem preço corrente"* (do Market Data) e *"Stop-loss sem
+  avaliação"* (do Risk Manager, uma vez por transição). Uma **compra** sem preço
+  recente é recusada; a saída da estratégia ainda usa o preço do sinal. Nunca se
+  volta ao fechamento do candle para stop, alvo ou tamanho de compra:
+  o preço médio veio de uma execução no mercado, e comparar com o fechamento diário
+  vendia por engano (o crítico mediu: médio 1,3969, fechamento 1,2957 abaixo do
+  stop 1,3550, venda fantasma após 4 min sem ticker).
+- Salto de mais de 3× numa leitura só fica **suspeito** e só vale se a leitura
+  seguinte confirmar o mesmo lado: um decimal trocado não dispara stop, e um colapso
+  de verdade (que persiste) entra um ciclo depois em vez de ser mascarado.
+- A valorização da carteira e o broker de papel usam o último preço de mercado
+  aceito (mesmo velho); o fechamento do candle só quando nunca houve ticker.
+- O candle continua sendo o que a **estratégia** lê.
+
+Provas: `tests/test_preco_corrente.py` (cada defeito, com contraprova) e
+`tests/test_cenarios.py` (o sistema inteiro contra um mercado simulado).
+
 #### As limitações, conferidas uma por uma
 
 | Cenário | Stop em software | OCO na exchange | Estado |
@@ -847,9 +909,10 @@ subir com as limitações abaixo é do operador, e este é o registro dela.
 | Posição sem preço médio | ✘ | ✘ | limitação nova nesta lista (não é nova no sistema) |
 | Poeira abaixo do mínimo da exchange | ✘ | ✘ | limitação nova nesta lista |
 | Ordem de proteção emitida e sem desfecho | ✘ | — | limitação nova nesta lista |
+| Exchange sem preço corrente do par por mais de 3 min | ✘ | ✔ | sem avaliação **e com alerta** (antes: comparava com o fechamento diário) |
 
-**Contagem, para não haver dúvida: seis limitações valem hoje** (linhas 2 a 4 e 6
-a 8). A primeira linha é o que o stop cobre; a quinta é a que foi fechada.
+**Contagem, para não haver dúvida: sete limitações valem hoje** (linhas 2 a 4 e 6
+a 9). A primeira linha é o que o stop cobre; a quinta é a que foi fechada.
 
 Uma que **deixou** de ser limitação e vale registrar, porque o botão continua na
 tela: **pausar o agente de execução pela interface** não desliga mais o stop.
@@ -911,8 +974,20 @@ O sistema tenta 3 vezes — recusa transitória (IP, rede, credencial que voltou
 passa em uma ou duas — e depois **desiste dizendo que desistiu**, com alerta
 nomeando a causa típica e a ação necessária. Insistir a cada snapshot daria uma
 ordem recusada e um alerta por minuto, 1.440 por dia, no aviso que menos pode ser
-ignorado. Ao desistir, a trava fica **armada**: a contagem zera e o stop volta a
-ser tentado quando o saldo do ativo mudar ou alguém fechar a posição à mão.
+ignorado. Ao desistir, a trava fica **armada** — e até 09/11/2026 ficava para
+sempre: o texto prometia que ela caía "quando o saldo do ativo mudar", e nada fazia
+isso, então uma recompra do ativo nascia sem stop. Hoje a trava cai quando a
+posição cresce acima da quantidade tentada (ou, se valia menos que o mínimo ao
+desistir, quando passa a valer acima dele), com o alerta *"voltou a ter
+stop-loss"*.
+
+A poeira propriamente dita — o resto que a exchange não aceitaria vender (truncado
+ao passo dá zero, ou abaixo do `MIN_NOTIONAL`) e que vale menos que metade do
+mínimo de ordem — **não recebe stop nem gera tentativas ou alertas** até a posição
+crescer. Ela é comum: sem BNB, a taxa da compra sai do próprio ativo e a venda é
+truncada ao passo, então toda venda do saldo inteiro deixa um resto. O `dry_run`
+passou a produzir essa poeira também (o broker de papel imita a Binance desde
+09/11/2026).
 
 **Ordem de proteção emitida e sem desfecho.** Se a ordem de proteção existe em
 `orders` e não tem desfecho, a trava é mantida de propósito — revender por cima
@@ -1123,7 +1198,17 @@ opera.
 - **Negócio** → telas **Configurações** e **Risco**. Exigem `confirm`, validam o
   resultado do merge (um campo isolado pode ser válido e tornar o conjunto
   incoerente), valem imediatamente sem reiniciar, e vão ao `audit_log` com o
-  antes e o depois.
+  antes e o depois **completos**. `PUT /trading/config` recusa timeframe que o
+  sistema não busca e pares fora da moeda de cotação (422). Os botões que mexem
+  em dinheiro (rearmar a trava, autorizar capital, lançar e excluir) pedem
+  confirmação na tela antes de mandar o `confirm` — até 09/11/2026 "Rearmar" e
+  "Autorizar capital" mandavam o pedido sem corpo e recebiam 400 sempre.
+- **Configuração gravada que deixou de validar** (um campo saiu ou entrou no
+  modelo numa atualização): campo desconhecido é ignorado com aviso e campo novo
+  recebe o padrão, preservando o resto. Se mesmo assim não valida, o sistema
+  **recusa subir**. Até 09/11/2026 ele voltava em silêncio aos padrões do código
+  (USDT, 15 min, duas estratégias) — operando outra moeda, com o stop das posições
+  em USDC sem preço.
 - **Ambiente** → editar o `.env` e reiniciar. Sem rastro, por natureza: é por isso
   que só ambiente mora lá.
 
@@ -1149,7 +1234,19 @@ Uma sequência, não uma escolha:
 
 1. Backtest da estratégia com dados históricos.
 2. `dry_run` por **semanas**, com o dashboard acompanhado de perto.
-3. `testnet`, para validar a integração real com a API da exchange.
+3. `testnet`, para validar a integração real com a API da exchange. Primeiro o
+   ensaio automático, que envia compra, venda, `clientOrderId` repetido e ordem
+   abaixo do mínimo e confere cada resposta (chave **separada** da real,
+   `BINANCE_TESTNET__API_KEY`/`_SECRET`, criada em testnet.binance.vision):
+
+   ```bash
+   docker compose run --rm --no-deps crypto crypto-traders ensaio-testnet --par BTC/USDT --valor 20
+   ```
+
+   Depois o sistema inteiro em `TRADING_MODE=testnet` por alguns dias. O mesmo
+   caminho de ponta a ponta já roda contra um mercado simulado na suíte
+   (`tests/test_cenarios.py`: stop intradiário, alvo, circuit breaker, stop durante
+   a trava, queda do ticker) — a testnet acrescenta o que só a exchange responde.
 4. **Teste deliberado do circuit breaker** — force o cenário de perda e confirme
    que a paralisação acontece de verdade.
 5. **Teste deliberado do stop-loss** — abra uma posição em `testnet` e confirme
@@ -1246,8 +1343,29 @@ Consequência direta para a seção 5: a separação de privilégio que fecharia
 trilha append-only contra código hostil no processo depende justamente do
 PostgreSQL. Enquanto ele não rodar, essa limitação continua aberta.
 
+**Atualização em 24/10/2026 — o PostgreSQL rodou.** Com a ida para o Docker, a
+suíte passou a rodar contra um PostgreSQL 16 de verdade (`POSTGRES_TEST_URL`, no
+CI e no compose de desenvolvimento): os testes de Postgres passam, menos o das
+*hypertables*, que fica `skipped` porque o Postgres da plataforma não tem a
+extensão TimescaleDB — as séries ficam em tabela comum, e o Timescale continua
+**não exercitado**. A separação de privilégio da seção 5 agora existe: o dono do
+banco (`crypto_dono`) cria schema e gatilhos pelo `crypto-traders migrar`, a
+aplicação roda como `crypto`, só com leitura e escrita de linhas, e o **servidor**
+recusa o `DROP TRIGGER` e o `CREATE TABLE` dela (medido em
+`test_docker_e_observabilidade.py` e na stack de produção). Um teste antigo desta
+classe, que nunca tinha rodado, falhou na primeira vez por ler "a última trade"
+num banco compartilhado; foi corrigido para ler a própria.
+
 **2. Não houve teste de integração contra a testnet.** Nenhuma ordem deste
-sistema jamais chegou a um servidor da Binance. Tudo o que a suíte prova sobre
+sistema jamais chegou a um servidor da Binance. *(04/11/2026: o ensaio existe —
+`crypto-traders ensaio-testnet` — e espera a chave da testnet do operador. Ele
+mede, entre outras coisas, se a Binance recusa um `clientOrderId` repetido de uma
+ordem já executada: se aceitar, o retry de rede de `_with_retry` pode comprar duas
+vezes, e isso vira defeito a corrigir antes do live.)* *(09/11/2026: a auditoria
+confirmou pela documentação da Binance que ela aceita — o id é único só entre
+ordens abertas — e o envio foi corrigido para não depender disso: ver seção 3,
+"Idempotência". O ensaio ganhou a etapa que prova o mecanismo novo, a consulta da
+ordem pelo `clientOrderId` no servidor real.)* Tudo o que a suíte prova sobre
 execução, idempotência, reconciliação e stop-loss foi provado com `PaperBroker`
 em processo único. Os filtros reais de cada par são consultados pelo
 `crypto-traders check` (que fala com a exchange), mas isso é leitura de metadados
@@ -1284,6 +1402,38 @@ Vale registrar o que **não** funcionou, porque é a opção óbvia: a configura
 "reiniciar se a tarefa falhar" **não age**. O `LastTaskResult` registrou a falha
 (`4294967295`) e nada reiniciou em 4 minutos de observação. Quem ressuscita é o
 gatilho repetitivo, não o reinício-em-falha.
+
+**Atualização em 24/10/2026 — a supervisão passou ao Docker.** No notebook, o
+sistema roda no compose de desenvolvimento com `restart: unless-stopped`, e as
+duas Tarefas Agendadas ficaram desabilitadas (não apagadas). A lacuna de logon
+**continua no notebook**: o Docker Desktop só abre quando alguém entra na conta.
+Em produção (`vm-prd`, Linux) o Docker é serviço do sistema e sobe no boot sem
+ninguém conectado — lá a lacuna fecha. O texto abaixo é o registro da fase da
+Tarefa Agendada.
+
+**Correção em 09/11/2026 — "a lacuna fecha" valia só para o processo que morre.**
+O Docker reinicia contêiner que **sai**, não contêiner **travado**: o healthcheck
+conferia só se o objeto do orquestrador existia, e o Docker não age sobre
+`unhealthy`. Um laço preso em `live` parava o stop sem aviso, porque os avisos
+saem do mesmo processo. Hoje:
+
+- o healthcheck usa `GET /api/health?sonda=1`, que responde 503 quando um agente
+  crítico (market_data, risk_manager, execution, portfolio) está parado,
+  desistido ou sem batida há mais de 10 min, ou quando o laço do vigia interno
+  parou de girar (pausa pedida pelo operador não conta);
+- no servidor, o `crypto-vigia.timer` (a cada minuto) reinicia o contêiner depois
+  de 3 verificações `unhealthy` seguidas, no máximo 3 vezes por hora;
+- com `VIGIA_URL` no `/opt/crypto/.env`, o vigia faz um ping de "estou vivo" a um
+  serviço externo de *dead-man's switch* (a conta é do operador): se o servidor
+  inteiro cair, quem avisa é esse serviço. **Sem `VIGIA_URL`, ninguém de fora
+  avisa.**
+
+Também desde 09/11/2026: retomar pela interface reabilita um agente que o vigia
+interno tinha desistido (antes ele seguia desistido, e a execução retomada
+continuava barrando o stop); a parada drena por até 20 s e registra no log e no
+`system_stopped` o que ficou cortado; e só um `crypto-traders run` sobe por banco
+Postgres (bloqueio consultivo) — o que não cobre dois bancos diferentes operando a
+mesma conta da Binance.
 
 **O que continua descoberto:** a tarefa roda no **logon do operador**. Cobrir a
 máquina sem usuário conectado exige marcar "executar mesmo sem usuário conectado"

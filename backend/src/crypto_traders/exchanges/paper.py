@@ -22,6 +22,7 @@ Depender de alguem chamar um setter na subida e depender de nada.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from decimal import Decimal
 from typing import Any
 
@@ -82,6 +83,18 @@ class PaperBroker(Broker):
 
     def set_prices(self, prices: dict[str, Decimal]) -> None:
         self._last_prices.update(prices)
+
+    def set_price_source(self, fonte: Callable[[], dict[str, Decimal]]) -> None:
+        """De onde ler o preco NO MOMENTO de executar uma ordem a mercado.
+
+        Antes so havia `set_prices`, chamado pelo orquestrador a cada snapshot
+        (60 s) -- e com o fechamento do candle. A ordem do sinal das 00:00 UTC
+        executava antes da sincronizacao seguinte, ao preco da vespera: medido no
+        dry_run, compra do XRP a 1,2957 com o mercado a 1,3962 e um "take profit"
+        de +7,7% em 38 s. Com a fonte, a ordem le o preco corrente daquele
+        instante, como a exchange faria.
+        """
+        self._fonte_de_preco = fonte
 
     @property
     def balances(self) -> dict[str, Decimal]:
@@ -149,31 +162,39 @@ class PaperBroker(Broker):
         if recusa is not None:
             return recusa
 
+        # A quantidade executada e a truncada ao passo do par (LOT_SIZE), como o
+        # ccxt envia (`amount_to_precision`). Sem isso o dry_run nunca gerava a
+        # poeira que o live gera ao vender um saldo inteiro.
+        market = self.market_filter(request.symbol)
+        quantidade = market.truncate(request.quantity) if market else request.quantity
+
         # Slippage sempre contra o operador: compra um pouco mais cara, venda um
         # pouco mais barata. Simular a favor seria enganar a si mesmo.
         direction = Decimal(1) if request.side is Side.BUY else Decimal(-1)
         fill_price = reference * (Decimal(1) + direction * self.slippage_pct)
-        gross = request.quantity * fill_price
-        fee = gross * self.fee_pct
+        gross = quantidade * fill_price
 
-        try:
-            if request.side is Side.BUY:
-                self._debit(quote, gross + fee)
-                self.credit(base, request.quantity)
-            else:
-                self._debit(base, request.quantity)
-                self.credit(quote, gross - fee)
-        except InsufficientFunds as exc:
-            # Nao memoriza: a exchange recusa ANTES de criar a ordem, entao o
-            # `clientOrderId` continua livre e uma nova tentativa (depois de um
-            # deposito, por exemplo) precisa poder acontecer de verdade.
-            return OrderResult(
-                order_request_id=request.id,
-                client_order_id=request.client_order_id,
-                exchange_order_id=None,
-                status=OrderStatus.REJECTED,
-                error=str(exc),
-            )
+        # A taxa sai da moeda RECEBIDA, como na Binance spot sem BNB: a compra
+        # paga no ativo base (compra 0,001 BTC, recebe 0,000999) e a venda na
+        # cotacao. Cobrando tudo na cotacao, o dry_run nunca passava pelo caminho
+        # em que o saldo do ativo fica menor que `filled` -- e a contabilidade
+        # so o veria no live (auditoria de 09/11/2026, H2 e M3).
+        if request.side is Side.BUY:
+            fee, fee_currency = quantidade * self.fee_pct, base
+        else:
+            fee, fee_currency = gross * self.fee_pct, quote
+
+        # Saldo insuficiente LEVANTA `InsufficientFunds`, como o `CcxtExchange`:
+        # devolver REJECTED deixava o `except InsufficientFunds` do Execution
+        # Agent sem exercicio no dry_run. Nao memoriza: a exchange recusa ANTES
+        # de criar a ordem, entao o `clientOrderId` continua livre e uma nova
+        # tentativa (depois de um deposito, por exemplo) precisa poder acontecer.
+        if request.side is Side.BUY:
+            self._debit(quote, gross)
+            self.credit(base, quantidade - fee)
+        else:
+            self._debit(base, quantidade)
+            self.credit(quote, gross - fee)
 
         self._last_prices[base] = reference
 
@@ -183,10 +204,10 @@ class PaperBroker(Broker):
                 client_order_id=request.client_order_id,
                 exchange_order_id=f"paper-{request.client_order_id}",
                 status=OrderStatus.FILLED,
-                filled_quantity=request.quantity,
+                filled_quantity=quantidade,
                 average_price=fill_price,
                 fee=fee,
-                fee_currency=quote,
+                fee_currency=fee_currency,
                 raw={"simulated": True, "reference_price": str(reference)},
             )
         )
@@ -268,6 +289,15 @@ class PaperBroker(Broker):
     def _reference_price(self, request: OrderRequest, base: str) -> Decimal | None:
         if request.order_type is OrderType.LIMIT and request.price is not None:
             return request.price
+        fonte = getattr(self, "_fonte_de_preco", None)
+        if fonte is not None:
+            try:
+                atual = fonte().get(base)
+            except Exception:  # pragma: no cover - fonte com defeito: cai no ultimo conhecido
+                atual = None
+            if atual is not None and atual > 0:
+                self._last_prices[base] = atual
+                return atual
         return self._last_prices.get(base)
 
     def snapshot(self) -> dict[str, Any]:

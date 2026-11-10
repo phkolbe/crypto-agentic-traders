@@ -45,6 +45,18 @@ class ApiAccessDenied(ExchangeError):
         self.operation = operation
 
 
+class DesfechoDesconhecido(ExchangeError):
+    """A ordem pode ter sido criada, e a exchange nao confirmou nem negou.
+
+    Timeout, `-1006`/`-1007` ("execution status unknown"), HTTP 5xx ou resposta
+    ilegivel no `create_order`, sem que a consulta pelo `clientOrderId` achasse a
+    ordem. Nao e falha: o `ExecutionAgent` grava PENDING e alerta
+    `order_outcome_unknown` para reconciliar. Devolver FAILED aqui gravava "failed,
+    filled 0" para uma compra que podia ter preenchido -- sem trade, sem preco
+    medio, sem stop (auditoria de 09/11/2026, P0 #2).
+    """
+
+
 #: Duracao de cada unidade de timeframe do ccxt, em segundos.
 #:
 #: `m` (minuto) e `M` (mes) diferem SO pela caixa -- normalizar a string para

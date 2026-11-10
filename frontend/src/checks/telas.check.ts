@@ -44,7 +44,28 @@ import {
   toNumber,
   unidadeDoEvento,
 } from '../api/format'
+import {
+  alocacaoNoTempo,
+  chaveDoGrupo,
+  comparacaoComBenchmark,
+  drawdown,
+  retornosPorPeriodo,
+} from '../api/analise'
+import {
+  chaveDoPeriodo,
+  erroDoPersonalizado,
+  lerPeriodoSalvo,
+  parametrosDoPeriodo,
+} from '../api/periodo'
 import type { AuditEntry, Position } from '../api/types'
+import {
+  formularioVazio,
+  lancamentoDoFormulario,
+  pedidos,
+  type LancamentoManual,
+  type Pedido,
+} from '../api/mutacoes'
+import contratoDasMutacoes from './contrato-mutacoes.json'
 import {
   amostragemTipica,
   casasParaPasso,
@@ -134,6 +155,7 @@ verifica(
 // [VERIFICACAO DE FONTE] idem: par fixo em codigo.
 const paginas = [
   'Dashboard.tsx',
+  'Portfolio.tsx',
   'Trades.tsx',
   'ManualTrade.tsx',
   'RiskSettings.tsx',
@@ -874,6 +896,122 @@ verifica(
 )
 
 // ===========================================================================
+bloco('Periodo dos graficos: atalhos e intervalo personalizado ate 1 ano')
+
+const hojeFixo = new Date(2026, 9, 25, 15, 30) // 25/10/2026 15h30, hora local
+verifica('um dia so (de = ate) vale', erroDoPersonalizado('2026-10-01', '2026-10-01', hojeFixo) === null)
+verifica(
+  '366 dias valem (o limite do backend)',
+  erroDoPersonalizado('2025-10-25', '2026-10-25', hojeFixo) === null,
+  String(erroDoPersonalizado('2025-10-25', '2026-10-25', hojeFixo)),
+)
+verifica(
+  '367 dias sao recusados ANTES de ir a API',
+  (erroDoPersonalizado('2025-10-24', '2026-10-25', hojeFixo) ?? '').includes('1 ano'),
+)
+verifica('inicio depois do fim e recusado', erroDoPersonalizado('2026-10-10', '2026-10-01', hojeFixo) !== null)
+verifica('fim no futuro e recusado', erroDoPersonalizado('2026-10-01', '2026-10-26', hojeFixo) !== null)
+{
+  const p = parametrosDoPeriodo({ tipo: 'personalizado', de: '2026-10-20', ate: '2026-10-25' }, hojeFixo)
+  verifica(
+    'o fim de um intervalo que inclui hoje e AGORA, nao 23h59 do futuro',
+    p.end === hojeFixo.toISOString(),
+    p.end,
+  )
+  verifica(
+    'o inicio e a meia-noite LOCAL do dia escolhido',
+    p.start === new Date(2026, 9, 20).toISOString(),
+    p.start,
+  )
+}
+{
+  const p = parametrosDoPeriodo({ tipo: 'atalho', dias: 7 }, hojeFixo)
+  verifica(
+    '7d sao 7 dias exatos ate agora',
+    Date.parse(p.end) - Date.parse(p.start) === 7 * 24 * 60 * 60 * 1000,
+  )
+}
+verifica(
+  'a chave de cache de um atalho nao muda com o relogio',
+  chaveDoPeriodo({ tipo: 'atalho', dias: 30 }) === chaveDoPeriodo({ tipo: 'atalho', dias: 30 }) &&
+    chaveDoPeriodo({ tipo: 'atalho', dias: 30 }) !== chaveDoPeriodo({ tipo: 'atalho', dias: 90 }),
+)
+verifica(
+  'periodo salvo corrompido ou fora do limite volta ao padrao',
+  lerPeriodoSalvo('{lixo', { tipo: 'atalho', dias: 30 }, hojeFixo).tipo === 'atalho' &&
+    lerPeriodoSalvo(
+      JSON.stringify({ tipo: 'personalizado', de: '2020-01-01', ate: '2026-10-01' }),
+      { tipo: 'atalho', dias: 30 },
+      hojeFixo,
+    ).tipo === 'atalho',
+)
+
+// ===========================================================================
+bloco('Analise do portfolio: drawdown, retornos, comparacao e alocacao')
+
+{
+  const dd = drawdown([100, 120, 90, 130, 117])
+  verifica('drawdown mede contra o pico ANTERIOR', Math.abs(dd.serie[2]! - -0.25) < 1e-12, String(dd.serie))
+  verifica('a maior queda e a de 120 para 90', Math.abs(dd.maior - -0.25) < 1e-12 && dd.indiceDoPico === 1 && dd.indiceDoVale === 2)
+  verifica('novo pico zera a queda', dd.serie[3] === 0)
+  verifica('serie so subindo nao tem queda', drawdown([1, 2, 3]).maior === 0)
+}
+{
+  const fechamentos = [
+    { dia: '2026-10-11', valor: 100 }, // base: dia anterior ao periodo
+    { dia: '2026-10-12', valor: 110 }, // segunda
+    { dia: '2026-10-13', valor: 99 },
+    { dia: '2026-10-19', valor: 120 }, // segunda seguinte
+  ]
+  const dias = retornosPorPeriodo(fechamentos, 'dia')
+  verifica('o dia base nao vira barra', dias.length === 3 && dias[0]!.chave === '2026-10-12')
+  verifica('retorno diario contra o fechamento anterior', Math.abs(dias[0]!.retorno - 0.1) < 1e-12)
+  verifica(
+    'semana comeca na segunda (domingo e da semana anterior)',
+    chaveDoGrupo('2026-10-11', 'semana') === '2026-10-05' && chaveDoGrupo('2026-10-13', 'semana') === '2026-10-12',
+  )
+  const semanas = retornosPorPeriodo(fechamentos, 'semana')
+  verifica(
+    'retorno semanal: ultimo fechamento da semana contra o da semana anterior',
+    semanas.length === 2 && Math.abs(semanas[0]!.retorno - -0.01) < 1e-12,
+    JSON.stringify(semanas),
+  )
+}
+{
+  const c = comparacaoComBenchmark(
+    [
+      { dia: '2026-10-02', valor: 50 },
+      { dia: '2026-10-03', valor: 55 },
+    ],
+    [
+      { dia: '2026-10-01', valor: 1000 },
+      { dia: '2026-10-02', valor: 1100 },
+      { dia: '2026-10-03', valor: 990 },
+    ],
+  )
+  verifica(
+    'a comparacao comeca no primeiro dia COMUM (nada de semana de vantagem)',
+    c.dias[0] === '2026-10-02' && c.carteira[0] === 0 && c.benchmark[0] === 0,
+    JSON.stringify(c),
+  )
+  verifica('carteira +10% e BTC -10% desde a base', Math.abs(c.carteira[1]! - 0.1) < 1e-12 && Math.abs(c.benchmark[1]! - -0.1) < 1e-12)
+}
+{
+  const a = alocacaoNoTempo(
+    [
+      { allocations: { USDC: 0.5, BTC: 0.2, ETH: 0.1, SOL: 0.1, ADA: 0.05, XRP: 0.05 } },
+      { allocations: { USDC: 1 } },
+    ],
+    3,
+  )
+  verifica('os maiores pela media e o resto em Outros', a.ativos.join() === 'USDC,BTC,ETH,Outros', a.ativos.join())
+  verifica(
+    'cada ponto soma 100% (nada some no agrupamento)',
+    [0, 1].every((i) => Math.abs(a.series.reduce((s, serie) => s + serie[i]!, 0) - 1) < 1e-12),
+  )
+}
+
+// ===========================================================================
 bloco('Contraste WCAG AA, calculado sobre as cores REAIS do styles.css')
 
 const css = fonte('styles.css')
@@ -1135,6 +1273,148 @@ verifica(
 verifica(
   'o defeito existe: .btn e .btn-primary nunca foram declarados',
   !/\.btn[\s,:.{]/.test(css) && !/\.btn-primary/.test(css),
+)
+
+// ===========================================================================
+bloco('Contrato das mutacoes: o que a tela envia e o que a API exige')
+
+// Rearmar e Autorizar capital mandaram POST sem corpo de 10/09 a 09/11/2026 e a
+// API respondeu 400 o tempo todo. O `contrato-mutacoes.json` e repetido contra
+// a API em `backend/tests/test_api.py` (TestContratoDasTelas); aqui se confere
+// que as funcoes que o `client.ts` usa montam EXATAMENTE aqueles pedidos.
+
+/** JSON com as chaves em ordem: comparar objeto sem depender da ordem de montagem. */
+function canonico(valor: unknown): string {
+  if (Array.isArray(valor)) return `[${valor.map(canonico).join(',')}]`
+  if (valor !== null && typeof valor === 'object') {
+    const obj = valor as Record<string, unknown>
+    return `{${Object.keys(obj)
+      .sort()
+      .map((k) => `${JSON.stringify(k)}:${canonico(obj[k])}`)
+      .join(',')}}`
+  }
+  return JSON.stringify(valor)
+}
+
+function comoNoContrato(pedido: { metodo?: string; caminho?: string; corpo?: unknown }) {
+  return {
+    metodo: pedido.metodo,
+    caminho: pedido.caminho,
+    ...(pedido.corpo !== undefined ? { corpo: pedido.corpo } : {}),
+  }
+}
+
+const lancamentoDoContrato: LancamentoManual = {
+  executed_at: '2026-11-09T15:00:00.000Z',
+  exchange: 'binance',
+  symbol: 'BTC/USDT',
+  side: 'buy',
+  quantity: '0.01',
+  price: '95000',
+  fee: '0',
+  fee_currency: 'USDT',
+  notes: null,
+}
+const montados: Record<string, Pedido> = {
+  rearmar_circuit_breaker: pedidos.rearmarCircuitBreaker(),
+  autorizar_capital: pedidos.autorizarCapital('5000'),
+  alterar_limites: pedidos.alterarLimites({ cooldown_seconds: 300 }),
+  alterar_negocio: pedidos.alterarNegocio({ timeframe: '4h' }),
+  lancar_manual: pedidos.lancarManual(lancamentoDoContrato, false),
+  lancar_manual_preco_fora_sem_aceitar: pedidos.lancarManual(
+    { ...lancamentoDoContrato, price: '9500' },
+    false,
+  ),
+  lancar_manual_preco_fora_aceito: pedidos.lancarManual(
+    { ...lancamentoDoContrato, price: '9500' },
+    true,
+  ),
+  excluir_lancamento: pedidos.excluirLancamento('ID_DO_LANCAMENTO'),
+}
+
+const pedidosDoContrato: { nome: string; metodo: string; caminho: string; corpo?: unknown }[] =
+  contratoDasMutacoes.pedidos
+for (const esperado of pedidosDoContrato) {
+  const montado = montados[esperado.nome]
+  const daTela = montado ? canonico(comoNoContrato(montado)) : 'nenhum'
+  const doContrato = canonico(comoNoContrato(esperado))
+  verifica(
+    `${esperado.nome}: a tela monta o pedido que a API aceita`,
+    daTela === doContrato,
+    `tela: ${daTela}\n          contrato: ${doContrato}`,
+  )
+}
+verifica(
+  'toda mutacao montada tem par no contrato (e e repetida contra a API)',
+  Object.keys(montados).every((nome) => pedidosDoContrato.some((p) => p.nome === nome)),
+)
+
+// O par do conserto: o pedido antigo (POST sem corpo) nao casa com o contrato.
+const contratoRearme = pedidosDoContrato.find((p) => p.nome === 'rearmar_circuit_breaker')
+verifica(
+  'o defeito existe: o rearme sem corpo, como saia ate 09/11, nao e o que a API exige',
+  contratoRearme !== undefined &&
+    canonico({ metodo: 'POST', caminho: '/risk/circuit-breaker/reset' }) !==
+      canonico(comoNoContrato(contratoRearme)),
+)
+verifica(
+  'autorizar leva o patrimonio que a tela mostrou (o 409 de deposito no meio passa a valer)',
+  pedidos.autorizarCapital('1234.56').corpo?.expected_total_value === '1234.56',
+)
+
+// [VERIFICACAO DE FONTE] O `client.ts` nao pode montar estes pedidos por conta
+// propria: se montar, o contrato acima confere uma funcao que ninguem usa.
+const fonteClient = fonteSemComentarios('api', 'client.ts')
+const caminhosDiretos = [
+  '/risk/circuit-breaker/reset',
+  '/risk/capital/authorize',
+  '/risk/config',
+  '/trading/config',
+  '/trades/manual',
+  '/trades/${',
+].filter((caminho) => {
+  // As leituras (GET) de `/risk/config` e `/trading/config` continuam no client.
+  const usos = fonteClient.split(caminho).length - 1
+  const leituras = caminho === '/risk/config' || caminho === '/trading/config' ? 1 : 0
+  return usos > leituras
+})
+verifica(
+  'client.ts envia as mutacoes so pelo que sai de mutacoes.ts',
+  caminhosDiretos.length === 0,
+  caminhosDiretos.join(', '),
+)
+
+// ===========================================================================
+bloco('Lancamento manual: data do formulario e fuso')
+
+const abertoAs9 = formularioVazio(new Date(2026, 10, 9, 9, 0))
+const abertoAs15 = formularioVazio(new Date(2026, 10, 9, 15, 0))
+verifica(
+  'a data padrao e a hora em que o formulario abre',
+  abertoAs9.executed_at === '2026-11-09T09:00' && abertoAs15.executed_at === '2026-11-09T15:00',
+  `${abertoAs9.executed_at} / ${abertoAs15.executed_at}`,
+)
+const enviado = lancamentoDoFormulario(
+  { ...abertoAs15, symbol: 'btc/usdc', quantity: '1', price: '2' },
+  'USDC',
+)
+verifica(
+  'o envio leva o horario com fuso (a API recusa data sem fuso)',
+  enviado.executed_at.endsWith('Z') &&
+    Date.parse(enviado.executed_at) === new Date(2026, 10, 9, 15, 0).getTime(),
+  enviado.executed_at,
+)
+verifica(
+  'moeda da taxa vazia usa a cotacao do par',
+  enviado.fee_currency === 'USDC' && enviado.symbol === 'BTC/USDC',
+  `${enviado.fee_currency} ${enviado.symbol}`,
+)
+// [VERIFICACAO DE FONTE] O defeito era textual: uma constante de modulo com a
+// data, avaliada uma vez quando o app carregava.
+const fonteManualTrade = fonteSemComentarios('pages', 'ManualTrade.tsx')
+verifica(
+  'nenhuma data de formulario e calculada no carregamento do modulo',
+  !/^const\s+EMPTY\b/m.test(fonteManualTrade) && !/^\s*executed_at:\s*nowForInput\(\)/m.test(fonteManualTrade),
 )
 
 // ===========================================================================

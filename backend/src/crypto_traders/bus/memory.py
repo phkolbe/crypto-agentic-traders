@@ -40,6 +40,7 @@ class InMemoryEventBus(EventBus):
         self._subscribers.clear()
 
     async def publish(self, topic: str, payload: Any) -> None:
+        self._notificar_observadores(topic, payload)
         for queue in list(self._subscribers.get(topic, [])):
             try:
                 queue.put_nowait(payload)

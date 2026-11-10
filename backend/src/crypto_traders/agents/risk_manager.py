@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -46,7 +47,8 @@ from ..domain.enums import (
     Side,
     SignalDirection,
 )
-from ..domain.models import OrderRequest, PortfolioSnapshot, RiskAssessment, Signal
+from ..domain.models import OrderRequest, PortfolioSnapshot, Position, RiskAssessment, Signal
+from ..exchanges.filters import MarketFilter
 from ..onchain import OnChainProvider
 from ..risk.rules import PortfolioState, RiskEngine
 from .base import BaseAgent
@@ -92,6 +94,29 @@ class _SaidaEmVoo:
     reason: str
 
 
+@dataclass(frozen=True)
+class _Reserva:
+    """Compra aprovada e publicada que o retrato do portfolio ainda nao mostra."""
+
+    client_order_id: str
+    symbol: str
+    asset: str
+    quantity: Decimal
+    notional: Decimal
+    price: Decimal
+    emitted_at: datetime
+
+
+#: Desfechos em que a ordem terminou. Com algo preenchido, o dinheiro saiu e a
+#: reserva espera o retrato mostrar a posicao; sem nada preenchido, cai na hora.
+#: `PARTIALLY_FILLED` entra porque e o desfecho final que o Execution grava para a
+#: ordem a mercado que preencheu so uma parte (`execution.py:_classificar`).
+ORDEM_TERMINADA = SAIDA_SEM_VENDA | {
+    str(OrderStatus.FILLED),
+    str(OrderStatus.PARTIALLY_FILLED),
+}
+
+
 class RiskManagerAgent(BaseAgent):
     name = "risk_manager"
 
@@ -110,6 +135,14 @@ class RiskManagerAgent(BaseAgent):
         self._circuit_breaker_reason: str | None = None
         self._capital_alerted = False
         """Aviso de saldo nao autorizado sai uma vez por transicao."""
+
+        self._precos_de_mercado: Callable[[], dict[str, Decimal]] | None = None
+        """Preco corrente recente por ativo (o orquestrador liga ao Market Data).
+
+        Quando ligado, stop e alvo so sao avaliados para ativo com preco aqui, e a
+        ordem e dimensionada nele. Desligado (testes de unidade), vale o preco do
+        snapshot e o do sinal, como antes.
+        """
 
         self._exiting: set[str] = set()
         """Ativos com ordem de protecao em voo.
@@ -152,6 +185,51 @@ class RiskManagerAgent(BaseAgent):
         semanal (dentro do limite) zerava o aviso da diaria a cada retrato, e a
         mensagem voltava a sair de 60 em 60 segundos -- a mesma patologia de
         1.440 avisos por dia que o resto deste agente evita.
+        """
+
+        self._reservas: dict[str, _Reserva] = {}
+        """Compras publicadas e ainda nao refletidas num retrato, por `client_order_id`.
+
+        A simulacao de caixa e vagas consumidas (`_apply_fill`) so vale DENTRO de
+        um lote. Com a janela de lote em 0 (o padrao), cada sinal e um lote, e
+        todos os sinais entre dois retratos (60s) viam o mesmo caixa. Medido na
+        auditoria de 09/11/2026 com a configuracao de producao: tres LONG no
+        fechamento diario, cada um vendo 5,89 USDC utilizaveis, tres aprovados --
+        exposicao total 41,0 sobre 29,29 autorizados (+40%). `_build_state`
+        desconta estas reservas do retrato; `_conciliar_reservas` as solta.
+        """
+
+        self._retratos_em: tuple[datetime | None, datetime | None] = (None, None)
+        """Carimbo do retrato anterior e do atual (o do fim da montagem).
+
+        O carimbo de um retrato e posto DEPOIS de ler o saldo, entao uma ordem
+        terminada antes dele pode nao estar no saldo lido. Mas o retrato seguinte
+        so comeca a ler depois de o anterior ser publicado: uma ordem terminada
+        antes do carimbo do retrato ANTERIOR esta, com certeza, no atual.
+        """
+
+        self._sem_preco_avisados: set[str] = set()
+        """Posicoes sem preco corrente recente, ja avisadas (uma vez por transicao)."""
+
+        self._poeira: dict[str, Decimal] = {}
+        """Ativo -> quantidade de poeira que nao recebe stop.
+
+        Entra aqui o resto de uma saida de protecao abaixo do minimo negociavel
+        (ver `_reconcile_exits`) e, quando o filtro do par e conhecido, qualquer
+        sobra que a exchange nao aceitaria vender (ver `_e_poeira_invendavel`).
+        O stop volta a valer quando a posicao cresce acima dela.
+        """
+
+        self._filtro_de_mercado: Callable[[str], MarketFilter | None] | None = None
+        """De onde ler o passo e o minimo do par (o broker), para reconhecer poeira."""
+
+        self._abaixo_do_minimo_ao_desistir: set[str] = set()
+        """Ativos abandonados que valiam menos que o minimo da exchange na desistencia.
+
+        So para estes "passar a valer acima do minimo" destrava: um ativo
+        abandonado por recusa permanente de outra natureza (credencial sem spot)
+        ja valia acima, e destrava-lo a cada retrato reabriria o laco de
+        recusa e alerta que o abandono existe para fechar.
         """
 
         self._limits_lock = asyncio.Lock()
@@ -265,6 +343,10 @@ class RiskManagerAgent(BaseAgent):
 
     async def _on_batch(self, batch: list[Signal]) -> None:
         """Decide o lote inteiro de uma vez, por confianca."""
+        # O motor dimensiona a quantidade e ancora stop e alvo no preco do sinal;
+        # o sinal sai com o fechamento do candle. O mesmo sinal (mesmo id), com o
+        # preco do mercado de agora, e o que segue daqui em diante.
+        batch = [self._no_preco_corrente(signal) for signal in batch]
         if self._snapshot is None:
             for signal in batch:
                 await self._persist_and_publish(
@@ -277,13 +359,37 @@ class RiskManagerAgent(BaseAgent):
                 )
             return
 
+        # Abertura sem preco corrente recente nao e dimensionada: cair no
+        # fechamento do candle (com `1d`, o de ontem) deixava a compra passar do
+        # teto por ordem e de exposicao na proporcao da distancia -- fechamento
+        # 100, mercado 108, gasto 8% acima do teto (auditoria 09/11/2026, M3). O
+        # FLAT continua passando: fechar nunca e travado, e quantidade de saida
+        # vem da carteira, nao do preco.
+        sem_preco = [s for s in batch if self._abertura_sem_preco_corrente(s)]
+        for signal in sem_preco:
+            await self._persist_and_publish(
+                RiskAssessment(
+                    signal_id=signal.id,
+                    decision=RiskDecision.REJECTED,
+                    reasons=[
+                        f"sem preco corrente recente de {signal.symbol}; abertura nao "
+                        "dimensionada no fechamento do candle"
+                    ],
+                ),
+                signal,
+            )
+        recusados = {s.id for s in sem_preco}
+        batch = [s for s in batch if s.id not in recusados]
+        if not batch:
+            return
+
         await self._load_state()
         state = await self._build_state(batch[0])
         for symbol in {s.symbol for s in batch}:
             base = symbol.partition("/")[0]
             for signal in batch:
                 if signal.symbol == symbol:
-                    state.prices[base] = signal.reference_price
+                    state.prices[base] = self._preco_de_dimensionamento(signal)
                     break
 
         decisoes = self._engine.evaluate_batch(batch, state)
@@ -373,6 +479,25 @@ class RiskManagerAgent(BaseAgent):
     def observe_snapshot(self, snapshot: PortfolioSnapshot) -> None:
         """Recebe o retrato mais recente do portfolio, publicado pelo Portfolio Agent."""
         self._snapshot = snapshot
+        self._marcar_retrato(snapshot)
+
+    def _marcar_retrato(self, snapshot: PortfolioSnapshot) -> None:
+        """Guarda o carimbo do retrato anterior e do atual (ver `_retratos_em`).
+
+        Idempotente por carimbo: o orquestrador entrega o MESMO retrato a
+        `observe_snapshot` e a `enforce_protective_exits`, e contar duas vezes
+        faria o "anterior" ser o proprio atual.
+        """
+        quando = _aware(snapshot.timestamp)
+        atual = self._retratos_em[1]
+        if atual is not None and quando <= atual:
+            return
+        self._retratos_em = (atual, quando)
+
+    def _retrato_mostra(self, terminada_em: datetime) -> bool:
+        """O retrato atual ja inclui uma ordem que terminou neste instante?"""
+        anterior = self._retratos_em[0]
+        return anterior is not None and _aware(terminada_em) < anterior
 
     async def check_capital_authorization(self, snapshot: PortfolioSnapshot) -> Decimal:
         """Avisa quando existe saldo que o sistema nao pode usar.
@@ -477,17 +602,32 @@ class RiskManagerAgent(BaseAgent):
         """
         limits = self._limits
         emitidas: list[OrderRequest] = []
+        self._marcar_retrato(snapshot)
+        mercado = self._precos_de_mercado() if self._precos_de_mercado is not None else None
 
         # Antes de decidir qualquer coisa nova: o que aconteceu com as ordens de
         # protecao anteriores? Sem isto a trava vira uma prisao (ver o metodo).
-        await self._reconcile_exits(snapshot)
+        await self._reconcile_exits(snapshot, mercado)
 
         sem_base: set[str] = set()
+        sem_preco: set[str] = set()
+        em_carteira = {p.asset for p in snapshot.positions if p.quantity > 0}
+        for asset in set(self._poeira) - em_carteira:
+            del self._poeira[asset]
         for position in snapshot.positions:
             if position.asset == self._settings.trading.quote_currency:
                 continue
             if position.quantity <= 0:
                 continue
+            poeira = self._poeira.get(position.asset)
+            if poeira is not None:
+                if position.quantity <= poeira:
+                    # Resto de uma saida de protecao abaixo do minimo negociavel:
+                    # a exchange recusaria a venda, e insistir era o caminho para
+                    # o abandono (ver `_reconcile_exits`). Ja foi dito uma vez.
+                    continue
+                # Cresceu acima da poeira: compra nova, e o stop volta a valer.
+                del self._poeira[position.asset]
             if position.average_price is None or position.average_price <= 0:
                 # Sem preco medio nao existe nivel, e chutar um seria pior que
                 # nao agir -- mas ficar em silencio e pior que os dois. Uma
@@ -498,7 +638,22 @@ class RiskManagerAgent(BaseAgent):
                 # airdrop, sem nenhuma compra correspondente.
                 sem_base.add(position.asset)
                 continue
+            if mercado is not None:
+                # So o preco corrente recente decide stop e alvo. Ativo sem ele
+                # fica sem avaliacao neste snapshot; comparar com o fechamento do
+                # candle venderia por engano. Mas nao em silencio: o Market Data
+                # so alertava sobre os pares do universo, e um ativo em carteira
+                # cujo par saiu da lista (revarredura, edicao de SYMBOLS) ficava
+                # sem stop e sem aviso -- o contrario do que o SEGURANCA §12
+                # promete ("sem avaliacao e com alerta").
+                corrente = mercado.get(position.asset)
+                if corrente is None:
+                    sem_preco.add(position.asset)
+                    continue
+                position = position.model_copy(update={"current_price": corrente})
             if position.current_price is None:
+                continue
+            if self._e_poeira_invendavel(position):
                 continue
             if position.asset in self._exiting:
                 # Ordem de protecao ja em voo: reemitir a cada snapshot venderia
@@ -604,9 +759,47 @@ class RiskManagerAgent(BaseAgent):
             emitidas.append(request)
 
         await self._report_missing_cost_basis(sem_base)
+        await self._avisar_sem_preco_corrente(sem_preco)
         return emitidas
 
-    async def _reconcile_exits(self, snapshot: PortfolioSnapshot) -> None:
+    async def _avisar_sem_preco_corrente(self, sem_preco: set[str]) -> None:
+        """Avisa sobre posicao cujo stop nao esta sendo avaliado por falta de preco.
+
+        Uma vez por transicao, como `_report_missing_cost_basis`: o estado pode
+        durar horas, e um aviso por retrato seriam 1.440 por dia.
+        """
+        if sem_preco == self._sem_preco_avisados:
+            return
+        novos = sorted(sem_preco - self._sem_preco_avisados)
+        voltaram = sorted(self._sem_preco_avisados - sem_preco)
+        self._sem_preco_avisados = set(sem_preco)
+        if voltaram:
+            self.log.info("risk.preco_corrente_restabelecido", assets=voltaram)
+        if not novos:
+            return
+        self.log.error(
+            "risk.position_without_current_price",
+            assets=novos,
+            detail="sem preco corrente recente: stop e alvo destas posicoes nao sao avaliados",
+        )
+        await self.bus.publish(
+            Topics.ALERTS,
+            {
+                "type": "position_without_current_price",
+                "title": f"Stop-loss sem avaliacao: {', '.join(novos)}",
+                "message": (
+                    f"Nao ha preco corrente recente para {', '.join(novos)}, entao "
+                    "stop-loss e take-profit destas posicoes NAO estao sendo "
+                    "avaliados (comparar com o fechamento do candle venderia por "
+                    "engano). Se o par saiu da lista negociada, a posicao continua "
+                    "na carteira: confira a coleta de precos ou feche a mao."
+                ),
+            },
+        )
+
+    async def _reconcile_exits(
+        self, snapshot: PortfolioSnapshot, mercado: dict[str, Decimal] | None = None
+    ) -> None:
         """Solta a trava de saida quando a ordem de protecao nao vendeu nada.
 
         A trava anterior caia por um unico criterio: o ativo desaparecer da
@@ -618,12 +811,27 @@ class RiskManagerAgent(BaseAgent):
         ativo enquanto o processo vivesse** -- com um `risk.protective_exit` no
         log dizendo que a protecao agiu.
 
-        Quatro desfechos, quatro tratamentos:
+        Os desfechos e os tratamentos:
 
-        - **recusada / falhou / cancelada**: nada foi vendido. Solta a trava e
-          avisa, porque o proximo snapshot tem de tentar de novo.
-        - **preenchida em parte**: a posicao encolheu mas continua aberta, e o
-          restante merece protecao propria. Solta a trava.
+        - **terminou e a posicao encolheu** (preenchida, em parte, ou cancelada
+          DEPOIS de preencher parte): o restante e posicao aberta e merece
+          protecao propria. Solta a trava. A quantidade decide ANTES do status:
+          venda a mercado em livro fino que preenche 60% e expira vem como
+          `CANCELED`, e lida pelo status contava como "nada vendido" -- aviso
+          falso de "posicao continua aberta" e uma tentativa gasta (auditoria de
+          09/11/2026, M1). Se o restante e poeira (abaixo do minimo negociavel),
+          ele nao recebe stop: ver `_poeira`.
+        - **preenchida e a posicao NAO encolheu**: ou o retrato ainda nao mostra
+          a venda, ou a posicao voltou a crescer (compra entre o preenchimento e
+          o retrato). Solta quando um retrato montado depois do desfecho chega
+          (`_retrato_mostra`); antes disso, soltar venderia duas vezes.
+        - **recusada / falhou / cancelada sem nada preenchido**: nada foi
+          vendido. Solta a trava e avisa, porque o proximo snapshot tem de
+          tentar de novo.
+        - **abandonada** (ver `_handle_failed_exit`): destrava quando a posicao
+          cresce acima da quantidade tentada ou passa a valer acima do minimo da
+          exchange. Antes ficava armada para sempre, e a posicao NOVA que a
+          estrategia comprava no mesmo ativo nunca tinha stop (P0 #5).
         - **sem linha nenhuma em `orders`**: o pedido nao chegou a existir como
           ordem. Passado `SAIDA_SEM_REGISTRO`, vale o mesmo que recusada -- e
           precisa valer, porque este e o caminho mais comum de recusa que existe:
@@ -639,7 +847,12 @@ class RiskManagerAgent(BaseAgent):
             return
 
         quantidades = {p.asset: p.quantity for p in snapshot.positions}
+        precos = {
+            p.asset: p.current_price for p in snapshot.positions if p.current_price is not None
+        }
+        precos.update(mercado or {})
         agora = _aware(snapshot.timestamp)
+        minimo = self._limits.min_order_notional
 
         async with session_scope(self._settings) as session:
             orders = OrderRepository(session)
@@ -655,35 +868,82 @@ class RiskManagerAgent(BaseAgent):
                 self._liberar(asset)
                 self._esquecer_falhas(asset)
                 continue
+            preco = precos.get(asset)
+            valor = restante * preco if preco is not None else None
 
             if asset in self._exit_abandoned:
-                # Ja desistimos deste ativo e ja avisamos. A trava fica armada de
-                # proposito: insistir seria uma ordem recusada e um alerta por
-                # ciclo, para sempre.
+                # Ja desistimos deste ativo e ja avisamos; insistir com o MESMO
+                # saldo seria uma ordem recusada e um alerta por ciclo. Mas o
+                # saldo mudar e outra historia: posicao maior que a tentada e
+                # compra nova, e poeira que passou a valer acima do minimo ficou
+                # vendavel. Nos dois casos o stop volta a valer.
+                cresceu = restante > voo.quantity
+                ficou_vendavel = (
+                    asset in self._abaixo_do_minimo_ao_desistir
+                    and valor is not None
+                    and valor >= minimo
+                )
+                if cresceu or ficou_vendavel:
+                    await self._retomar_protecao(asset, voo, restante, valor)
                 continue
 
             status = order.status if order is not None else None
+            preenchido = (order.filled_quantity or Decimal(0)) if order is not None else Decimal(0)
 
-            if status in SAIDA_SEM_VENDA:
-                await self._handle_failed_exit(asset, voo, status, order)
+            if status in ORDEM_TERMINADA and restante < voo.quantity:
+                # Vendeu parte. O resto e uma posicao aberta como qualquer
+                # outra, e precisa de nivel proprio -- salvo se for poeira.
+                self._liberar(asset)
+                self._esquecer_falhas(asset)
+                self.log.warning(
+                    "risk.protective_exit_partial",
+                    asset=asset,
+                    motivo=voo.reason,
+                    status=status,
+                    emitida=str(voo.quantity),
+                    restante=str(restante),
+                )
+                if valor is not None and valor < minimo / 2:
+                    # O caso concreto: o stop vende 0,001 BTC, a taxa da compra
+                    # foi cobrada em BTC e a venda e truncada no LOT_SIZE -- sobra
+                    # 0,00000988 BTC. Disparar stop nisso era uma venda recusada
+                    # por minimo, tres tentativas e o abandono. O limiar e o mesmo
+                    # que o motor usa para "poeira" (`RiskEngine`, metade do
+                    # minimo de ordem), e nao o minimo inteiro: `min_order_notional`
+                    # e configuravel acima do minimo da exchange, e tratar como
+                    # poeira uma posicao vendavel a deixaria sem stop.
+                    self._poeira[asset] = restante
+                    self.log.warning(
+                        "risk.protective_exit_dust",
+                        asset=asset,
+                        quantidade=str(restante),
+                        valor=str(valor),
+                        detail="resto abaixo do minimo negociavel; sem stop ate a posicao crescer",
+                    )
                 continue
 
-            if status in (
-                str(OrderStatus.FILLED),
-                str(OrderStatus.PARTIALLY_FILLED),
+            if status in (str(OrderStatus.FILLED), str(OrderStatus.PARTIALLY_FILLED)) or (
+                status in SAIDA_SEM_VENDA and preenchido > 0
             ):
-                if restante < voo.quantity:
-                    # Vendeu parte. O resto e uma posicao aberta como qualquer
-                    # outra, e precisa de nivel proprio.
+                # Vendeu, e a posicao nao encolheu. Ou o retrato ainda nao mostra
+                # a venda (soltar agora venderia duas vezes), ou a posicao voltou
+                # a crescer depois do desfecho -- compra manual ou da estrategia.
+                # Antes este ramo so soltava com `restante < voo.quantity`, e o
+                # segundo caso prendia a trava para sempre, sem aviso.
+                if order is not None and self._retrato_mostra(order.updated_at):
                     self._liberar(asset)
                     self._esquecer_falhas(asset)
                     self.log.warning(
-                        "risk.protective_exit_partial",
+                        "risk.protective_exit_position_regrew",
                         asset=asset,
                         motivo=voo.reason,
                         emitida=str(voo.quantity),
                         restante=str(restante),
                     )
+                continue
+
+            if status in SAIDA_SEM_VENDA:
+                await self._handle_failed_exit(asset, voo, status, order, valor)
                 continue
 
             if status is None and agora - voo.emitted_at >= SAIDA_SEM_REGISTRO:
@@ -694,7 +954,7 @@ class RiskManagerAgent(BaseAgent):
                 # Nada foi enviado a exchange, logo nao ha venda para duplicar, e
                 # tratar isto como "ordem viva" prendia a posicao sem stop para
                 # sempre, com um alerta por retrato dizendo que era anomalia.
-                await self._handle_failed_exit(asset, voo, None, None)
+                await self._handle_failed_exit(asset, voo, None, None, valor)
                 continue
 
             if (
@@ -729,7 +989,12 @@ class RiskManagerAgent(BaseAgent):
                 )
 
     async def _handle_failed_exit(
-        self, asset: str, voo: _SaidaEmVoo, status: str | None, order: object
+        self,
+        asset: str,
+        voo: _SaidaEmVoo,
+        status: str | None,
+        order: object,
+        valor: Decimal | None = None,
     ) -> None:
         """Decide entre tentar de novo e desistir dizendo que desistiu.
 
@@ -743,9 +1008,13 @@ class RiskManagerAgent(BaseAgent):
           e um alerta por ciclo -- 1.440 por dia, a patologia do achado 1 do
           ensaio, no aviso que menos pode ser ignorado.
 
-        Ao desistir a trava fica ARMADA. Nao e otimismo: o ativo entra no aviso
-        de posicao sem protecao e sai dele quando alguem fechar a posicao a mao
-        ou o saldo mudar -- e ai a contagem zera e o stop volta a ser tentado.
+        Ao desistir a trava fica ARMADA, e cai quando alguem fechar a posicao a
+        mao ou o saldo mudar de um jeito que muda a resposta: a posicao crescer
+        acima da quantidade tentada (compra nova) ou, se ela valia menos que o
+        minimo da exchange ao desistir, passar a valer acima dele. Ai a contagem
+        zera e o stop volta a ser tentado (`_reconcile_exits`). Ate 09/11/2026
+        esta frase era promessa: nada soltava a trava, e a recompra do mesmo
+        ativo ficava sem stop enquanto o processo vivesse.
 
         `status is None` chega aqui pelo caminho da ordem que NAO tem linha em
         `orders` (ver `_reconcile_exits`), e conta como recusa pelo mesmo motivo
@@ -766,6 +1035,8 @@ class RiskManagerAgent(BaseAgent):
 
         if falhas >= MAX_TENTATIVAS_DE_SAIDA:
             self._exit_abandoned.add(asset)
+            if valor is not None and valor < self._limits.min_order_notional:
+                self._abaixo_do_minimo_ao_desistir.add(asset)
             self.log.error(
                 "risk.protective_exit_abandoned",
                 asset=asset,
@@ -787,7 +1058,8 @@ class RiskManagerAgent(BaseAgent):
                         + "). O caso tipico e valor abaixo do minimo da exchange, "
                         "que nao muda com o tempo. O sistema PAROU de tentar para "
                         "nao gerar uma ordem e um alerta por minuto: esta posicao "
-                        "esta sem stop-loss ate alguem fecha-la a mao."
+                        "esta sem stop-loss ate alguem fecha-la a mao (ou ela "
+                        "crescer com uma compra nova, quando o stop volta a valer)."
                     ),
                 },
             )
@@ -837,7 +1109,40 @@ class RiskManagerAgent(BaseAgent):
     def _esquecer_falhas(self, asset: str) -> None:
         """A saida funcionou: a proxima recusa comeca a contagem do zero."""
         self._exit_abandoned.discard(asset)
+        self._abaixo_do_minimo_ao_desistir.discard(asset)
         self._exit_failures.pop(asset, None)
+
+    async def _retomar_protecao(
+        self, asset: str, voo: _SaidaEmVoo, restante: Decimal, valor: Decimal | None
+    ) -> None:
+        """Destrava um ativo abandonado cujo saldo mudou, e diz isso uma vez.
+
+        O aviso de abandono disse "sem stop-loss ate alguem fecha-la a mao"; a
+        volta da protecao merece o mesmo canal, senao o operador continua
+        achando que precisa agir.
+        """
+        self._liberar(asset)
+        self._esquecer_falhas(asset)
+        self.log.warning(
+            "risk.protective_exit_resumed",
+            asset=asset,
+            tentada=str(voo.quantity),
+            restante=str(restante),
+            valor=str(valor) if valor is not None else None,
+        )
+        await self.bus.publish(
+            Topics.ALERTS,
+            {
+                "type": "protective_exit_resumed",
+                "title": f"{asset} voltou a ter stop-loss",
+                "message": (
+                    f"A saida de {asset} tinha sido abandonada com {voo.quantity}; "
+                    f"o saldo agora e {restante}"
+                    + (f" (vale {valor:.2f})" if valor is not None else "")
+                    + ". Stop-loss e take-profit voltaram a ser avaliados."
+                ),
+            },
+        )
 
     async def _report_missing_cost_basis(self, sem_base: set[str]) -> None:
         """Avisa sobre posicao que o stop em software nao alcanca.
@@ -887,6 +1192,90 @@ class RiskManagerAgent(BaseAgent):
         """
         await self._on_batch([signal])
 
+    def definir_precos_de_mercado(self, fonte: Callable[[], dict[str, Decimal]]) -> None:
+        self._precos_de_mercado = fonte
+
+    def definir_filtros_de_mercado(self, fonte: Callable[[str], MarketFilter | None]) -> None:
+        self._filtro_de_mercado = fonte
+
+    def _e_poeira_invendavel(self, position: Position) -> bool:
+        """Sobra que a exchange recusaria vender: sem stop, sem tentativas, sem alerta.
+
+        Com a taxa da compra cobrada no proprio ativo (Binance sem BNB) e a venda
+        truncada ao passo do par, TODA venda do saldo inteiro deixa um resto menor
+        que um passo -- a da estrategia tambem, nao so a de protecao. Sem isto, o
+        resto chegava ao stop, a venda era recusada pelo filtro tres vezes e saia
+        o alerta "acao manual necessaria" por centavos (auditoria de 09/11/2026).
+
+        Poeira aqui e o criterio da propria exchange (truncado ao passo da zero,
+        ou fica abaixo do MIN_NOTIONAL) E vale menos que metade do minimo de
+        ordem do sistema -- o mesmo corte do `RiskEngine`. Uma posicao invendavel
+        de valor relevante continua no caminho normal, que termina no aviso de
+        posicao sem protecao: o operador precisa saber dela. Sem filtro conhecido
+        (testes, broker sem catalogo) nada muda.
+        """
+        if self._filtro_de_mercado is None or position.current_price is None:
+            return False
+        quote = self._settings.trading.quote_currency
+        market = self._filtro_de_mercado(f"{position.asset}/{quote}")
+        if market is None:
+            return False
+        vendavel = market.truncate(position.quantity)
+        if vendavel > 0 and vendavel * position.current_price >= market.min_cost:
+            return False
+        valor = position.quantity * position.current_price
+        if valor >= self._limits.min_order_notional / 2:
+            return False
+        if self._poeira.get(position.asset) != position.quantity:
+            self._poeira[position.asset] = position.quantity
+            self.log.info(
+                "risk.poeira_sem_stop",
+                asset=position.asset,
+                quantidade=str(position.quantity),
+                valor=str(valor),
+                detail="abaixo do passo ou do minimo da exchange; sem stop ate a posicao crescer",
+            )
+        return True
+
+    def _no_preco_corrente(self, signal: Signal) -> Signal:
+        preco = self._preco_de_dimensionamento(signal)
+        if preco == signal.reference_price:
+            return signal
+        self.log.info(
+            "risk.preco_corrente_no_lugar_do_fechamento",
+            symbol=signal.symbol,
+            fechamento=str(signal.reference_price),
+            corrente=str(preco),
+        )
+        return signal.model_copy(update={"reference_price": preco})
+
+    def _abertura_sem_preco_corrente(self, signal: Signal) -> bool:
+        """LONG sem preco corrente recente, com a fonte de mercado ligada.
+
+        Desligada (testes de unidade), vale o preco do sinal, como antes.
+        """
+        if signal.direction is not SignalDirection.LONG or self._precos_de_mercado is None:
+            return False
+        corrente = self._precos_de_mercado().get(signal.symbol.partition("/")[0])
+        return corrente is None or corrente <= 0
+
+    def _preco_de_dimensionamento(self, signal: Signal) -> Decimal:
+        """O preco corrente do par; sem ele, o de referencia do sinal.
+
+        O sinal carrega o fechamento do candle (com `1d`, o de ontem). A ordem
+        executa no mercado de agora: dimensionar no fechamento deixava a compra
+        passar do teto por ordem e de exposicao na mesma proporcao da distancia
+        (medido pelo critico: 20,00 aprovados, 21,58 gastos, +7,9%).
+
+        O recuo para o preco do sinal so chega a dimensionar FECHAMENTO: a
+        abertura sem preco corrente e recusada antes (`_abertura_sem_preco_corrente`).
+        """
+        if self._precos_de_mercado is not None:
+            corrente = self._precos_de_mercado().get(signal.symbol.partition("/")[0])
+            if corrente is not None and corrente > 0:
+                return corrente
+        return signal.reference_price
+
     async def _build_state(self, signal: Signal) -> PortfolioState:
         snapshot = self._snapshot
         assert snapshot is not None
@@ -895,12 +1284,27 @@ class RiskManagerAgent(BaseAgent):
         prices = {
             p.asset: p.current_price for p in snapshot.positions if p.current_price is not None
         }
-        # O preco do par avaliado vem do sinal, que e mais recente que o snapshot.
         base = signal.symbol.partition("/")[0]
-        prices[base] = signal.reference_price
+        prices[base] = self._preco_de_dimensionamento(signal)
 
         async with session_scope(self._settings) as session:
-            last_order = await OrderRepository(session).last_order_time(signal.symbol)
+            orders = OrderRepository(session)
+            last_order = await orders.last_order_time(signal.symbol)
+            await self._conciliar_reservas(orders)
+
+        # O que ja foi aprovado e publicado e o retrato ainda nao mostra: o mesmo
+        # que `_apply_fill` faz dentro do lote, valendo entre lotes. Sem preco no
+        # retrato (ativo novo), vale o da aprovacao -- sem ele a posicao reservada
+        # valeria zero e nao contaria nem na exposicao nem nas vagas.
+        cash = snapshot.cash_value
+        last_order_at = {signal.symbol: last_order} if last_order else {}
+        for reserva in self._reservas.values():
+            cash -= reserva.notional
+            positions[reserva.asset] = positions.get(reserva.asset, Decimal(0)) + reserva.quantity
+            prices.setdefault(reserva.asset, reserva.price)
+            anterior = last_order_at.get(reserva.symbol)
+            if anterior is None or _aware(anterior) < reserva.emitted_at:
+                last_order_at[reserva.symbol] = reserva.emitted_at
 
         # Leitura de regime. Falha ou ausencia => None => filtro nao se aplica.
         mvrv_percentile = None
@@ -915,14 +1319,47 @@ class RiskManagerAgent(BaseAgent):
 
         return PortfolioState(
             total_value=snapshot.total_value,
-            cash=snapshot.cash_value,
+            cash=cash,
             positions=positions,
             prices=prices,
-            last_order_at={signal.symbol: last_order} if last_order else {},
+            last_order_at=last_order_at,
             circuit_breaker_active=self._circuit_breaker_active,
             circuit_breaker_reason=self._circuit_breaker_reason,
             mvrv_percentile=mvrv_percentile,
         )
+
+    async def _conciliar_reservas(self, orders: OrderRepository) -> None:
+        """Solta a reserva da compra que o retrato ja mostra ou que nao gastou nada.
+
+        Pelo banco, e nao pelo topico de resultados, pelo mesmo motivo de
+        `_reconcile_exits`: a linha em `orders` e gravada pelo Execution antes de
+        o resultado ser publicado, nao depende de uma assinatura viva neste agente
+        e cobre a recusa que nunca chega a ser ordem.
+
+        - **terminou sem preencher nada**: nada foi gasto, a reserva cai na hora;
+        - **terminou com algo preenchido**: cai quando um retrato montado depois
+          do desfecho chegar (`_retrato_mostra`); antes disso o saldo lido pode
+          ser o de antes da compra;
+        - **sem linha em `orders`** depois de `SAIDA_SEM_REGISTRO`: recusada por
+          filtro antes de existir, nada foi enviado;
+        - **sem desfecho** (PENDING/OPEN): continua reservada. Desfecho
+          desconhecido pode ter gasto o dinheiro, e liberar no escuro e o furo
+          que esta reserva fecha.
+        """
+        if not self._reservas:
+            return
+        agora = datetime.now(UTC)
+        for client_order_id, reserva in list(self._reservas.items()):
+            order = await orders.find_by_client_id(client_order_id)
+            if order is None:
+                if agora - reserva.emitted_at >= SAIDA_SEM_REGISTRO:
+                    del self._reservas[client_order_id]
+                continue
+            if order.status not in ORDEM_TERMINADA:
+                continue
+            preenchido = order.filled_quantity or Decimal(0)
+            if preenchido <= 0 or self._retrato_mostra(order.updated_at):
+                del self._reservas[client_order_id]
 
     async def _persist_and_publish(self, assessment: RiskAssessment, signal: Signal) -> None:
         # Persistir primeiro: um `OrderRequest` nunca pode referenciar um
@@ -995,6 +1432,21 @@ class RiskManagerAgent(BaseAgent):
             notional=str(request.notional),
             stop_loss=str(request.stop_loss) if request.stop_loss else None,
         )
+        if abertura:
+            # Reservada ANTES de publicar: o proximo sinal pode ser avaliado
+            # enquanto o Execution ainda nem gravou a ordem. So a compra reserva;
+            # a venda nao credita caixa nem libera vaga ate o retrato mostrar o
+            # dinheiro (o lado conservador: atrasa uma abertura, nunca a financia
+            # com uma venda que pode ser recusada).
+            self._reservas[request.client_order_id] = _Reserva(
+                client_order_id=request.client_order_id,
+                symbol=request.symbol,
+                asset=request.symbol.partition("/")[0],
+                quantity=request.quantity,
+                notional=request.notional,
+                price=signal.reference_price,
+                emitted_at=datetime.now(UTC),
+            )
         await self.bus.publish(Topics.ORDER_REQUESTS, request)
 
     # ------------------------------------------------------------------

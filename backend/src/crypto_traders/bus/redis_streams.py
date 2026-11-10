@@ -59,6 +59,7 @@ class RedisStreamsEventBus(EventBus):
             else json.dumps(payload)
         )
         await self._redis.xadd(topic, {"data": body}, maxlen=MAX_STREAM_LENGTH, approximate=True)
+        self._notificar_observadores(topic, payload)
 
     async def subscribe(self, topic: str) -> AsyncIterator[Any]:
         """Le o stream a partir de agora (`$`), em fan-out.

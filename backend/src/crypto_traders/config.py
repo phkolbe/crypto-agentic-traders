@@ -381,6 +381,7 @@ class Settings(BaseSettings):
 
     app_name: str = "crypto-agentic-traders"
     environment: str = "local"
+    """Vai para `deployment.environment` na telemetria (`dev`, `prd`)."""
     log_level: str = "INFO"
     log_json: bool = False
 
@@ -400,6 +401,23 @@ class Settings(BaseSettings):
 
     db_echo: bool = False
 
+    db_migrar_na_subida: bool = True
+    """Se o `run` cria o schema e os gatilhos (padrao, e o caso do SQLite).
+
+    No Postgres de producao isto e `false`: quem cria schema e gatilhos e o
+    `crypto-traders migrar`, com o usuario DONO do banco, e a aplicacao roda com
+    um usuario que so le e grava linhas -- sem TRIGGER e sem CREATE, ela nao
+    consegue derrubar a propria trilha append-only. O `run` continua
+    conferindo que os gatilhos existem e recusa subir se faltar um.
+    """
+
+    # --- Observabilidade --------------------------------------------------
+    otel_exporter_otlp_endpoint: str = ""
+    """Coletor OpenTelemetry da plataforma (OTLP/HTTP), ex. `http://prd-otel-agente:4318`.
+
+    Vazio desliga traces, logs e metricas por OTLP; o log continua no console.
+    """
+
     # --- Event bus --------------------------------------------------------
     event_bus: str = Field(default="memory", pattern="^(memory|redis)$")
     redis_url: str = "redis://localhost:6379/0"
@@ -412,6 +430,13 @@ class Settings(BaseSettings):
     cors_origins: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: ["http://localhost:5173"]
     )
+
+    acesso_login_tailscale: str = ""
+    """Producao: o unico login Tailscale (e-mail) que passa pela API e pelas telas.
+
+    Vazio desliga a trava (desenvolvimento, so 127.0.0.1). Preenchido, todo pedido
+    sem `Tailscale-User-Login` igual a este recebe 403 (`api.app.PortaoTailscale`).
+    """
 
     # --- Exchange ---------------------------------------------------------
     # AMBIENTE: esta amarrada a qual credencial existe neste arquivo. Apontar
@@ -435,6 +460,10 @@ class Settings(BaseSettings):
     whatsapp_template_language: str = "pt_BR"
 
     binance: ExchangeCredentials = Field(default_factory=ExchangeCredentials)
+    binance_testnet: ExchangeCredentials = Field(default_factory=ExchangeCredentials)
+    """Chave da Binance Spot Testnet (`BINANCE_TESTNET__API_KEY`). Separada da real
+    de proposito: a chave de dinheiro real nunca viaja para a testnet, e a da
+    testnet nunca e usada em `live` -- trocar o modo nao troca a conta por engano."""
 
     # --- Negocio (preenchido pelo banco na subida) ------------------------
     trading: TradingSettings = Field(default_factory=TradingSettings)
@@ -520,13 +549,19 @@ class Settings(BaseSettings):
         """True quando ordens saem da maquina (LIVE ou TESTNET)."""
         return self.trading_mode in (TradingMode.LIVE, TradingMode.TESTNET)
 
-    def credentials_for(self, exchange: str) -> ExchangeCredentials:
+    def credentials_for(self, exchange: str, *, testnet: bool | None = None) -> ExchangeCredentials:
         """Credenciais da exchange, ou vazias se ela nao for suportada.
 
         Devolver vazio (em vez de falhar) mantem o caminho seguro: sem
-        credencial, `build_broker` recusa sair do modo simulado.
+        credencial, `build_broker` recusa sair do modo simulado. `testnet`
+        (padrao: o modo corrente) escolhe a chave da testnet -- nunca a real.
         """
-        return {"binance": self.binance}.get(exchange.lower(), ExchangeCredentials())
+        if testnet is None:
+            testnet = self.trading_mode is TradingMode.TESTNET
+        tabela = (
+            {"binance": self.binance_testnet} if testnet else {"binance": self.binance}
+        )
+        return tabela.get(exchange.lower(), ExchangeCredentials())
 
     def with_business_config(
         self, trading: TradingSettings, risk: RiskSettings

@@ -149,3 +149,38 @@ class TestDeterminism:
         second = await make_engine(risk_limits).run(candles)
         assert first.final_value == second.final_value
         assert len(first.trades) == len(second.trades)
+
+
+class TestRecusaPorSaldoNoBacktest:
+    """O `PaperBroker` levanta `InsufficientFunds`, como o `CcxtExchange`.
+
+    No sistema quem converte isso em REJECTED e o Execution Agent; o backtest
+    chama o broker direto e precisa do mesmo desfecho, senao uma compra que o
+    deslizamento empurra acima do caixa derrubaria a simulacao.
+    """
+
+    async def test_saldo_insuficiente_vira_recusa_e_nao_excecao(self):
+        from crypto_traders.backtest.engine import preenchimento
+        from crypto_traders.domain.enums import ExchangeName, OrderStatus, OrderType, Side
+        from crypto_traders.domain.models import OrderRequest
+        from crypto_traders.exchanges.paper import PaperBroker
+
+        broker = PaperBroker(quote_currency="USDC", initial_balance=Decimal("10"))
+        broker.set_price("BTC", Decimal("100"))
+        pedido = OrderRequest(
+            client_order_id="bt-sem-saldo",
+            signal_id=None,
+            risk_event_id="bt-sem-saldo",
+            exchange=ExchangeName.PAPER,
+            symbol="BTC/USDC",
+            side=Side.BUY,
+            order_type=OrderType.MARKET,
+            quantity=Decimal("1"),
+            notional=Decimal("100"),
+        )
+
+        resultado = await preenchimento(broker.place_order(pedido), pedido)
+
+        assert resultado.status is OrderStatus.REJECTED
+        assert "insuficiente" in (resultado.error or "")
+        assert (await broker.fetch_balances()) == {"USDC": Decimal("10")}
