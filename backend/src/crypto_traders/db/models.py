@@ -24,6 +24,8 @@ entrega ja custou tres defeitos silenciosos.
 
 from __future__ import annotations
 
+import json
+import math
 import re
 import sqlite3
 from collections.abc import Callable
@@ -34,6 +36,7 @@ from typing import Any
 from sqlalchemy import (
     JSON,
     Boolean,
+    CheckConstraint,
     Connection,
     Date,
     DateTime,
@@ -296,6 +299,38 @@ class Money(TypeDecorator):
 MONEY = Money()
 
 
+def _json_aceitavel(valor: Any) -> Any:
+    """Troca o que o tipo `json` do Postgres recusa por texto, recursivamente.
+
+    `json.dumps` escreve `NaN`/`Infinity` para float nao finito, e o Postgres
+    recusa o documento inteiro (`Token "NaN" is invalid`); `Decimal` nem chega
+    la, levanta TypeError. No SQLite os dois passavam, entao o defeito so
+    apareceria em producao: um indicador em aquecimento (media movel ainda sem
+    janela) derrubava a gravacao do sinal, e um `Decimal` num snapshot de risco
+    derrubava a do evento de risco. Vira TEXTO, e nao `null`: "NaN" continua
+    dizendo o que era.
+    """
+    if isinstance(valor, float) and not math.isfinite(valor):
+        return "NaN" if math.isnan(valor) else ("Infinity" if valor > 0 else "-Infinity")
+    if isinstance(valor, Decimal):
+        return str(valor)
+    if isinstance(valor, dict):
+        return {chave: _json_aceitavel(item) for chave, item in valor.items()}
+    if isinstance(valor, list | tuple):
+        return [_json_aceitavel(item) for item in valor]
+    return valor
+
+
+def json_para_o_banco(valor: Any) -> str:
+    """Serializador das colunas `JSON` do engine (`db.session.get_engine`).
+
+    `allow_nan=False` depois da limpeza: se algum caminho escapar dela, o erro
+    aparece AQUI, com o nome do problema, e nao como documento invalido no
+    Postgres.
+    """
+    return json.dumps(_json_aceitavel(valor), allow_nan=False)
+
+
 def utcnow() -> datetime:
     return datetime.now(UTC)
 
@@ -423,6 +458,20 @@ class Order(Base):
     raw: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
+#: Dominio fechado das colunas de `trades` que decidem o que o historico
+#: significa. `mode` tem quatro valores reais: os tres de `TradingMode` e
+#: `manual` (lancamento digitado, `api/routes/trades.py`). Um valor fora daqui
+#: (`paper`, `LIVE`, `bot`) faria o trade sumir dos filtros por modo e da
+#: apuracao do custo medio sem erro nenhum; o banco recusa na gravacao.
+#: Repetidos como literais pelo mesmo motivo de `_ORIGEM_MANUAL`: a regra vive
+#: dentro do banco. A migracao 2 (`db.migracoes`) usa estas mesmas regras.
+CHECKS_DE_TRADES: dict[str, str] = {
+    "ck_trades_origin": "origin IN ('agent', 'manual')",
+    "ck_trades_side": "side IN ('buy', 'sell')",
+    "ck_trades_mode": "mode IN ('dry_run', 'testnet', 'live', 'manual')",
+}
+
+
 class Trade(Base):
     """Historico consolidado: negociacoes dos agentes E lancamentos manuais.
 
@@ -442,6 +491,19 @@ class Trade(Base):
     __table_args__ = (
         Index("ix_trades_executed", "executed_at"),
         Index("ix_trades_symbol", "symbol"),
+        # Um trade de AGENTE por ordem. Sem isto, `_record` rodando duas vezes
+        # para a mesma ordem (fill parcial e depois o total, ou uma
+        # reconciliacao) gravava a mesma compra duas vezes -- e a duplicata e
+        # IRREMOVIVEL, porque `trades` e append-only. Parcial de proposito:
+        # lancamento manual pode repetir (ou nao ter) `order_id`.
+        Index(
+            "uq_trades_order_agent",
+            "order_id",
+            unique=True,
+            postgresql_where=text("origin = 'agent'"),
+            sqlite_where=text("origin = 'agent'"),
+        ),
+        *(CheckConstraint(regra, name=nome) for nome, regra in CHECKS_DE_TRADES.items()),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
@@ -535,7 +597,13 @@ class AuditLog(Base):
     """
 
     __tablename__ = "audit_log"
-    __table_args__ = (Index("ix_audit_ts", "timestamp"),)
+    __table_args__ = (
+        Index("ix_audit_ts", "timestamp"),
+        # O razao do Portfolio (`PortfolioLedgerRepository.movements`) filtra por
+        # `action` a cada retrato; so com o indice de `timestamp` isso varria a
+        # trilha inteira, que so cresce.
+        Index("ix_audit_action_ts", "action", "timestamp"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -677,9 +745,12 @@ TABELAS_APPEND_ONLY: dict[str, str] = {
 #: `risk_events` para reescrever linhas antigas, e isso era uma brecha e nao um
 #: detalhe, porque no pysqlite o DDL nao entra na transacao (medido) e uma falha
 #: no meio deixava o historico mutavel para sempre. Hoje a escala e imposta na
-#: LEITURA (`normalizar_dinheiro_lido`) e nenhum caminho de subida emite
-#: `DROP TRIGGER`. `verificar_protecao_append_only` confere na subida que os seis
-#: gatilhos existem, e o sistema RECUSA subir se faltar um.
+#: LEITURA (`normalizar_dinheiro_lido`) e, no SQLite, nenhum caminho de subida
+#: emite `DROP TRIGGER`. No Postgres o `migrar` emite `DROP TRIGGER IF EXISTS` +
+#: `CREATE TRIGGER` a cada rodada (e assim que um gatilho desligado volta a
+#: valer), mas na mesma transacao do schema, e la o DDL E transacional: nao ha
+#: instante sem gatilho. `verificar_protecao_append_only` confere na subida que
+#: os gatilhos existem e estao LIGADOS, e o sistema RECUSA subir se faltar um.
 _GATILHOS_APPEND_ONLY: dict[str, tuple[str, ...]] = {
     "sqlite": (
         "CREATE TRIGGER IF NOT EXISTS audit_log_sem_update BEFORE UPDATE ON audit_log "
@@ -729,7 +800,12 @@ _GATILHOS_TRADES: dict[str, tuple[str, ...]] = {
         "CREATE TRIGGER IF NOT EXISTS trades_sem_update BEFORE UPDATE ON trades "
         f"BEGIN SELECT RAISE(ABORT, '{_TRADES_IMUTAVEL}'); END",
         "CREATE TRIGGER IF NOT EXISTS trades_sem_delete_de_agente BEFORE DELETE ON trades "
-        f"WHEN OLD.origin <> '{_ORIGEM_MANUAL}' "
+        # `IS NOT`, e nao `<>`: com `origin` NULL, `<>` da NULL e o DELETE
+        # passaria. Em banco SQLite que ja existia o gatilho antigo fica (CREATE
+        # IF NOT EXISTS, e nenhum caminho de subida derruba gatilho no SQLite);
+        # la o caso pede uma linha com `origin` NULL, que a aplicacao nunca grava
+        # e que a coluna NOT NULL de todo banco criado pelo `create_all` recusa.
+        f"WHEN OLD.origin IS NOT '{_ORIGEM_MANUAL}' "
         f"BEGIN SELECT RAISE(ABORT, '{_TRADES_IMUTAVEL}'); END",
     ),
     "postgresql": (
@@ -739,7 +815,8 @@ _GATILHOS_TRADES: dict[str, tuple[str, ...]] = {
         "END $$",
         "CREATE OR REPLACE FUNCTION trades_delete_apenas_manual() RETURNS trigger "
         "LANGUAGE plpgsql AS $$ BEGIN "
-        f"IF OLD.origin <> '{_ORIGEM_MANUAL}' THEN RAISE EXCEPTION '{_TRADES_IMUTAVEL}'; END IF; "
+        f"IF OLD.origin IS DISTINCT FROM '{_ORIGEM_MANUAL}' THEN "
+        f"RAISE EXCEPTION '{_TRADES_IMUTAVEL}'; END IF; "
         "RETURN OLD; END $$",
         "DROP TRIGGER IF EXISTS trades_sem_update ON trades",
         "CREATE TRIGGER trades_sem_update BEFORE UPDATE ON trades "
@@ -784,12 +861,23 @@ GATILHOS_ESPERADOS: dict[str, tuple[str, ...]] = {
     ),
 }
 
-#: Como listar os gatilhos existentes, por dialeto.
+#: Como listar os gatilhos existentes, por dialeto: (nome, ligado?).
+#:
+#: No Postgres o NOME nao basta. `ALTER TABLE trades DISABLE TRIGGER
+#: trades_sem_update` (o dono fazendo uma correcao manual e esquecendo de
+#: religar) deixa o gatilho no catalogo e a tabela mutavel, e a conferencia por
+#: nome subia dizendo "gatilhos presentes" (auditoria de 09/11/2026, F3). Conta
+#: como protecao so o que dispara numa sessao comum: `tgenabled` 'O' (origem) ou
+#: 'A' (sempre). 'D' e desligado, e 'R' so dispara em modo replica -- o que, para
+#: a aplicacao, e desligado tambem. Schema `public` explicito: um gatilho com o
+#: mesmo nome numa tabela homonima de outro schema nao protege nada aqui.
 _SQL_LISTAR_GATILHOS: dict[str, str] = {
-    "sqlite": "SELECT name FROM sqlite_master WHERE type = 'trigger'",
+    "sqlite": "SELECT name, 1 FROM sqlite_master WHERE type = 'trigger'",
     "postgresql": (
-        "SELECT t.tgname FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid "
-        "WHERE NOT t.tgisinternal AND c.relname IN ('audit_log', 'risk_events', 'trades')"
+        "SELECT t.tgname, t.tgenabled::text IN ('O', 'A') FROM pg_trigger t "
+        "JOIN pg_class c ON c.oid = t.tgrelid "
+        "WHERE NOT t.tgisinternal AND c.relnamespace = 'public'::regnamespace "
+        "AND c.relname IN ('audit_log', 'risk_events', 'trades')"
     ),
 }
 
@@ -799,8 +887,11 @@ _OPCAO_INTERNA = {"crypto_traders_protecao": True}
 
 #: A separacao que so o PostgreSQL consegue impor de verdade: no SQLite qualquer
 #: conexao com o arquivo e dona do schema, entao a barreira do processo e o
-#: maximo possivel. No Postgres o dono do banco deve rodar isto uma vez, e ai
-#: nem um `DROP TRIGGER` vindo da aplicacao funciona -- o servidor recusa.
+#: maximo possivel. No Postgres isto tira o privilegio TRIGGER de quem roda, e
+#: so isso: o DONO das tabelas continua derrubando e desligando gatilho pela
+#: posse, revogado ou nao. A separacao de verdade e a aplicacao rodar com um
+#: usuario que nao e dono (`conceder_a_aplicacao`); em live, rodar como dono
+#: recusa a subida (`avisar_se_a_aplicacao_pode_derrubar_gatilho`).
 SQL_REVOGACAO_POSTGRES: tuple[str, ...] = (
     "REVOKE TRIGGER ON audit_log, risk_events, trades FROM CURRENT_USER",
     "REVOKE CREATE ON SCHEMA public FROM CURRENT_USER",
@@ -809,6 +900,10 @@ SQL_REVOGACAO_POSTGRES: tuple[str, ...] = (
 
 class ProtecaoAusenteError(RuntimeError):
     """Falta gatilho de trilha append-only no banco. O sistema nao sobe assim."""
+
+
+class AplicacaoPodeDerrubarGatilhoError(ProtecaoAusenteError):
+    """Em live, a aplicacao conectada como dono (ou superusuario) nao sobe."""
 
 
 def _aplicar_gatilhos_de(connection: Connection, tabela: str) -> tuple[str, ...]:
@@ -854,17 +949,23 @@ def verificar_protecao_append_only(connection: Connection) -> tuple[str, ...]:
             f"dialeto '{dialeto}' nao sabe impor trilha append-only; o sistema nao sobe nele"
         )
 
-    existentes = {
-        linha[0]
-        for linha in connection.execute(
-            text(consulta).execution_options(**_OPCAO_INTERNA)
-        ).all()
-    }
-    faltando = [nome for nome in esperados if nome not in existentes]
-    if faltando:
+    linhas = connection.execute(text(consulta).execution_options(**_OPCAO_INTERNA)).all()
+    existentes = {nome for nome, ligado in linhas if ligado}
+    desligados = sorted(nome for nome, ligado in linhas if not ligado and nome in esperados)
+    faltando = [nome for nome in esperados if nome not in existentes and nome not in desligados]
+    if faltando or desligados:
+        partes = []
+        if faltando:
+            partes.append(f"faltam os gatilhos {faltando}")
+        if desligados:
+            partes.append(
+                f"os gatilhos {desligados} existem mas estao DESLIGADOS "
+                "(ALTER TABLE ... DISABLE TRIGGER); o dono religa com "
+                "ALTER TABLE ... ENABLE TRIGGER, ou roda `crypto-traders migrar`"
+            )
         raise ProtecaoAusenteError(
-            "trilha append-only desprotegida: faltam os gatilhos "
-            f"{faltando} em {dialeto}. O sistema nao sobe com auditoria mutavel."
+            "trilha append-only desprotegida: " + "; ".join(partes) + f" em {dialeto}. "
+            "O sistema nao sobe com auditoria mutavel."
         )
     return tuple(sorted(existentes))
 
@@ -888,23 +989,33 @@ def conceder_a_aplicacao(connection: Connection, usuario: str) -> None:
         f"GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO {alvo}",
         f"GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO {alvo}",
         f"REVOKE TRIGGER ON audit_log, risk_events, trades FROM {alvo}",
+        # A versao do schema e do dono: a aplicacao le (a subida confere) e nao
+        # escreve, senao um INSERT dela "migraria" o banco sem migracao nenhuma.
+        f"REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON schema_versao FROM {alvo}",
     ):
         connection.execute(text(comando).execution_options(**_OPCAO_INTERNA))
 
 
 def avisar_se_a_aplicacao_pode_derrubar_gatilho(
-    connection: Connection, usuario: str | None = None
-) -> None:
+    connection: Connection, usuario: str | None = None, *, recusar: bool = False
+) -> bool:
     """No Postgres da para perguntar ao servidor quem pode mexer nos gatilhos.
 
     `usuario` e o da aplicacao quando quem pergunta e o `migrar` (o dono, que
-    sempre pode); sem ele, pergunta pelo usuario desta conexao.
+    sempre pode); sem ele, pergunta pelo usuario desta conexao. Devolve se pode.
 
-    Enquanto o usuario da aplicacao tiver o privilegio TRIGGER, ele consegue
-    derrubar a propria protecao -- e ai a ultima barreira e removivel por quem
-    ela deveria conter. Nao derruba a subida (revogar exige ser dono do banco, e
-    quem sobe o processo em geral nao e), mas sai no log com o SQL exato a
-    rodar.
+    "Pode" e qualquer um de tres caminhos, e nao so o privilegio TRIGGER: ser
+    DONO das tabelas (ou membro do papel dono) -- `DROP TRIGGER` e `ALTER TABLE
+    ... DISABLE TRIGGER` exigem ser dono, e o dono faz os dois mesmo depois de
+    revogar o proprio TRIGGER --, ser superusuario, ou ter TRIGGER concedido. A
+    sonda antiga perguntava so pelo privilegio.
+
+    Com `recusar=False` (dry_run, testnet) nao derruba a subida: sai no log, com
+    o SQL a rodar. Com `recusar=True` -- a subida da APLICACAO em live -- levanta
+    `AplicacaoPodeDerrubarGatilhoError`: o criterio do projeto e "na duvida nao
+    opera", e uma trilha append-only removivel por quem ela deveria conter nao e
+    trilha (auditoria de 09/11/2026, F4). Sonda que nao consegue responder, em
+    live, tambem recusa.
 
     Roda em conexao PROPRIA, fora da transacao que cria o schema, e nao por
     zelo: no PostgreSQL um comando que falha aborta a transacao inteira, e o
@@ -913,27 +1024,54 @@ def avisar_se_a_aplicacao_pode_derrubar_gatilho(
     diagnostico nao pode ter poder de apagar o banco.
     """
     if connection.dialect.name != "postgresql":
-        return
+        return False
+    quem = usuario or "current_user"
     try:
         pode = connection.execute(
             text(
-                "SELECT bool_or(has_table_privilege(COALESCE(:usuario, current_user), t, "
-                "'TRIGGER')) FROM unnest(ARRAY['audit_log', 'risk_events', 'trades']) AS t"
+                "SELECT bool_or(has_table_privilege(u.nome, c.oid, 'TRIGGER') "
+                "OR pg_has_role(u.nome, c.relowner, 'USAGE')) "
+                "OR bool_or(r.rolsuper) "
+                "FROM (SELECT COALESCE(CAST(:usuario AS text), current_user::text)::name "
+                "AS nome) u "
+                "JOIN pg_roles r ON r.rolname = u.nome "
+                "CROSS JOIN pg_class c "
+                "WHERE c.relnamespace = 'public'::regnamespace "
+                "AND c.relname IN ('audit_log', 'risk_events', 'trades')"
             ).execution_options(**_OPCAO_INTERNA),
             {"usuario": usuario},
         ).scalar()
-    except Exception as exc:  # pragma: no cover - servidor sem has_table_privilege
+    except Exception as exc:  # pragma: no cover - servidor sem as funcoes de privilegio
+        if recusar:
+            raise AplicacaoPodeDerrubarGatilhoError(
+                f"nao foi possivel conferir se o usuario {quem} pode derrubar os gatilhos "
+                f"das trilhas append-only ({exc}); em live o sistema nao sobe na duvida."
+            ) from exc
         log.warning("db.privilegio_indeterminado", error=str(exc))
-        return
-    if pode:
-        log.error(
-            "db.aplicacao_pode_derrubar_gatilho",
-            usuario=usuario or "current_user",
-            detail=(
-                "o usuario da aplicacao tem privilegio TRIGGER nas trilhas append-only; "
-                "rode como dono do banco: " + "; ".join(SQL_REVOGACAO_POSTGRES)
-            ),
+        return False
+    if not pode:
+        return False
+    if recusar:
+        raise AplicacaoPodeDerrubarGatilhoError(
+            f"o usuario do banco desta aplicacao ({quem}) pode derrubar ou desligar os "
+            "gatilhos das trilhas append-only (e dono das tabelas, superusuario ou tem "
+            "TRIGGER). Em live o sistema nao sobe assim: rode a aplicacao com o usuario "
+            "da aplicacao (o `crypto-traders migrar --usuario-aplicacao <usuario>`, com "
+            "o dono, concede so leitura e escrita de linhas) e DB_MIGRAR_NA_SUBIDA=false."
         )
+    log.error(
+        "db.aplicacao_pode_derrubar_gatilho",
+        usuario=quem,
+        detail=(
+            "o usuario da aplicacao pode derrubar ou desligar os gatilhos das trilhas "
+            "append-only (dono das tabelas, superusuario ou privilegio TRIGGER); rode a "
+            "aplicacao com um usuario que nao e dono (`crypto-traders migrar "
+            "--usuario-aplicacao`), ou, se for so o privilegio, rode como dono: "
+            + "; ".join(SQL_REVOGACAO_POSTGRES)
+            + ". Em live isto RECUSA a subida."
+        ),
+    )
+    return True
 
 
 def hypertable_possivel(tabela: str, coluna_de_tempo: str) -> list[str]:
@@ -1240,7 +1378,8 @@ def _recusar_sql_cru_contra_a_protecao(sql: str, execution_options: Any) -> None
 
     1. **PostgreSQL nao tem autorizador.** La esta lista e tudo o que existe no
        processo, e ela e explicitamente best-effort: a defesa de verdade no
-       Postgres e privilegio, `SQL_REVOGACAO_POSTGRES`, conferido na subida por
+       Postgres e privilegio -- a aplicacao com usuario que nao e dono
+       (`conceder_a_aplicacao`) --, conferido na subida por
        `avisar_se_a_aplicacao_pode_derrubar_gatilho`.
     2. **Mensagem.** Ela recusa antes de o comando sair do processo e nomeia o
        comando; o autorizador recusa depois, e o driver so diz "not authorized"

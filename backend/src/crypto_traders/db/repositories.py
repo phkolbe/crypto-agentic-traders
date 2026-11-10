@@ -20,7 +20,10 @@ from sqlalchemy.orm import aliased
 
 from ..domain import models as dm
 from ..domain.enums import OrderStatus, RiskEventType, TradeOrigin
+from ..logging_setup import get_logger
 from . import models as orm
+
+log = get_logger(__name__)
 
 
 def _new_id() -> str:
@@ -45,6 +48,22 @@ def _aware(value: datetime | None) -> datetime | None:
     if value is None:
         return None
     return value if value.tzinfo else value.replace(tzinfo=UTC)
+
+
+def _mais_novos(linhas: list[Any], limite: int, consulta: str, modo: str | None) -> list[Any]:
+    """`linhas` em ordem DECRESCENTE, lidas com `limite + 1`; corta e grita se passou."""
+    if len(linhas) > limite:
+        log.error(
+            "db.historico_truncado",
+            consulta=consulta,
+            limite=limite,
+            modo=modo,
+            detail=(
+                "o historico tem mais linhas que o limite; os registros mais ANTIGOS "
+                "ficaram de fora e o que for derivado dele (custo medio, razao) sai errado"
+            ),
+        )
+    return linhas[:limite]
 
 
 class CandleRepository:
@@ -361,19 +380,37 @@ class TradeRepository:
         await self._session.delete(trade)
         return True
 
-    async def for_cost_basis(self, limit: int = 200_000) -> list[orm.Trade]:
-        """Historico inteiro, para derivar custo medio e PnL realizado.
+    async def for_cost_basis(
+        self, limit: int = 200_000, *, modo: str | None = None
+    ) -> list[orm.Trade]:
+        """Historico para derivar custo medio e PnL realizado, em ordem cronologica.
 
-        Sem filtro de modo, de cotacao ou de origem **de proposito**: quem apura
-        (`PortfolioAgent._apurar`) precisa VER o trade que vai descartar para
-        registrar o descarte no `audit_log`. Filtrar aqui deixaria o descarte
-        invisivel, que e como este projeto perde protecao.
+        Sem `modo`, sem filtro de modo, de cotacao ou de origem **de proposito**:
+        quem apura (`PortfolioAgent._apurar`) precisa VER o trade que vai
+        descartar para registrar o descarte no `audit_log`. Filtrar aqui deixaria
+        o descarte invisivel, que e como este projeto perde protecao. Com
+        `modo`, o filtro vai para o SQL (o modo pedido mais os lancamentos
+        manuais, que valem em qualquer modo), e o limite passa a contar so o
+        historico que a apuracao usa.
+
+        O limite guarda os MAIS NOVOS. Era o contrario (ordem crescente com
+        limite), e ao bater o limite caiam justamente os registros mais novos:
+        depois de semanas de dry_run, os trades do live (auditoria de
+        09/11/2026, banco). Bater o limite continua sendo historico truncado --
+        o custo medio sai errado --, entao sai ERROR com o tamanho.
 
         A ordenacao final e feita em Python: compra tem de vir antes de venda
         quando o instante empata, e isso o banco nao sabe.
         """
-        stmt = select(orm.Trade).order_by(orm.Trade.executed_at.asc()).limit(limit)
-        return list((await self._session.execute(stmt)).scalars().all())
+        stmt = select(orm.Trade)
+        if modo is not None:
+            stmt = stmt.where(orm.Trade.mode.in_([modo, str(TradeOrigin.MANUAL)]))
+        # Um a mais que o limite: e o que distingue "cabia exatamente" de "cortou".
+        stmt = stmt.order_by(orm.Trade.executed_at.desc(), orm.Trade.id.desc()).limit(limit + 1)
+        trades = list((await self._session.execute(stmt)).scalars().all())
+        trades = _mais_novos(trades, limit, "trades.for_cost_basis", modo)
+        trades.reverse()
+        return trades
 
     async def realized_pnl_total(self) -> Decimal:
         """Soma a COLUNA `realized_pnl` em Python, nao com `SUM()` no banco.
@@ -608,16 +645,25 @@ class PortfolioLedgerRepository:
         self._session = session
 
     async def movements(
-        self, actions: Sequence[str], limit: int = 20_000
+        self, actions: Sequence[str], limit: int = 20_000, *, modo: str | None = None
     ) -> list[orm.AuditLog]:
-        """Movimentos do razao, em ordem cronologica."""
-        stmt = (
-            select(orm.AuditLog)
-            .where(orm.AuditLog.action.in_(list(actions)))
-            .order_by(orm.AuditLog.timestamp.asc())
-            .limit(limit)
+        """Movimentos do razao, em ordem cronologica; com `modo`, so os dele.
+
+        O limite guarda os MAIS NOVOS, e bater nele sai como ERROR: o razao e
+        uma soma, e soma de historico truncado esta errada (ver
+        `TradeRepository.for_cost_basis`, mesmo defeito). O filtro de modo e
+        sobre `after.mode`, onde o Portfolio grava o modo do movimento.
+        """
+        stmt = select(orm.AuditLog).where(orm.AuditLog.action.in_(list(actions)))
+        if modo is not None:
+            stmt = stmt.where(orm.AuditLog.after["mode"].as_string() == modo)
+        stmt = stmt.order_by(orm.AuditLog.timestamp.desc(), orm.AuditLog.id.desc()).limit(
+            limit + 1
         )
-        return list((await self._session.execute(stmt)).scalars().all())
+        movimentos = list((await self._session.execute(stmt)).scalars().all())
+        movimentos = _mais_novos(movimentos, limit, "audit_log.movements", modo)
+        movimentos.reverse()
+        return movimentos
 
 
 class OnChainMetricRepository:

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from functools import partial
 
 from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import (
@@ -19,14 +20,15 @@ from sqlalchemy.ext.asyncio import (
 
 from ..config import Settings, get_settings
 from ..logging_setup import get_logger
+from .migracoes import VERSAO_ATUAL, aplicar_migracoes, verificar_schema, verificar_versao
 from .models import (
-    Base,
     ProtecaoAusenteError,
     aplicar_protecao_append_only,
     avisar_se_a_aplicacao_pode_derrubar_gatilho,
     conceder_a_aplicacao,
     hypertable_possivel,
     instalar_autorizador_sqlite,
+    json_para_o_banco,
     relatar_dinheiro_fora_de_escala,
     verificar_protecao_append_only,
 )
@@ -96,6 +98,8 @@ def get_engine(settings: Settings | None = None) -> AsyncEngine:
             echo=settings.db_echo,
             future=True,
             pool_pre_ping=True,
+            # NaN e Decimal nas colunas JSON: ver `models.json_para_o_banco`.
+            json_serializer=json_para_o_banco,
         )
         if settings.database_url.startswith("sqlite"):
             _tune_sqlite(_engine)
@@ -215,28 +219,41 @@ async def init_db(
     *,
     migrar: bool | None = None,
     usuario_aplicacao: str | None = None,
+    como_dono: bool = False,
 ) -> None:
-    """Cria o schema e, no Postgres, converte as series temporais em hypertables.
+    """Migra o schema e, no Postgres, converte as series temporais em hypertables.
+
+    Com `migrar=True`: migracoes versionadas (`db.migracoes`, que inclui o
+    `create_all` das tabelas ausentes), gatilhos, e a conferencia do banco contra
+    o modelo -- tudo numa transacao.
 
     Com `migrar=False` (ou `DB_MIGRAR_NA_SUBIDA=false`) nao cria nada: so confere
-    que o schema e os gatilhos append-only estao no banco e recusa subir se nao
-    estiverem. E o caminho do Docker, onde a aplicacao roda com um usuario sem
+    gatilhos, versao do schema e o banco contra o modelo, e recusa subir se algo
+    faltar. E o caminho do Docker, onde a aplicacao roda com um usuario sem
     privilegio de DDL e o schema e do `crypto-traders migrar` (usuario dono).
 
     `usuario_aplicacao` (Postgres, so no `migrar`): concede a ele leitura e
     escrita de linhas, e a sonda de privilegio passa a perguntar por ELE -- o
     dono, que roda o `migrar`, sempre pode mexer em gatilho, e acusa-lo seria
     um alarme falso.
+
+    `como_dono`: True so no `crypto-traders migrar`, que e o dono por definicao.
+    Fora dele, em live, a aplicacao conectada como dono ou superusuario RECUSA
+    subir (`AplicacaoPodeDerrubarGatilhoError`); em dry_run e testnet e aviso.
     """
     settings = settings or get_settings()
     if migrar is None:
         migrar = settings.db_migrar_na_subida
     engine = get_engine(settings)
+    recusar_dono = settings.is_live and not como_dono
     if not migrar:
-        await _conferir_db(settings, engine)
+        await _conferir_db(settings, engine, recusar_dono=recusar_dono)
         return
     async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+        # Migracoes antes dos gatilhos: a 2 mexe na funcao do gatilho de
+        # `trades` so pelo `CREATE OR REPLACE` abaixo, e numa transacao so -- no
+        # Postgres, migracao que falha desfaz o carimbo da versao junto.
+        await conn.run_sync(aplicar_migracoes)
         # Re-aplicado a cada subida: banco criado antes destes gatilhos
         # existirem tambem precisa passar a recusar UPDATE/DELETE na auditoria.
         # Sem try/except de proposito, e ao contrario das hypertables: auditoria
@@ -247,12 +264,18 @@ async def init_db(
         # Aqui havia uma afirmacao falsa: "tudo dentro DESTA transacao". Nao
         # estava -- no pysqlite/aiosqlite o DDL emitido antes do primeiro DML da
         # conexao e autocommitado e sobrevive ao rollback (medido nos dois
-        # lados, com o `UPDATE` do mesmo bloco voltando atras). Por isso nenhum
-        # caminho de subida emite `DROP TRIGGER`: a protecao so cresce, nunca
-        # sai do ar nem por um instante. E como rollback nao e garantia, quem
-        # garante e esta conferencia, que levanta `ProtecaoAusenteError` e
-        # impede o sistema de subir com trilha mutavel.
+        # lados, com o `UPDATE` do mesmo bloco voltando atras). Por isso, no
+        # SQLite, nenhum caminho de subida emite `DROP TRIGGER`: la a protecao
+        # so cresce. No Postgres o `DROP TRIGGER IF EXISTS` + `CREATE TRIGGER`
+        # de `aplicar_protecao_append_only` roda nesta transacao, onde o DDL E
+        # transacional: nao ha janela sem gatilho. E como rollback nao e
+        # garantia no SQLite, quem garante e esta conferencia, que levanta
+        # `ProtecaoAusenteError` e impede o sistema de subir com trilha mutavel.
         await conn.run_sync(verificar_protecao_append_only)
+        # O `migrar` tambem confere o resultado: migracao esquecida (modelo
+        # mudou, `db/migracoes.py` nao) falha AQUI, com o dono olhando, e nao na
+        # subida seguinte da aplicacao.
+        await conn.run_sync(verificar_schema)
         # So diagnostico, e nao escreve nada: a escala de dinheiro ja e imposta
         # na leitura por `normalizar_dinheiro_lido`, entao nao ha historico a
         # reescrever -- e reescrever historico exigiria justamente derrubar o
@@ -270,16 +293,24 @@ async def init_db(
                 await conn.run_sync(conceder_a_aplicacao, usuario_aplicacao)
             log.info("db.privilegios_da_aplicacao", usuario=usuario_aplicacao)
         async with engine.connect() as conn:
-            await conn.run_sync(avisar_se_a_aplicacao_pode_derrubar_gatilho, usuario_aplicacao)
+            await conn.run_sync(
+                partial(
+                    avisar_se_a_aplicacao_pode_derrubar_gatilho,
+                    usuario=usuario_aplicacao,
+                    recusar=recusar_dono,
+                )
+            )
 
-    log.info("db.initialized")
+    log.info("db.initialized", versao_do_schema=VERSAO_ATUAL)
 
 
-async def _conferir_db(settings: Settings, engine: AsyncEngine) -> None:
-    """A metade de `init_db` que so le: gatilhos presentes, privilegios, escala."""
+async def _conferir_db(settings: Settings, engine: AsyncEngine, *, recusar_dono: bool) -> None:
+    """A metade de `init_db` que so le: gatilhos, versao, schema, privilegios, escala."""
     try:
         async with engine.connect() as conn:
             await conn.run_sync(verificar_protecao_append_only)
+            await conn.run_sync(verificar_versao)
+            await conn.run_sync(verificar_schema)
             await conn.run_sync(relatar_dinheiro_fora_de_escala)
     except ProtecaoAusenteError as exc:
         raise ProtecaoAusenteError(
@@ -288,8 +319,14 @@ async def _conferir_db(settings: Settings, engine: AsyncEngine) -> None:
         ) from exc
     if settings.database_url.startswith("postgresql"):
         async with engine.connect() as conn:
-            await conn.run_sync(avisar_se_a_aplicacao_pode_derrubar_gatilho)
-    log.info("db.conferido", detail="schema e gatilhos presentes; nada criado na subida")
+            await conn.run_sync(
+                partial(avisar_se_a_aplicacao_pode_derrubar_gatilho, recusar=recusar_dono)
+            )
+    log.info(
+        "db.conferido",
+        versao_do_schema=VERSAO_ATUAL,
+        detail="gatilhos, versao e schema conferidos; nada criado na subida",
+    )
 
 
 async def dispose_engine() -> None:
