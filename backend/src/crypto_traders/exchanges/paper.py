@@ -48,8 +48,21 @@ class PaperBroker(Broker):
         fee_pct: Decimal = Decimal("0.001"),
         slippage_pct: Decimal = Decimal("0.0005"),
         simulated_exchange: str = "binance",
+        preenche_limit_no_preco: bool = True,
     ) -> None:
         self.quote_currency = quote_currency
+        self.preenche_limit_no_preco = preenche_limit_no_preco
+        """LIMIT preenche na hora ao preco pedido (`True`) ou e recusada (`False`).
+
+        O papel nao tem livro de ofertas: nao sabe se uma LIMIT ficaria parada no
+        livro, nem a que preco o mercado a executaria. Preencher ao preco-limite
+        sem olhar o mercado (auditoria de 09/11/2026, exchanges M3 d) e regra do
+        BACKTEST, onde o motor ja decidiu pelo candle o preco da saida de
+        protecao e usa a LIMIT para dizer "a este preco". No dry_run
+        (`build_broker`) ninguem decidiu nada: uma LIMIT ali seria simulada
+        errada, e recusar com motivo e melhor do que preencher de mentira. Hoje o
+        sistema so envia MARKET; isto e a cerca para o dia em que nao for assim.
+        """
         self.fee_pct = fee_pct
         self.slippage_pct = slippage_pct
         self.simulated_exchange = simulated_exchange
@@ -143,6 +156,25 @@ class PaperBroker(Broker):
             )
             return anterior.model_copy(
                 update={"raw": {**anterior.raw, "duplicate": True}}
+            )
+
+        if request.order_type is OrderType.LIMIT and not self.preenche_limit_no_preco:
+            # Nao memoriza: nada foi criado, como a recusa por filtro.
+            log.warning(
+                "paper.limit_recusada",
+                symbol=request.symbol,
+                client_order_id=request.client_order_id,
+            )
+            return OrderResult(
+                order_request_id=request.id,
+                client_order_id=request.client_order_id,
+                exchange_order_id=None,
+                status=OrderStatus.REJECTED,
+                error=(
+                    "ordem LIMIT nao e simulada no dry_run: o broker de papel nao tem "
+                    "livro de ofertas e preencheria ao preco-limite sem olhar o mercado"
+                ),
+                raw={"simulated": True},
             )
 
         base, quote = _split_symbol(request.symbol)

@@ -26,6 +26,7 @@ from .base import (
     ExchangeError,
     InsufficientFunds,
     MarketDataSource,
+    timeframe_seconds,
 )
 from .filters import MarketFilter, baseline_market_filter
 
@@ -75,6 +76,13 @@ _RECUSA_NA_PORTA = (
     ccxt.DDoSProtection,
 )
 
+#: 418 da Binance: o IP esta banido (ver `_espera_pedida`).
+_HTTP_BAN = re.compile(r"(?<!\d)418(?!\d)")
+
+#: Maior `Retry-After` que o retry espera dentro da chamada. Acima disto quem
+#: chamou recebe o erro na hora, e o proximo ciclo dele e a nova tentativa.
+_ESPERA_MAXIMA_NO_RETRY = 30.0
+
 #: Espera antes de consultar o desfecho de um envio sem resposta: da ao motor da
 #: exchange tempo de processar a mensagem que ainda pode estar na fila.
 _ESPERA_ANTES_DA_CONSULTA = 1.0
@@ -87,9 +95,24 @@ _ESPERA_ANTES_DA_CONSULTA = 1.0
 #: da chave, e apontar o IP nesse caso mandaria o operador investigar o lugar
 #: errado.
 #:
-#: O `ip` usa limite de palavra de proposito: "ip" como substring solta
+#: O `\bip\b` usa limite de palavra de proposito: "ip" como substring solta
 #: casaria com "multiple", "description" e praticamente qualquer mensagem.
-_IP_HINT = re.compile(r"-2015|whitelist|ip", re.IGNORECASE)
+#:
+#: Ate a rodada 3 os dois `\b` estavam gravados como o CARACTERE de controle
+#: backspace (0x08) dentro da string crua: a expressao procurava "<BS>ip<BS>", que
+#: nao aparece em mensagem nenhuma, e um "IP address not allowed" sem `-2015` nem
+#: "whitelist" mandava conferir a chave em vez do IP.
+_IP_HINT = re.compile(r"-2015|whitelist|\bip\b", re.IGNORECASE)
+
+
+#: Maximo de klines por chamada na Binance spot (`GET /api/v3/klines`). Acima
+#: disto o ccxt corta o `limit` sem avisar; `fetch_candles` pagina.
+_CANDLES_POR_PAGINA = 1000
+
+
+def _agora_ms() -> int:
+    """Instante atual em ms (funcao propria para o teste fixar o relogio)."""
+    return int(datetime.now(UTC).timestamp() * 1000)
 
 
 def _dec(value: Any) -> Decimal:
@@ -212,6 +235,7 @@ class CcxtExchange(MarketDataSource, Broker):
                     raise ExchangeError(f"{self.name}.{operation}: {exc}") from exc
                 if isinstance(exc, ccxt.InvalidNonce):
                     await self._ressincronizar_relogio(operation)
+                espera = self._espera_pedida(operation, exc)
                 last_error = exc
                 log.warning(
                     "exchange.retry",
@@ -221,11 +245,50 @@ class CcxtExchange(MarketDataSource, Broker):
                     error=str(exc),
                 )
                 if attempt < self._max_retries:
-                    await asyncio.sleep(delay)
+                    await asyncio.sleep(max(delay, espera or 0.0))
                     delay *= 2
         raise ExchangeError(
             f"{self.name}.{operation} falhou apos {self._max_retries} tentativas: {last_error}"
         )
+
+    def _espera_pedida(self, operation: str, exc: Exception) -> float | None:
+        """Quanto a exchange mandou esperar num 429/418; levanta se nao vale retentar.
+
+        O backoff fixo de 1 s e 2 s ignorava o `Retry-After`, e a Binance documenta
+        que nao recuar depois de um 429 leva ao ban do IP (418), que cresce para
+        quem reincide -- de 2 minutos a 3 dias. Reenviar durante o ban e
+        reincidir, e o ban por IP derruba tambem as chamadas privadas, inclusive
+        a venda do stop (auditoria de 09/11/2026, exchanges L2). Entao:
+
+        * **418** (ban), com ou sem cabecalho: nao retenta. Nenhum retry de
+          segundos cabe num ban de minutos;
+        * **429 com espera acima de `_ESPERA_MAXIMA_NO_RETRY`**: nao retenta.
+          Dormir minutos aqui prenderia o ciclo de quem chamou (Market Data,
+          Portfolio, a ordem), e o proximo ciclo ja e a nova tentativa;
+        * **429 com espera curta**: espera o que foi pedido (no minimo o backoff);
+        * **sem cabecalho**: `None`, e vale o backoff de antes.
+        """
+        if not isinstance(exc, _RECUSA_NA_PORTA):
+            return None
+        cabecalhos = getattr(self._client, "last_response_headers", None) or {}
+        bruto = next(
+            (valor for chave, valor in cabecalhos.items() if str(chave).lower() == "retry-after"),
+            None,
+        )
+        try:
+            espera = float(bruto) if bruto is not None else None
+        except (TypeError, ValueError):
+            espera = None
+        banido = isinstance(exc, ccxt.DDoSProtection) and bool(_HTTP_BAN.search(str(exc)))
+        if banido or (espera is not None and espera > _ESPERA_MAXIMA_NO_RETRY):
+            pedido = f"{espera:.0f}s" if espera is not None else "nao informada"
+            raise ExchangeError(
+                f"{self.name}.{operation}: limite de requisicoes da exchange "
+                f"(HTTP {'418, IP banido' if banido else '429'}; espera pedida {pedido}). "
+                "Nao retentado: reenviar dentro da espera e o que faz a Binance banir o "
+                f"IP e alongar o ban. Erro original: {exc}"
+            ) from exc
+        return espera
 
     def _levantar_se_definitivo(self, operation: str, exc: Exception) -> None:
         """Traduz as respostas que nenhum retry resolve, qualquer que seja a operacao.
@@ -282,7 +345,9 @@ class CcxtExchange(MarketDataSource, Broker):
 
         * **recusa na porta** (429/418 sem `-2015`, e `-1021` depois de
           ressincronizar o relogio): a Binance respondeu sem processar o pedido,
-          nada entrou no motor, e reenviar e seguro;
+          nada entrou no motor, e reenviar e seguro -- mas nao dentro do ban: o
+          418, e o 429 com `Retry-After` longo, nao sao reenviados
+          (`_espera_pedida`);
         * **desfecho desconhecido** (timeout, `-1007`, `-1006`, `-1000`/`-1001`,
           HTTP 5xx, conexao caida, resposta ilegivel -- tudo `OperationFailed` no
           ccxt 4.5): consulta a ordem pelo `clientOrderId`. Achou, devolve o
@@ -300,11 +365,13 @@ class CcxtExchange(MarketDataSource, Broker):
                 return await self._client.create_order(*args)
             except ccxt.BaseError as exc:
                 self._levantar_se_definitivo("create_order", exc)
+                espera = None
                 if isinstance(exc, ccxt.InvalidNonce):
                     # `-1021`: timestamp recusado na validacao, antes do motor.
                     await self._ressincronizar_relogio("create_order")
                 elif isinstance(exc, _RECUSA_NA_PORTA):
-                    pass
+                    # Seguro reenviar, mas nao dentro do ban (`_espera_pedida`).
+                    espera = self._espera_pedida("create_order", exc)
                 elif isinstance(exc, ccxt.OperationFailed):
                     return await self._descobrir_desfecho(request, exc)
                 else:
@@ -319,7 +386,7 @@ class CcxtExchange(MarketDataSource, Broker):
                     error=str(exc),
                 )
                 if attempt < self._max_retries:
-                    await asyncio.sleep(delay)
+                    await asyncio.sleep(max(delay, espera or 0.0))
                     delay *= 2
         # Todas as tentativas foram recusadas NA PORTA: nenhuma ordem foi criada, e
         # FAILED aqui e verdade.
@@ -391,11 +458,22 @@ class CcxtExchange(MarketDataSource, Broker):
     # MarketDataSource
     # ------------------------------------------------------------------
     async def fetch_candles(self, symbol: str, timeframe: str, limit: int = 500) -> list[Candle]:
-        raw = await self._with_retry(
-            "fetch_ohlcv", self._client.fetch_ohlcv, symbol, timeframe, None, limit
-        )
+        """Os `limit` candles mais recentes, o ultimo ainda em formacao.
+
+        Acima de `_CANDLES_POR_PAGINA` a busca e paginada (`_paginar_ohlcv`): a
+        Binance devolve no maximo 1000 klines por chamada e o ccxt corta o
+        `limit` em silencio. Ate a rodada 3 isto era uma chamada so, e os 90 dias
+        do backtest em 1h (2160 candles) chegavam como 1000 -- 41 dias medidos
+        como se fossem 90.
+        """
+        if limit <= _CANDLES_POR_PAGINA:
+            raw = await self._with_retry(
+                "fetch_ohlcv", self._client.fetch_ohlcv, symbol, timeframe, None, limit
+            )
+        else:
+            raw = await self._paginar_ohlcv(symbol, timeframe, limit)
         exchange_name = self._exchange_enum()
-        linhas = _linhas_ohlcv_confiaveis(self.name, symbol, raw)
+        linhas = _linhas_ohlcv_confiaveis(self.name, symbol, raw)[-limit:]
         candles: list[Candle] = []
         for index, (timestamp, open_, high, low, close, volume) in enumerate(linhas):
             candles.append(
@@ -424,6 +502,49 @@ class CcxtExchange(MarketDataSource, Broker):
             )
         return candles
 
+    async def _paginar_ohlcv(self, symbol: str, timeframe: str, limit: int) -> list[Any]:
+        """Linhas cruas da janela dos ultimos `limit` candles, pagina a pagina.
+
+        O cursor anda pela ABERTURA da ultima linha recebida mais 1 ms, e nao por
+        "mais um timeframe": em `1M` o mes tem 28 a 31 dias, e somar a duracao
+        nominal pulava fevereiro. Com "> ultima abertura" nada se repete e nada
+        se pula, mesmo com buraco na exchange (manutencao sem klines) ou pagina
+        que volta para tras -- a desduplicacao final (`_linhas_ohlcv_confiaveis`)
+        cobre o resto. Para quando chega ao candle em formacao, quando a pagina
+        vem vazia, quando o cursor nao avanca, ou no teto de paginas: uma exchange
+        que ignora o `since` nao pode virar laco infinito.
+        """
+        passo_ms = timeframe_seconds(timeframe) * 1000
+        agora = _agora_ms()
+        em_formacao = agora - agora % passo_ms
+        inicio = desde = em_formacao - (limit - 1) * passo_ms
+        maximo_de_paginas = limit // _CANDLES_POR_PAGINA + 3
+        linhas: list[Any] = []
+        for _ in range(maximo_de_paginas):
+            pagina = await self._with_retry(
+                "fetch_ohlcv",
+                self._client.fetch_ohlcv,
+                symbol,
+                timeframe,
+                desde,
+                _CANDLES_POR_PAGINA,
+            )
+            com_abertura = [
+                row
+                for row in pagina or []
+                if isinstance(row, (list, tuple)) and row and row[0] is not None
+            ]
+            if not com_abertura:
+                break
+            # So o que cai na janela pedida: uma exchange que ignora o cursor e
+            # devolve o comeco do historico nao pode virar "os ultimos candles".
+            linhas.extend(row for row in com_abertura if int(row[0]) >= inicio)
+            ultima = max(int(row[0]) for row in com_abertura)
+            if ultima >= em_formacao or ultima < desde:
+                break
+            desde = ultima + 1
+        return linhas
+
     async def fetch_markets_and_tickers(
         self,
     ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
@@ -437,6 +558,11 @@ class CcxtExchange(MarketDataSource, Broker):
     async def fetch_ticker(self, symbol: str) -> Ticker:
         raw = await self._with_retry("fetch_ticker", self._client.fetch_ticker, symbol)
         price = raw.get("last") or raw.get("close") or raw.get("bid")
+        if price is None:
+            # Como em `fetch_tickers`: sem preco na resposta nao existe ticker. Antes
+            # saia preco ZERO, que e "o ativo nao vale nada" -- so o Market Data
+            # recusar preco <= 0 impedia o stop de ler isso (exchanges L1).
+            raise ExchangeError(f"{self.name}.fetch_ticker: resposta sem preco para {symbol}")
         return Ticker(exchange=self._exchange_enum(), symbol=symbol, price=_dec(price))
 
     async def fetch_tickers(self, symbols: list[str]) -> dict[str, Ticker]:
