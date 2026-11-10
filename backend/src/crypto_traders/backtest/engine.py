@@ -22,7 +22,7 @@ import math
 from collections import Counter
 from collections.abc import Awaitable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 from ..config import RiskSettings
@@ -35,11 +35,12 @@ from ..domain.enums import (
     SignalDirection,
 )
 from ..domain.models import Candle, OrderRequest, OrderResult
-from ..exchanges.base import InsufficientFunds
+from ..exchanges.base import InsufficientFunds, timeframe_seconds
 from ..exchanges.paper import PaperBroker
 from ..logging_setup import get_logger
 from ..risk.rules import PortfolioState, RiskEngine
 from ..strategies import MarketFrame, Strategy
+from .protecao import FOLGAS_PADRAO, FolgasDeProtecao, saida_de_protecao
 
 log = get_logger(__name__)
 
@@ -202,8 +203,12 @@ class BacktestEngine:
         fee_pct: Decimal = Decimal("0.001"),
         slippage_pct: Decimal = Decimal("0.0005"),
         lookback: int = 500,
+        folgas: FolgasDeProtecao = FOLGAS_PADRAO,
     ) -> None:
         self.strategy = strategy
+        # Stop e alvo lidos como a producao os ve (ticker de 60 s), na mesma
+        # regra do motor de carteira. Ver `protecao.py`.
+        self.folgas = folgas
         self.risk = RiskEngine(risk_limits, quote_currency)
         self.quote_currency = quote_currency
         self.initial_balance = initial_balance
@@ -231,11 +236,14 @@ class BacktestEngine:
             slippage_pct=self.slippage_pct,
         )
 
+        # O periodo medido comeca no primeiro candle em que a estrategia pode
+        # operar, como o comprar-e-segurar: contar o aquecimento no inicio
+        # mostrava ao operador uma data em que nada podia ter acontecido.
         result = BacktestResult(
             strategy=self.strategy.name,
             symbol=reference.symbol,
             timeframe=reference.timeframe,
-            start=closed[0].open_time,
+            start=closed[self.strategy.min_candles].open_time,
             end=reference.open_time,
             initial_balance=self.initial_balance,
             final_value=self.initial_balance,
@@ -248,26 +256,28 @@ class BacktestEngine:
         held = Decimal(0)
         last_order_at: dict[str, datetime] = {}
         protection: tuple[Decimal, Decimal] | None = None
+        duracao = timedelta(seconds=timeframe_seconds(reference.timeframe))
 
         for index in range(self.strategy.min_candles, len(closed)):
             window = closed[max(0, index + 1 - self.lookback) : index + 1]
             current = window[-1]
             price = current.close
             broker.set_price(base, price)
+            # Instante em que a producao decide sobre este candle: o fechamento,
+            # nao a abertura. E o "agora" do risco e o carimbo do cooldown das
+            # ordens da estrategia (ver o motor de carteira).
+            fechamento = current.open_time + duracao
 
-            # Protecao antes da decisao. As mesmas tres convencoes pessimistas do
-            # motor de carteira: stop vence empate no mesmo candle, gap conta
-            # contra no stop e nao credita no alvo. Ver `portfolio.py`.
+            # Protecao antes da decisao, com a regra unica dos dois motores
+            # (`protecao.saida_de_protecao`).
             if protection is not None:
                 held_now = (await broker.fetch_balances()).get(base, Decimal(0))
                 if held_now > 0:
                     stop, alvo = protection
-                    if current.low <= stop:
-                        motivo, saida = "stop", min(current.open, stop)
-                    elif current.high >= alvo:
-                        motivo, saida = "alvo", alvo
-                    else:
-                        motivo, saida = None, None
+                    disparo = saida_de_protecao(
+                        current.open, current.high, current.low, stop, alvo, self.folgas
+                    )
+                    motivo, saida = disparo if disparo is not None else (None, None)
                     if motivo is not None:
                         pedido_de_saida = OrderRequest(
                             client_order_id=f"bt-{motivo}-{index}",
@@ -313,6 +323,11 @@ class BacktestEngine:
                             held = max(Decimal(0), held_now - vendido)
                             cost_basis = held * medio
                             protection = None
+                            # A saida aconteceu DURANTE o candle; a abertura e o
+                            # carimbo mais cedo possivel. Carimbar o mesmo
+                            # instante do sinal do fechamento recusava por
+                            # cooldown uma reentrada que a producao aceita (em
+                            # 1d o stop vem horas antes do fechamento).
                             last_order_at[result.symbol] = current.open_time
 
             market = MarketFrame.from_candles(window)
@@ -331,7 +346,7 @@ class BacktestEngine:
                     prices={base: price},
                     last_order_at=dict(last_order_at),
                 )
-                assessment = self.risk.evaluate(signal, state, now=current.open_time)
+                assessment = self.risk.evaluate(signal, state, now=fechamento)
 
                 if assessment.decision is RiskDecision.REJECTED:
                     result.signals_rejected += 1
@@ -361,7 +376,7 @@ class BacktestEngine:
                         fill_price = order_result.average_price or price
                         quantity = order_result.filled_quantity
                         no_saldo, taxa = liquido_e_taxa(order_result, side, base, fill_price)
-                        last_order_at[signal.symbol] = current.open_time
+                        last_order_at[signal.symbol] = fechamento
 
                         realized: Decimal | None = None
                         if side is Side.BUY:
