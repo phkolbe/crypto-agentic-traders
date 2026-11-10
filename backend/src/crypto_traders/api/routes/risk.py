@@ -188,12 +188,19 @@ async def authorize_capital(
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    # Relido DEPOIS do await, e a sobra calculada como em `GET /risk/capital`:
+    # com `unauthorized_value=0` fixo, um retrato novo chegando no meio (um
+    # deposito) fazia a resposta dizer "tudo autorizado" com o total acima do
+    # autorizado.
     snapshot = orchestrator.risk_manager.last_snapshot
     total = snapshot.total_value if snapshot else Decimal(0)
+    autorizado = limits.authorized_capital
     return CapitalStatusOut(
         total_value=total,
-        authorized_capital=limits.authorized_capital,
-        unauthorized_value=Decimal(0),
+        authorized_capital=autorizado,
+        unauthorized_value=(
+            max(Decimal(0), total - autorizado) if autorizado is not None else Decimal(0)
+        ),
         gate_active=limits.authorized_capital is not None,
         quote_currency=orchestrator.settings.trading.quote_currency,
     )
@@ -203,6 +210,7 @@ async def authorize_capital(
 async def reset_circuit_breaker(
     payload: CircuitBreakerResetIn | None = None,
     orchestrator: Orchestrator = Depends(orchestrator_dep),
+    session: AsyncSession = Depends(db_session),
 ) -> RiskConfigOut:
     """Rearma o circuit breaker e retoma os agentes.
 
@@ -226,10 +234,17 @@ async def reset_circuit_breaker(
     await orchestrator.risk_manager.reset_circuit_breaker(actor="user")
     await orchestrator.resume_all(actor="user")
 
+    # Relido, na mesma fonte de `GET /risk/config`, em vez de `False` fixo: se a
+    # perda que disparou a trava continua alem do limite, ela dispara de novo
+    # logo depois do rearme, e a resposta dizia "desarmado" sobre uma trava
+    # armada.
+    config = await RiskConfigRepository(session).get_or_create(
+        orchestrator.risk_manager.limits.model_dump(mode="json")
+    )
     return RiskConfigOut(
         **orchestrator.risk_manager.limits.model_dump(),
-        circuit_breaker_active=False,
-        circuit_breaker_reason=None,
+        circuit_breaker_active=config.circuit_breaker_active,
+        circuit_breaker_reason=config.circuit_breaker_reason,
     )
 
 

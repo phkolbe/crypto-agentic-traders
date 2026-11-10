@@ -8,6 +8,7 @@ precisa e formata para exibicao.
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Literal
@@ -546,13 +547,34 @@ class NotificationConfigIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     email_enabled: bool | None = None
-    email_to: str | None = Field(default=None, max_length=320)
+    # Formato minimo (algo@dominio.tld), nao validacao de caixa postal. Sem ele,
+    # "paulo.exemplo.com" gravava com 200 e o canal aparecia ligado na tela, com
+    # o alerta de stop e de circuit breaker indo para lugar nenhum.
+    email_to: str | None = Field(
+        default=None, max_length=320, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
+    )
     whatsapp_enabled: bool | None = None
     whatsapp_to: str | None = Field(
         default=None,
         max_length=32,
         description="Numero em formato internacional, ex.: 5511999999999",
     )
+
+    @field_validator("whatsapp_to")
+    @classmethod
+    def _numero_internacional(cls, valor: str | None) -> str | None:
+        """Pontuacao de telefone passa (o canal tira o que nao e digito); o numero
+        precisa ter de 10 a 15 digitos (E.164: pais + DDD + numero)."""
+        if valor is None:
+            return None
+        if not re.fullmatch(r"[\d\s()+-]+", valor):
+            raise ValueError("use so digitos, no formato internacional: 5511999999999")
+        digitos = re.sub(r"\D", "", valor)
+        if not 10 <= len(digitos) <= 15:
+            raise ValueError(
+                "numero com pais e DDD, de 10 a 15 digitos: 55 + DDD + numero"
+            )
+        return valor
 
 
 class NotificationTestOut(BaseModel):
