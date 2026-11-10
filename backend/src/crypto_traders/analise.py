@@ -14,7 +14,13 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from .agents.portfolio import MODO_MANUAL, _decimal, _em_ordem, _instante
+from .agents.portfolio import (
+    MODO_MANUAL,
+    _decimal,
+    _em_ordem,
+    _instante,
+    _quantidade_e_taxa,
+)
 from .domain.enums import Side
 
 
@@ -47,8 +53,10 @@ def resultado_por_par(
     taxas dentro de [inicio, fim] contam no resultado do periodo. As mesmas
     exclusoes da apuracao, pelo mesmo motivo: trade de outra cotacao nao entra
     num medio desta (erro de unidade), trade de outro modo nao entra (papel nao e
-    dinheiro real; lancamento manual conta sempre), taxa em outra moeda e
-    descartada (converter exigiria a cotacao do instante, que nao esta guardada).
+    dinheiro real; lancamento manual conta sempre). A taxa segue a mesma
+    `_quantidade_e_taxa`: no ativo base, sai da quantidade e entra pelo preco do
+    proprio trade; em terceira moeda (BNB) e descartada, porque converter exigiria
+    a cotacao do instante, que nao esta guardada.
 
     "Ganho" e "perda" sao por VENDA: uma venda que realizou acima do custo medio
     mais a taxa. Venda sem base de custo nao e ganho nem perda -- e contada a
@@ -70,11 +78,8 @@ def resultado_por_par(
         if (trade.mode or modo) not in (modo, MODO_MANUAL):
             continue
 
-        quantidade = _decimal(trade.quantity)
         preco = _decimal(trade.price)
-        taxa = _decimal(trade.fee)
-        if taxa > 0 and (trade.fee_currency or quote) != quote:
-            taxa = Decimal(0)
+        quantidade, taxa, _ = _quantidade_e_taxa(trade, asset, quote)
         no_periodo = inicio <= _instante(trade.executed_at) <= fim
 
         mantido = quantidades.get(asset, Decimal(0))

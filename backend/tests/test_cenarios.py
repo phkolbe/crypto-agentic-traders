@@ -16,7 +16,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 
 import pytest
 
@@ -48,6 +48,9 @@ PRECO_CORRENTE = Decimal("57100")
 
 SLIPPAGE = Decimal("0.0005")
 TAXA = Decimal("0.001")
+
+#: Passo de lote (LOT_SIZE) do BTC/USDT no catalogo versionado da Binance.
+PASSO_BTC = Decimal("0.00001")
 
 
 def _limites(**mudancas: object) -> RiskSettings:
@@ -116,10 +119,33 @@ async def _abrir_posicao(cenario: AgenteDeCenario, preco: Decimal = PRECO_CORREN
     return compras[0]
 
 
+def _liquido(compra) -> Decimal:
+    """BTC que a compra pos no saldo: o papel cobra a taxa no ativo recebido.
+
+    Como a Binance spot sem BNB: `quantity` e o executado bruto e a taxa sai do
+    BTC. Antes o papel cobrava em USDT e o saldo era a quantidade cheia.
+    """
+    quantidade = Decimal(str(compra.quantity))
+    if compra.fee_currency == SIMBOLO.partition("/")[0]:
+        return quantidade - Decimal(str(compra.fee))
+    return quantidade
+
+
+def _vendavel(compra) -> Decimal:
+    """O que uma venda do saldo inteiro executa: truncado ao passo do par.
+
+    A sobra abaixo de um passo (0,00001 BTC) fica no saldo como poeira -- e o
+    que o live faz depois de toda compra com a taxa no ativo.
+    """
+    return _liquido(compra).quantize(PASSO_BTC, rounding=ROUND_DOWN)
+
+
 def _medio(compra) -> Decimal:
-    """Preco medio como o Portfolio o reconstroi: preco + taxa sobre a quantidade."""
-    custo = Decimal(str(compra.quantity)) * Decimal(str(compra.price)) + Decimal(str(compra.fee))
-    return custo / Decimal(str(compra.quantity))
+    """Preco medio como o Portfolio o reconstroi: custo pago sobre o que entrou."""
+    custo = Decimal(str(compra.quantity)) * Decimal(str(compra.price))
+    if compra.fee_currency != SIMBOLO.partition("/")[0]:
+        custo += Decimal(str(compra.fee))
+    return custo / _liquido(compra)
 
 
 def _vendas(trades) -> list:
@@ -149,7 +175,7 @@ async def test_compra_executa_no_preco_corrente_e_nao_no_fechamento_da_vespera(t
         assert _vendas(await cenario.trades()) == []
         assert await cenario.saidas_de_protecao() == []
         assert cenario.alertas_do_tipo("protective_exit") == []
-        assert await cenario.saldo("BTC") == Decimal(str(compra.quantity))
+        assert await cenario.saldo("BTC") == _liquido(compra)
 
 
 async def test_contraprova_fiacao_antiga_compra_na_vespera_e_fabrica_take_profit(tmp_path):
@@ -200,11 +226,13 @@ async def test_stop_intradiario_dispara_no_ticker_sem_candle_novo(tmp_path):
         assert len(vendas) == 1, "o stop nao agiu dentro do ciclo"
         assert vendas[0].strategy == "protecao"
         assert Decimal(str(vendas[0].price)) == caido * (1 - SLIPPAGE)
-        assert Decimal(str(vendas[0].quantity)) == Decimal(str(compra.quantity))
+        assert Decimal(str(vendas[0].quantity)) == _vendavel(compra)
         assert [e.snapshot["motivo"] for e in await cenario.saidas_de_protecao()] == [
             "stop_loss"
         ]
-        assert await cenario.saldo("BTC") == 0
+        # Sobra a poeira abaixo de um passo, como no live (antes o papel zerava).
+        assert await cenario.saldo("BTC") == _liquido(compra) - _vendavel(compra)
+        assert await cenario.saldo("BTC") < PASSO_BTC
 
         # Nenhum candle fechou: a avaliacao antiga via o fechamento, acima do stop.
         assert cenario.mercado.ultimo_fechamento(SIMBOLO) == FECHAMENTO_DO_CRUZAMENTO
@@ -224,7 +252,7 @@ async def test_contraprova_fiacao_antiga_nao_ve_o_stop_intradiario(tmp_path):
 
         assert _vendas(await cenario.trades()) == []
         assert await cenario.saidas_de_protecao() == []
-        assert await cenario.saldo("BTC") == Decimal(str(compra.quantity))
+        assert await cenario.saldo("BTC") == _liquido(compra)
 
 
 # ======================================================================
@@ -309,7 +337,7 @@ async def test_circuit_breaker_arma_barra_abertura_e_so_solta_no_rearme_manual(t
         ordens_antes = len(await cenario.ordens())
         sinal = await cenario.publicar_sinal(SIMBOLO, SignalDirection.LONG)
         assert len(await cenario.ordens()) == ordens_antes
-        assert await cenario.saldo("BTC") == Decimal(str(compra.quantity))
+        assert await cenario.saldo("BTC") == _liquido(compra)
 
         # Operador retoma o Risk Manager sozinho: o motor rejeita, com motivo.
         await orq.resume_agent("risk_manager", actor="operador")
@@ -364,8 +392,10 @@ async def test_stop_dispara_com_o_circuit_breaker_armado(tmp_path):
         assert len(vendas) == 1, "a venda de protecao NAO saiu com a trava armada"
         assert vendas[0].strategy == "protecao"
         assert Decimal(str(vendas[0].price)) == rompido * (1 - SLIPPAGE)
-        assert Decimal(str(vendas[0].quantity)) == Decimal(str(compra.quantity))
-        assert await cenario.saldo("BTC") == 0
+        assert Decimal(str(vendas[0].quantity)) == _vendavel(compra)
+        # Sobra a poeira abaixo de um passo, como no live (antes o papel zerava).
+        assert await cenario.saldo("BTC") == _liquido(compra) - _vendavel(compra)
+        assert await cenario.saldo("BTC") < PASSO_BTC
         # A trava continua armada e a abertura continua barrada.
         assert orq.risk_manager.circuit_breaker_active
         assert orq.execution.openings_blocked is not None

@@ -162,31 +162,39 @@ class PaperBroker(Broker):
         if recusa is not None:
             return recusa
 
+        # A quantidade executada e a truncada ao passo do par (LOT_SIZE), como o
+        # ccxt envia (`amount_to_precision`). Sem isso o dry_run nunca gerava a
+        # poeira que o live gera ao vender um saldo inteiro.
+        market = self.market_filter(request.symbol)
+        quantidade = market.truncate(request.quantity) if market else request.quantity
+
         # Slippage sempre contra o operador: compra um pouco mais cara, venda um
         # pouco mais barata. Simular a favor seria enganar a si mesmo.
         direction = Decimal(1) if request.side is Side.BUY else Decimal(-1)
         fill_price = reference * (Decimal(1) + direction * self.slippage_pct)
-        gross = request.quantity * fill_price
-        fee = gross * self.fee_pct
+        gross = quantidade * fill_price
 
-        try:
-            if request.side is Side.BUY:
-                self._debit(quote, gross + fee)
-                self.credit(base, request.quantity)
-            else:
-                self._debit(base, request.quantity)
-                self.credit(quote, gross - fee)
-        except InsufficientFunds as exc:
-            # Nao memoriza: a exchange recusa ANTES de criar a ordem, entao o
-            # `clientOrderId` continua livre e uma nova tentativa (depois de um
-            # deposito, por exemplo) precisa poder acontecer de verdade.
-            return OrderResult(
-                order_request_id=request.id,
-                client_order_id=request.client_order_id,
-                exchange_order_id=None,
-                status=OrderStatus.REJECTED,
-                error=str(exc),
-            )
+        # A taxa sai da moeda RECEBIDA, como na Binance spot sem BNB: a compra
+        # paga no ativo base (compra 0,001 BTC, recebe 0,000999) e a venda na
+        # cotacao. Cobrando tudo na cotacao, o dry_run nunca passava pelo caminho
+        # em que o saldo do ativo fica menor que `filled` -- e a contabilidade
+        # so o veria no live (auditoria de 09/11/2026, H2 e M3).
+        if request.side is Side.BUY:
+            fee, fee_currency = quantidade * self.fee_pct, base
+        else:
+            fee, fee_currency = gross * self.fee_pct, quote
+
+        # Saldo insuficiente LEVANTA `InsufficientFunds`, como o `CcxtExchange`:
+        # devolver REJECTED deixava o `except InsufficientFunds` do Execution
+        # Agent sem exercicio no dry_run. Nao memoriza: a exchange recusa ANTES
+        # de criar a ordem, entao o `clientOrderId` continua livre e uma nova
+        # tentativa (depois de um deposito, por exemplo) precisa poder acontecer.
+        if request.side is Side.BUY:
+            self._debit(quote, gross)
+            self.credit(base, quantidade - fee)
+        else:
+            self._debit(base, quantidade)
+            self.credit(quote, gross - fee)
 
         self._last_prices[base] = reference
 
@@ -196,10 +204,10 @@ class PaperBroker(Broker):
                 client_order_id=request.client_order_id,
                 exchange_order_id=f"paper-{request.client_order_id}",
                 status=OrderStatus.FILLED,
-                filled_quantity=request.quantity,
+                filled_quantity=quantidade,
                 average_price=fill_price,
                 fee=fee,
-                fee_currency=quote,
+                fee_currency=fee_currency,
                 raw={"simulated": True, "reference_price": str(reference)},
             )
         )

@@ -185,14 +185,21 @@ class PortfolioAgent(BaseAgent):
         quote = self._settings.trading.quote_currency
         modo = str(self._settings.trading_mode)
         prices = self._price_source()
-        positions = await self._broker.fetch_positions(prices)
 
+        # O historico e lido ANTES do saldo. Na ordem inversa, uma venda que
+        # preenchia depois do `fetch_balance` e era gravada antes desta sessao
+        # entrava duas vezes: no realizado e no nao realizado do saldo velho (o
+        # -0,20 de um stop aparecia como -0,40; auditoria de 09/11/2026, M1).
+        # Nesta ordem a unica corrida possivel e a outra -- saldo ja sem o
+        # ativo, trade ainda nao gravado --, que e o fantasma que o razao trata.
         async with session_scope(self._settings) as session:
             trades = await TradeRepository(session).for_cost_basis()
             ancora = await PortfolioSnapshotRepository(session).latest(mode=modo)
             razao = _ler_razao(
                 await PortfolioLedgerRepository(session).movements(ACOES_DO_RAZAO), modo
             )
+
+        positions = await self._broker.fetch_positions(prices)
 
         saldo_anterior = _quantidades_do_retrato(ancora)
         if not positions and saldo_anterior:
@@ -327,18 +334,13 @@ class PortfolioAgent(BaseAgent):
                 outro_modo[trade_modo] = outro_modo.get(trade_modo, 0) + 1
                 continue
 
-            quantidade = _decimal(trade.quantity)
             preco = _decimal(trade.price)
-            taxa = _decimal(trade.fee)
-            moeda_da_taxa = trade.fee_currency or quote
-            if taxa > 0 and moeda_da_taxa != quote:
-                # 0,01 BNB nao e 0,01 USDT. Converter exigiria a cotacao do
-                # instante do trade, que nao esta guardada; somar como se fosse a
-                # mesma moeda inventaria custo.
+            quantidade, taxa, descartada = _quantidade_e_taxa(trade, asset, quote)
+            if descartada is not None:
+                moeda_da_taxa, valor = descartada
                 taxa_descartada[moeda_da_taxa] = (
-                    taxa_descartada.get(moeda_da_taxa, Decimal(0)) + taxa
+                    taxa_descartada.get(moeda_da_taxa, Decimal(0)) + valor
                 )
-                taxa = Decimal(0)
 
             mantido = quantidades.get(asset, Decimal(0))
             custo = custos.get(asset, Decimal(0))
@@ -581,6 +583,13 @@ class PortfolioAgent(BaseAgent):
             if aviso.unico and chave in self._avisados:
                 continue
             self._avisados.add(chave)
+            if aviso.action == ACAO_TAXA:
+                # Taxa em terceira moeda (BNB) fica fora do custo: o medio sai
+                # subestimado e o stop um pouco mais baixo. Alem do audit_log,
+                # sai como aviso no log de operacao, para nao passar calado.
+                self.log.warning(
+                    "portfolio.taxa_descartada", moeda=aviso.target, detail=aviso.detail
+                )
             await log.append(
                 action=aviso.action,
                 actor=self.name,
@@ -623,6 +632,37 @@ def _movimento(
         },
         unico=False,
     )
+
+
+def _quantidade_e_taxa(
+    trade: Any, asset: str, quote: str
+) -> tuple[Decimal, Decimal, tuple[str, Decimal] | None]:
+    """(quantidade que moveu o saldo do ativo, taxa na cotacao, taxa descartada).
+
+    A Binance spot sem BNB cobra a taxa da COMPRA no ativo recebido: `filled` e
+    0,001 BTC, a taxa e 0,000001 BTC e o saldo sobe 0,000999. Tratada como
+    "outra moeda" (descartada), a quantidade bruta ficava no historico e a
+    diferenca virava um fantasma sem saida de saldo, que `_sustentar` lia como
+    edicao retroativa e usava para apagar o prejuizo realizado do dia
+    (auditoria de 09/11/2026, H2). Aqui a taxa no ativo base sai da quantidade
+    (compra entra liquida; venda tira a taxa junto) e entra no dinheiro pelo
+    preco do PROPRIO trade, que e a cotacao exata do instante. Na compra isso da
+    `custo = quantidade bruta x preco`: a taxa fica embutida no medio.
+
+    Taxa em terceira moeda (BNB) continua fora do custo: a cotacao do instante
+    nao esta guardada, e somar 0,01 BNB como 0,01 USDT inventaria custo. Ela
+    volta como descartada para o chamador deixar o rastro.
+    """
+    quantidade = _decimal(trade.quantity)
+    taxa = _decimal(trade.fee)
+    moeda = trade.fee_currency or quote
+    if taxa <= 0 or moeda == quote:
+        return quantidade, taxa, None
+    if moeda == asset:
+        compra = trade.side == str(Side.BUY)
+        no_saldo = quantidade - taxa if compra else quantidade + taxa
+        return no_saldo, taxa * _decimal(trade.price), None
+    return quantidade, Decimal(0), (moeda, taxa)
 
 
 def _ler_razao(

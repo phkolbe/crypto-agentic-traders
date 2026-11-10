@@ -162,6 +162,30 @@ class TestResultadoPorPar:
         assert pares["BTC/USDT"].compras == 0
         assert pares["BTC/USDT"].realizado == Decimal("148.5")
 
+    def test_taxa_da_compra_no_ativo_base_entra_na_conta(self, settings):
+        """Binance sem BNB: compra 1 BTC, recebe 0,999; a taxa vale 0,10 a 100.
+
+        Antes a taxa no ativo base era descartada: a tela dizia "zero a zero"
+        numa ida e volta que perdeu a taxa, e a quantidade bruta deixava 0,001
+        BTC sem venda no historico (auditoria de 09/11/2026, H2).
+        """
+        historico = [
+            _trade(1, "BTC/USDT", "buy", "1", "100", "0.001", moeda_taxa="BTC"),
+            _trade(2, "BTC/USDT", "sell", "0.999", "100", "0.0999", moeda_taxa="USDT"),
+        ]
+        agente = PortfolioAgent(InMemoryEventBus(), None, settings, lambda: {})
+        apuracao = agente._apurar(historico)
+        (btc,) = resultado_por_par(
+            historico, "USDT", "dry_run", AGORA - timedelta(days=365), AGORA
+        )
+
+        # 0,999 x 100 recebidos - 100 pagos - 0,0999 de taxa da venda (o medio
+        # 100 / 0,999 e dizima: a conta fecha na 28a casa).
+        assert btc.realizado == pytest.approx(Decimal("-0.1999"), abs=Decimal("1e-20"))
+        assert btc.taxas == Decimal("0.1") + Decimal("0.0999")
+        assert apuracao.realizado == btc.realizado
+        assert apuracao.quantidades["BTC"] == 0
+
 
 class TestMotivosDeRisco:
     def test_ativo_vira_marcador_e_sigla_do_texto_fica(self):
