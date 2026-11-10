@@ -227,12 +227,12 @@ class AgenteDeCenario:
         for agente in self.orquestrador.agents.values():
             if agente.pending_events or not agente.is_idle:
                 return False
+        # TODAS as filas do bus, e nao so CANDLES/SIGNALS/ORDER_REQUESTS: um
+        # resultado de ordem ou alerta ainda na fila do assinante fica fora de
+        # `pending_events` ate o alimentador da caixa acordar, e o cenario
+        # dependia das leituras repetidas para nao ler o banco antes dele.
         filas = getattr(self.orquestrador.bus, "_subscribers", {})
-        return not any(
-            fila.qsize()
-            for topico in (Topics.CANDLES, Topics.SIGNALS, Topics.ORDER_REQUESTS)
-            for fila in filas.get(topico, [])
-        )
+        return not any(fila.qsize() for lista in filas.values() for fila in lista)
 
     # ------------------------------------------------------------------
     # Leitura do que aconteceu
