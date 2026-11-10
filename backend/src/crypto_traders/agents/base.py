@@ -69,6 +69,15 @@ ONCE_ONLY_TOPICS = frozenset({Topics.CANDLES, Topics.SIGNALS, Topics.ORDER_REQUE
 #: Perder com aviso e melhor que crescer em silencio.
 INBOX_MAX_SIZE = 1000
 
+#: Quanto a parada espera o evento EM PROCESSAMENTO terminar antes de cancelar.
+#:
+#: Cancelar na hora cortava a ordem no meio do `place_order`: o `CancelledError`
+#: passava por cima do `except Exception` da execucao, a ordem ficava PENDING sem o
+#: alerta de "desfecho desconhecido" e nada no log dizia que algo ficou no meio. O
+#: prazo cabe com folga no `stop_grace_period` de 60 s do compose: os agentes drenam
+#: em paralelo (`Orchestrator.stop`), entao o pior caso e um prazo, nao cinco.
+PRAZO_DRENAGEM_SEGUNDOS = 20.0
+
 log = get_logger(__name__)
 
 
@@ -204,6 +213,11 @@ class _Inbox:
             yield event
             self.in_flight = None
             self.handled += 1
+            if self._agent.parando:
+                # Parada pedida: o evento corrente terminou e o proximo fica na
+                # fila -- e registrado como pendente no `stop()`, nao comecado e
+                # cortado no meio.
+                return
 
     async def close(self) -> None:
         """Desfaz a assinatura. So no `stop()`, nunca no reinicio.
@@ -294,6 +308,10 @@ class BaseAgent(abc.ABC):
         self.inbox_failures = 0
         """Quantas vezes uma assinatura deste agente caiu sob os pes dele."""
 
+        self.deixados_na_parada: list[str] = []
+        """O que a ultima parada deixou para tras: evento cortado no meio (passado o
+        prazo de drenagem) e eventos que ficaram na fila sem ser processados."""
+
         self._task: asyncio.Task[None] | None = None
         self._pulse: asyncio.Task[None] | None = None
         self._inboxes: dict[str, _Inbox] = {}
@@ -326,17 +344,70 @@ class BaseAgent(abc.ABC):
         self._start_pulse()
         self.log.info("agent.started")
 
+    @property
+    def parando(self) -> bool:
+        """True a partir do pedido de parada: nenhum evento novo e comecado."""
+        return self._stopping.is_set()
+
+    async def drenar(self, prazo: float | None = None) -> None:
+        """Para de pegar evento novo e espera o que esta em processamento terminar.
+
+        Ate `prazo` segundos (`PRAZO_DRENAGEM_SEGUNDOS`). Agente pausado nao drena:
+        o evento dele esta parado no gate de pausa, ainda nao comecou, e liberar o
+        gate para "terminar" faria um agente pausado decidir durante a parada.
+        """
+        self._stopping.set()
+        if self._task is None or self._task.done() or self.is_paused:
+            return
+        loop = asyncio.get_running_loop()
+        limite = loop.time() + (PRAZO_DRENAGEM_SEGUNDOS if prazo is None else prazo)
+        while loop.time() < limite and not self._task.done():
+            if all(box.in_flight is None for box in self._inboxes.values()):
+                return
+            await asyncio.sleep(0.02)
+
+    async def _registrar_o_que_ficou(self) -> None:
+        """Diz em ALTO o que a parada deixou para tras -- antes so o restart dizia."""
+        deixados: list[str] = []
+        for topic, box in self._inboxes.items():
+            if box.in_flight is not None:
+                self.lost_events += 1
+                descricao = f"{topic}: {describe_event(box.in_flight)}"
+                self.log.error("agent.event_lost_in_stop", topic=topic, lost=descricao)
+                deixados.append(descricao)
+                box.in_flight = None
+            if box.pending:
+                self.log.error(
+                    "agent.pending_dropped_in_stop",
+                    topic=topic,
+                    pending=box.pending,
+                    detail="eventos recebidos e nao processados; somem com a parada",
+                )
+                deixados.append(f"{topic}: {box.pending} pendente(s) na fila")
+        self.deixados_na_parada = deixados
+
     async def stop(self) -> None:
         """Desligamento completo. Nenhuma etapa pode impedir as seguintes.
+
+        Primeiro drena (`drenar`): o evento em processamento termina, ate o prazo.
+        So depois cancela, e o que ficou -- evento cortado no meio, eventos na
+        fila -- vai para o log em ERROR e para `deixados_na_parada`.
 
         O `try/finally` nao e decoracao: quando `_close_inboxes` estourava no
         meio, o agente ficava em `RUNNING` e `on_stop()` -- que fecha broker e
         sessao HTTP -- simplesmente nao rodava, enquanto o orquestrador
         registrava um desligamento limpo.
         """
+        try:
+            await self.drenar()
+        except Exception as exc:  # pragma: no cover - defesa em profundidade
+            self.log.error("agent.drain_failed", error=str(exc))
         self._stopping.set()
         self._resumed.set()  # libera quem estiver parado no gate de pausa
-        for etapa in (self._cancel_task, self._cancel_pulse, self._close_inboxes):
+        for etapa in (
+            self._cancel_task, self._cancel_pulse, self._registrar_o_que_ficou,
+            self._close_inboxes,
+        ):
             try:
                 await etapa()
             except Exception as exc:  # pragma: no cover - defesa em profundidade

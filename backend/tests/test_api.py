@@ -1905,3 +1905,127 @@ class TestShuttingDownLeavesNothingRunning:
         assert ws_module.manager.count == 0, "conexao continua na lista do fan-out"
         assert navegador.fechado, "o navegador nao recebeu o fechamento"
         await bus.stop()
+
+
+# ---------------------------------------------------------------------------
+# P0 #8 / M2 da API -- a resposta das rotas de agentes diz o estado RELIDO
+# ---------------------------------------------------------------------------
+class TestControleDeAgentesDizOQueValeu:
+    """As rotas devolviam literais ("paused"/"running") que podiam nao existir.
+
+    Medido no codigo anterior: `POST /agents/execution/pause` respondia
+    `"state": "paused"` com a execucao de pe (a pausa vira trava de abertura,
+    D4), e `POST /agents/execution/resume` com o circuit breaker armado
+    respondia `"running"` com a abertura ainda barrada -- sem nada na resposta
+    dizendo por que o sistema seguia sem abrir posicao.
+    """
+
+    @staticmethod
+    async def _com_execucao(orchestrator, settings):
+        from crypto_traders.agents.execution import ExecutionAgent
+        from crypto_traders.exchanges.paper import PaperBroker
+
+        orchestrator.execution = ExecutionAgent(
+            orchestrator.bus, PaperBroker(initial_balance=Decimal("100")), settings
+        )
+        await orchestrator.execution.start()
+        await asyncio.sleep(0.05)
+        return orchestrator.execution
+
+    async def test_pausar_a_execucao_diz_que_so_a_abertura_parou(self, orquestrado, settings):
+        http, orchestrator, _ = orquestrado
+        execucao = await self._com_execucao(orchestrator, settings)
+        try:
+            resposta = await http.post("/api/agents/execution/pause")
+        finally:
+            await execucao.stop()
+
+        assert resposta.status_code == 200, resposta.text
+        corpo = resposta.json()
+        assert corpo["paused"] is False, "a execucao nunca e pausada (D4); a resposta mentia"
+        assert corpo["running"] is True
+        assert corpo["openings_blocked"], "a resposta tem que dizer que a abertura parou"
+        assert "abertura" in corpo["note"].lower()
+
+    async def test_retomar_a_execucao_com_o_breaker_armado_diz_que_segue_barrada(
+        self, orquestrado, settings
+    ):
+        http, orchestrator, _ = orquestrado
+        execucao = await self._com_execucao(orchestrator, settings)
+        try:
+            await orchestrator.risk_manager._trip("perda diaria de teste")
+            # O que o orquestrador faz ao ver a trava disparar (`_on_snapshot`).
+            await orchestrator.pause_all(actor="circuit_breaker", reason="perda diaria")
+            resposta = await http.post("/api/agents/execution/resume")
+        finally:
+            await execucao.stop()
+
+        assert resposta.status_code == 200, resposta.text
+        corpo = resposta.json()
+        assert corpo["openings_blocked"], (
+            "com o circuit breaker armado a abertura continua barrada, e a resposta dizia 'running'"
+        )
+        assert "circuit breaker" in corpo["note"].lower()
+
+    async def test_pausar_tudo_devolve_o_estado_de_cada_agente(self, orquestrado, settings):
+        http, orchestrator, _ = orquestrado
+        execucao = await self._com_execucao(orchestrator, settings)
+        try:
+            resposta = await http.post("/api/agents/pause-all")
+        finally:
+            await execucao.stop()
+
+        assert resposta.status_code == 200, resposta.text
+        corpo = resposta.json()
+        agentes = corpo["agents"]
+        assert agentes["strategy"]["paused"] is True
+        assert agentes["risk_manager"]["paused"] is True
+        assert agentes["execution"]["paused"] is False
+        assert agentes["execution"]["openings_blocked"]
+        assert agentes["market_data"]["paused"] is False
+
+    async def test_retomar_tudo_devolve_o_estado_relido(self, orquestrado):
+        http, orchestrator, _ = orquestrado
+        await orchestrator.pause_all(actor="user", reason="teste")
+
+        resposta = await http.post("/api/agents/resume-all")
+
+        assert resposta.status_code == 200, resposta.text
+        agentes = resposta.json()["agents"]
+        assert agentes["strategy"]["paused"] is False
+        assert orchestrator.strategy.is_paused is False
+
+
+# ---------------------------------------------------------------------------
+# P0 #11 -- a sonda de saude do conteiner olha o sistema vivo
+# ---------------------------------------------------------------------------
+class TestSondaDeSaude:
+    """`/api/health` respondia 200 sempre que o objeto orquestrador existia.
+
+    Com os agentes mortos e o laco de eventos de pe, o HEALTHCHECK seguia
+    `healthy` e ninguem de fora sabia que o stop nao rodava.
+    """
+
+    async def test_a_sonda_falha_com_o_sistema_parado(self, orquestrado):
+        http, _, _ = orquestrado  # agentes construidos e NAO iniciados
+
+        sonda = await http.get("/api/health", params={"sonda": "1"})
+
+        assert sonda.status_code == 503, sonda.text
+        detalhe = sonda.json()["detail"]
+        assert any("risk_manager" in p for p in detalhe), detalhe
+        assert any("watchdog" in p for p in detalhe), detalhe
+
+    async def test_a_tela_continua_lendo_a_saude_com_o_sistema_parado(self, orquestrado):
+        """O dashboard le `/api/health` justamente quando algo esta errado."""
+        http, _, _ = orquestrado
+        assert (await http.get("/api/health")).status_code == 200
+
+    async def test_a_sonda_passa_com_o_sistema_vivo(self, orquestrado, monkeypatch):
+        http, orchestrator, _ = orquestrado
+        monkeypatch.setattr(orchestrator, "vitalidade", lambda: [])
+
+        sonda = await http.get("/api/health", params={"sonda": "1"})
+
+        assert sonda.status_code == 200, sonda.text
+        assert sonda.json()["mode"] == "dry_run"

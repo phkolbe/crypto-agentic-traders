@@ -45,9 +45,13 @@ ENV PATH=/app/.venv/bin:$PATH PYTHONUNBUFFERED=1 API_HOST=0.0.0.0 API_PORT=8000 
     DB_MIGRAR_NA_SUBIDA=false LOG_JSON=true TRADING_MODE=dry_run
 USER servico
 EXPOSE 8000
-# /crypto-traders/api/health responde so com o orquestrador de pe (503 sem ele).
+# A sonda pergunta se o sistema PROTEGE a carteira (`?sonda=1`, Orchestrator.vitalidade):
+# 503 com agente critico sem batida, morto ou desistido, ou com o laco do watchdog
+# parado. So "o objeto existe" deixava o conteiner healthy com o stop parado. O Docker
+# nao reinicia conteiner unhealthy: quem reinicia e o vigia do host
+# (implantacao/producao/systemd/crypto-vigia.*).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-    CMD ["python", "-c", "import os, urllib.request; urllib.request.urlopen(f'http://127.0.0.1:{os.environ[\"API_PORT\"]}/crypto-traders/api/health', timeout=4)"]
+    CMD ["python", "-c", "import os, urllib.request; urllib.request.urlopen(f'http://127.0.0.1:{os.environ[\"API_PORT\"]}/crypto-traders/api/health?sonda=1', timeout=4)"]
 # exec form: o processo e o PID 1 e recebe o SIGTERM do `docker stop` (desligamento limpo).
 STOPSIGNAL SIGTERM
 CMD ["crypto-traders", "run"]

@@ -41,9 +41,10 @@ SENHA_DB_CRYPTO_DONO=$(senha)
 SENHA_DB_CRYPTO=$(senha)
 RESTIC_REPOSITORY=
 RESTIC_PASSWORD=
+VIGIA_URL=
 EOF
 cp "$RAIZ/crypto.env.exemplo" "$PASTA/crypto.env"
 chmod 600 "$PASTA/.env" "$PASTA/crypto.env"
 echo "Pasta $PASTA pronta:"
-echo "  .env        VERSAO_CRYPTO, TS_AUTHKEY (primeira subida) e, se houver, OTEL_ENDPOINT e restic"
+echo "  .env        VERSAO_CRYPTO, TS_AUTHKEY (primeira subida) e, se houver, OTEL_ENDPOINT, restic e VIGIA_URL"
 echo "  crypto.env  nasce em dry_run; live e chaves da Binance depois (ver o arquivo)"
