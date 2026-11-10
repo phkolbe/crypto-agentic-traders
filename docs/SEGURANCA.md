@@ -87,8 +87,15 @@ provedor não serve — autoriza milhares de clientes e esvazia a proteção.
 - São carregadas como `SecretStr` do Pydantic: o valor não aparece em `repr()`,
   em tracebacks nem em dumps de configuração.
 - O logger tem um processador (`_redact_secrets`) que substitui por `***`
-  qualquer campo cujo nome sugira credencial. É uma última linha de defesa:
-  se um agente logar um dict de credenciais por descuido, nada vaza para o disco.
+  qualquer campo cujo nome seja ou termine num nome de credencial (`password`,
+  `_token`, `_secret`, `_api_key`, `database_url`, `dsn`…), inclusive dentro de
+  dicts aninhados. É uma última linha de defesa: se um agente logar um dict de
+  credenciais por descuido, nada vaza para o disco. O texto livre de exceções não
+  é redigido.
+- A credencial da exchange só entra pelo nome **com prefixo** (`BINANCE__API_KEY`,
+  `BINANCE_TESTNET__API_KEY`). Até 10/11/2026 o modelo da credencial lia o
+  ambiente sozinho, sem prefixo: um `API_SECRET` de qualquer outra ferramenta
+  preenchia ao mesmo tempo a chave real e a da testnet.
 - Nenhuma chave é gravada no banco.
 
 > **Nunca cole suas chaves em um chat, e-mail ou issue** — nem para configurar
@@ -263,14 +270,17 @@ que a compra está barrada.
   `clientOrderId`; achou, registra o estado real; não achou ou não conseguiu
   consultar, a ordem fica `PENDING` com o alerta *desfecho desconhecido* e
   **não** é reenviada. Só se reenvia o que a Binance recusou na porta sem processar
-  (429/418, e `-1021` depois de ressincronizar o relógio). Prova:
+  (429 com espera curta, e `-1021` depois de ressincronizar o relógio); **418 (IP
+  banido) e 429 com `Retry-After` acima de 30 s não são reenviados**, porque
+  reincidir alonga o ban, que derruba também a venda do stop. Prova:
   `tests/test_ordem_real_binance.py`, contra uma Binance dublada que deduplica só
   ordens abertas.
 - **Grava antes de enviar**: a ordem nasce `PENDING` no banco *antes* da chamada
   à exchange. Se o processo morrer no meio, resta o rastro para reconciliar — em
   vez de uma ordem existindo na exchange e em lugar nenhum aqui.
 - **Retry só no que faz sentido**: timeout e rate limit são retentados com
-  backoff exponencial. Saldo insuficiente e ordem inválida sobem na hora —
+  backoff exponencial, respeitando o `Retry-After` (ban e espera longa não são
+  retentados). Saldo insuficiente e ordem inválida sobem na hora —
   repetir não muda o resultado e só atrasa o diagnóstico.
 
 ### Os portões do último metro
@@ -576,8 +586,10 @@ comparação de qualidade.
 armadilha que o sistema evita em todas as camadas) e depois as **aberturas por
 confiança decrescente**, simulando cada aprovação para que a próxima veja o
 caixa já consumido. **Entre lotes** — e com a janela em 0, o padrão, cada sinal é
-um lote — o Risk Manager reserva as compras que publicou até o retrato da carteira
-mostrá-las (ou a ordem terminar sem preencher). Até 09/11/2026 isso não existia:
+um lote — o Risk Manager reserva as compras **e as vendas** que publicou até o
+retrato da carteira mostrá-las (ou a ordem terminar sem preencher); a venda reserva
+só a quantidade, para um segundo FLAT não vender o mesmo saldo, e o cooldown vale
+para cada par do lote (até 10/11/2026, só para o primeiro). Até 09/11/2026 isso não existia:
 três compras no mesmo fechamento enxergavam o mesmo caixa e estouravam o capital
 autorizado e a exposição por ativo.
 
@@ -921,9 +933,12 @@ Como funciona agora:
   o preço médio veio de uma execução no mercado, e comparar com o fechamento diário
   vendia por engano (o crítico mediu: médio 1,3969, fechamento 1,2957 abaixo do
   stop 1,3550, venda fantasma após 4 min sem ticker).
-- Salto de mais de 3× numa leitura só fica **suspeito** e só vale se a leitura
-  seguinte confirmar o mesmo lado: um decimal trocado não dispara stop, e um colapso
-  de verdade (que persiste) entra um ciclo depois em vez de ser mascarado.
+- Salto de mais de 3× numa leitura só fica **suspeito** e só vale se uma leitura
+  seguinte, dentro da idade máxima do preço, ficar a menos de 3× da suspeita (o
+  suspeito mais velho expira): um decimal trocado não dispara stop, e um colapso
+  de verdade (que persiste) entra um ciclo depois em vez de ser mascarado. A idade
+  do preço é medida pelo **carimbo da exchange** no ticker, não pela hora de
+  recebimento (desde 10/11/2026).
 - A valorização da carteira e o broker de papel usam o último preço de mercado
   aceito (mesmo velho); o fechamento do candle só quando nunca houve ticker.
 - O candle continua sendo o que a **estratégia** lê.
@@ -1101,15 +1116,30 @@ pares-mês; medição registrada em `backtest/protecao.py`):
 6. **Deslizamento nas duas pontas.**
 
 Medido contra a caminhada de minuto, o conjunto fica levemente **pessimista** por
-operação (−0,15% a −0,19%), e nenhuma convenção isolada é otimista. `SEM_FOLGA`
-desliga as folgas.
+operação (−0,15% a −0,19%), e nenhuma convenção isolada é otimista **na média**;
+caso a caso, o pavio de alvo maior que a folga e o salto de preço dentro de uma
+leitura de 60 s ainda favorecem o backtest. `SEM_FOLGA` desliga as folgas. Desde
+10/11/2026, `tests/test_paridade_backtest.py` roda o sistema real e o motor nos
+mesmos candles: entradas, saídas, quantidades e níveis coincidem, e stop e alvo
+diferem dentro da leitura de 60 s.
 
 Também desde 09/11/2026 o backtest de carteira escolhe os sinais **como a produção**
 (janela 0 = cada sinal na ordem de chegada, contra o estado já atualizado; a ordem
 de chegada é a de `SYMBOLS`), mede a queda máxima em **todo** instante (antes,
 1 em 4), conta o período a partir do fim do aquecimento e aceita pares que começam
 depois. As medições anteriores a essa data mediam outro sistema: com a seleção por
-confiança, a queda máxima do último ano saía em ~10%; com a da produção, ~20%.
+confiança, a queda máxima do último ano saía em ~10%; com a da produção, ~20%. O
+resultado declara **viés de sobrevivência** (`vies_de_sobrevivencia`) quando a
+lista de pares é a de hoje, e lista os pares cuja série acaba antes do fim
+(`pares_encerrados`).
+
+**Seleção por confiança, medida de novo em 10/11/2026** no motor corrigido (7.304
+backtests, 30 meses, anos móveis, semestres e trimestres, 30 permutações da ordem
+dos pares): na `ma_crossover` ela **não** é melhor — em 30 meses, +25,7% contra
++41,9% da ordem de chegada, abaixo de todas as permutações — e a correlação entre
+confiança e PnL fica entre −0,07 e +0,04. A conclusão da seção 9 vale no motor
+novo. Só a ordem dos pares move o resultado anual em 10 a 25 pontos: comparar
+configurações exige repetir com permutações, não uma execução só.
 
 Os níveis protegem a **posição**, não o lote: ao reforçar uma posição são
 recalculados sobre o preço médio. Manter o stop do primeiro lote deixaria a parte
@@ -1229,7 +1259,9 @@ quantia de dinheiro real. Configuração duplicada não é redundância.
 Não leem ambiente nem por acidente: não existe caminho de código do `.env` até
 eles. E `Settings` carrega uma lista das chaves de negócio aposentadas
 (`RETIRED_ENV_KEYS`), varre o ambiente e o próprio arquivo, e falha com a lista
-do que precisa sair.
+do que precisa sair — e, desde 10/11/2026, também os blocos aninhados
+(`TRADING__*`, `RISK__*`, `TRADING`/`RISK` em JSON), que o `env_nested_delimiter`
+levaria a `settings.trading`/`risk` como uma segunda fonte de verdade.
 
 Um teste garante que a lista não fica atrás do código: adicionar um campo a
 qualquer um dos dois modelos sem registrá-lo na trava quebra a suíte. Sem isso, a
@@ -1261,7 +1293,12 @@ opera.
   "Aplicar" de Configurações também tem um segundo passo, que lista campo a campo
   o que muda e em que modo vale. A faixa Simulação/Dinheiro real está em todas as
   telas. O `POST /backtest` roda um por vez (o segundo recebe 429) e fora do laço
-  de eventos do sistema, para não atrasar o stop.
+  de eventos do sistema, para não atrasar o stop; o histórico é paginado na
+  exchange, e acima de 20.000 candles (teto por memória) a rota devolve 422 em vez
+  de cortar calada. A exportação CSV recusa acima de 100.000 linhas e protege o
+  texto livre contra fórmula de planilha; o destinatário de notificação é
+  validado no formato. O feed "Atividade em tempo real" carrega o histórico do
+  banco ao abrir (`GET /api/atividade`).
 - **Configuração gravada que deixou de validar** (um campo saiu ou entrou no
   modelo numa atualização): campo desconhecido é ignorado com aviso e campo novo
   recebe o padrão, preservando o resto. Se mesmo assim não valida, o sistema
@@ -1499,7 +1536,9 @@ saem do mesmo processo. Hoje:
   desistido ou sem batida há mais de 10 min, ou quando o laço do vigia interno
   parou de girar (pausa pedida pelo operador não conta);
 - no servidor, o `crypto-vigia.timer` (a cada minuto) reinicia o contêiner depois
-  de 3 verificações `unhealthy` seguidas, no máximo 3 vezes por hora;
+  de 3 verificações `unhealthy` seguidas, no máximo 3 vezes por hora; desde
+  10/11/2026 vigia também o `crypto-prd-tailscale` (healthcheck `/healthz`) e pinga
+  `/fail` quando o nó sai do tailnet;
 - com `VIGIA_URL` no `/opt/crypto/.env`, o vigia faz um ping de "estou vivo" a um
   serviço externo de *dead-man's switch* (a conta é do operador): se o servidor
   inteiro cair, quem avisa é esse serviço. **Sem `VIGIA_URL`, ninguém de fora
@@ -1510,7 +1549,14 @@ interno tinha desistido (antes ele seguia desistido, e a execução retomada
 continuava barrando o stop); a parada drena por até 20 s e registra no log e no
 `system_stopped` o que ficou cortado; e só um `crypto-traders run` sobe por banco
 Postgres (bloqueio consultivo) — o que não cobre dois bancos diferentes operando a
-mesma conta da Binance.
+mesma conta da Binance. Desde 10/11/2026 o vigia interno confere essa trava a cada
+ciclo (`pg_locks` da própria sessão): se a conexão cai, ela é retomada com alerta;
+sem retomar, a abertura fica barrada até voltar.
+
+**Implantação (10/11/2026):** imagens de terceiros fixadas por digest; a CI constrói
+a imagem em todo PR; e o `implantar.sh` volta sozinho para a versão anterior se a
+nova não fica saudável ou deixa a trava aberta — em `live`, com migração aplicada,
+a volta é manual, porque restaurar o dump apagaria ordens reais gravadas depois dele.
 
 **O que continua descoberto:** a tarefa roda no **logon do operador**. Cobrir a
 máquina sem usuário conectado exige marcar "executar mesmo sem usuário conectado"
