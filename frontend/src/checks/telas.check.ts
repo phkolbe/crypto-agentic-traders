@@ -48,6 +48,14 @@ import {
   unidadeDoEvento,
 } from '../api/format'
 import {
+  chaveDoEvento,
+  descreverEvento,
+  horaDoFeed,
+  instanteDoEvento,
+  juntarAtividade,
+  type ItemDoFeed,
+} from '../api/atividade'
+import {
   alocacaoNoTempo,
   chaveDoGrupo,
   comparacaoComBenchmark,
@@ -1596,6 +1604,215 @@ verifica(
   'reconectar o WebSocket revalida as consultas',
   /onopen = \(\) => \{[\s\S]*?invalidateQueries\(\)[\s\S]*?\}/.test(fonteLive),
 )
+
+// ===========================================================================
+bloco('Feed de atividade: historico do banco + tempo real, sem repetir')
+
+// Payloads com a forma REAL das duas fontes: `GET /api/atividade`
+// (`routes/atividade.py`, conferida em `tests/test_atividade.py`) e a mensagem
+// do WebSocket (`routes/ws.py`, `model_dump(mode="json")` do modelo de dominio).
+const SINAL_ID = '6f1c2a9e0b7d4e3f8a5c1d2e3f4a5b6c'
+const DECISAO_ID = '0a1b2c3d4e5f60718293a4b5c6d7e8f9'
+const ORDEM_ID = 'ffeeddccbbaa99887766554433221100'
+const HISTORICO_REAL: ItemDoFeed[] = [
+  {
+    event: 'alert',
+    at: '2026-11-10T03:12:40.512000+00:00',
+    data: {
+      type: 'circuit_breaker',
+      title: 'Circuit breaker acionado',
+      reason: 'perda diaria de 5,2% acima do limite de 5%',
+      target: 'risk_config',
+      timestamp: '2026-11-10T03:12:40.512000+00:00',
+    },
+  },
+  {
+    event: 'order_result',
+    at: '2026-11-10T02:44:11.020000+00:00',
+    data: {
+      id: ORDEM_ID,
+      order_request_id: ORDEM_ID,
+      symbol: 'BTC/BRL',
+      side: 'buy',
+      status: 'filled',
+      filled_quantity: '0.00004',
+      average_price: '562340.12',
+      error: null,
+      timestamp: '2026-11-10T02:44:11.020000+00:00',
+    },
+  },
+  {
+    event: 'risk_assessment',
+    at: '2026-11-10T02:44:10.900000+00:00',
+    data: {
+      id: DECISAO_ID,
+      decision: 'approved',
+      reasons: [],
+      approved_notional: '22.50',
+      snapshot: { symbol: 'BTC/BRL' },
+    },
+  },
+  {
+    event: 'signal',
+    at: '2026-11-10T02:44:10.100000+00:00',
+    data: {
+      id: SINAL_ID,
+      created_at: '2026-11-10T02:44:10.100000',
+      symbol: 'BTC/BRL',
+      strategy: 'ma_crossover',
+      direction: 'long',
+      confidence: 0.71,
+      reason: 'media curta cruzou a longa',
+      reference_price: '562300.00',
+    },
+  },
+  {
+    event: 'system',
+    at: '2026-11-09T22:14:03.000000+00:00',
+    data: { type: 'system_started', actor: 'system', target: 'orchestrator', mode: 'dry_run' },
+  },
+]
+// O WebSocket entregou o mesmo sinal e o mesmo alerta (com 30 ms de diferenca do
+// registro no banco), mais tres retratos de portfolio.
+const chegada = new Date('2026-11-10T03:20:00Z')
+const AO_VIVO: ItemDoFeed[] = [
+  {
+    event: 'portfolio',
+    data: { timestamp: '2026-11-10T03:15:00+00:00', total_value: '29.29', unrealized_pnl: '0' },
+  },
+  {
+    event: 'alert',
+    data: {
+      type: 'circuit_breaker',
+      title: 'Circuit breaker acionado',
+      message: 'perda diaria de 5,2% acima do limite de 5%\n\nOs agentes de decisao foram pausados.',
+      reason: 'perda diaria de 5,2% acima do limite de 5%',
+      timestamp: '2026-11-10T03:12:40.542000+00:00',
+    },
+  },
+  {
+    event: 'portfolio',
+    data: { timestamp: '2026-11-10T03:14:00+00:00', total_value: '29.30', unrealized_pnl: '0' },
+  },
+  {
+    event: 'portfolio',
+    data: { timestamp: '2026-11-10T03:13:00+00:00', total_value: '29.31', unrealized_pnl: '0' },
+  },
+  {
+    event: 'signal',
+    data: { ...HISTORICO_REAL[3]!.data, created_at: '2026-11-10T02:44:10.100000+00:00' },
+  },
+].map((m) => ({ ...m, at: instanteDoEvento(m.data, chegada) }))
+
+const juntado = juntarAtividade(HISTORICO_REAL, AO_VIVO, 50)
+const chaves = juntado.map(chaveDoEvento)
+const concatenado = [...AO_VIVO, ...HISTORICO_REAL]
+verifica(
+  'o defeito existe: so concatenar repete o sinal e o alerta',
+  concatenado.filter((i) => i.event === 'signal').length === 2 &&
+    concatenado.filter((i) => i.event === 'alert').length === 2,
+)
+verifica(
+  'ao abrir a tela, o historico aparece mesmo sem nada ao vivo',
+  juntarAtividade(HISTORICO_REAL, [], 50).length === HISTORICO_REAL.length,
+)
+verifica(
+  'o mesmo sinal (mesmo id) aparece uma vez',
+  juntado.filter((i) => i.event === 'signal').length === 1,
+)
+verifica(
+  'o mesmo alerta (mesmo tipo, 30 ms de diferenca) aparece uma vez, e e o do tempo real',
+  juntado.filter((i) => i.event === 'alert').length === 1 &&
+    typeof juntado.find((i) => i.event === 'alert')!.data.message === 'string',
+)
+verifica('nenhuma chave repetida (a key do React)', new Set(chaves).size === chaves.length, chaves.join(', '))
+verifica(
+  'retratos de portfolio: so o mais recente',
+  juntado.filter((i) => i.event === 'portfolio').length === 1 &&
+    juntado.find((i) => i.event === 'portfolio')!.data.total_value === '29.29',
+)
+const instantesJuntados = juntado.map((i) => Date.parse(i.at))
+verifica(
+  'do mais novo para o mais antigo, historico e tempo real intercalados',
+  instantesJuntados.every((ms, i) => i === 0 || ms <= instantesJuntados[i - 1]!) &&
+    juntado[0]!.event === 'portfolio' &&
+    juntado[juntado.length - 1]!.event === 'system',
+  juntado.map((i) => `${i.event}@${i.at}`).join(' | '),
+)
+verifica('o maximo e respeitado', juntarAtividade(HISTORICO_REAL, AO_VIVO, 3).length === 3)
+const outroDisparo: ItemDoFeed = {
+  ...HISTORICO_REAL[0]!,
+  at: '2026-11-10T04:12:40.512000+00:00',
+  data: { ...HISTORICO_REAL[0]!.data, timestamp: '2026-11-10T04:12:40.512000+00:00' },
+}
+verifica(
+  'dois disparos do circuit breaker com 1 h de distancia sao dois eventos',
+  juntarAtividade([outroDisparo, ...HISTORICO_REAL], [], 50).filter((i) => i.event === 'alert')
+    .length === 2,
+)
+const mesmaOrdemAberta: ItemDoFeed = {
+  event: 'order_result',
+  at: '2026-11-10T02:44:10.990000+00:00',
+  data: { order_request_id: ORDEM_ID, status: 'open', filled_quantity: '0' },
+}
+verifica(
+  'a mesma ordem em dois estados (aberta, executada) sao dois eventos',
+  juntarAtividade(HISTORICO_REAL, [mesmaOrdemAberta], 50).filter((i) => i.event === 'order_result')
+    .length === 2,
+)
+verifica(
+  'instante do tempo real vem do servidor, nao da chegada',
+  AO_VIVO[1]!.at === '2026-11-10T03:12:40.542000+00:00',
+  AO_VIVO[1]!.at,
+)
+verifica(
+  'sem instante no payload, vale a chegada',
+  instanteDoEvento({ total_value: '1' }, chegada) === chegada.toISOString(),
+)
+
+const textoSubida = descreverEvento('system', HISTORICO_REAL[4]!.data, 'USDC')
+verifica('marco de subida diz o modo', textoSubida === 'Sistema iniciado em simulação', textoSubida)
+const textoParada = descreverEvento(
+  'system',
+  { type: 'system_stopped', detail: 'sinal de parada (SIGTERM)' },
+  'USDC',
+)
+verifica('marco de parada diz o motivo', textoParada === 'Sistema parado: sinal de parada (SIGTERM)', textoParada)
+const textoAlerta = descreverEvento('alert', HISTORICO_REAL[0]!.data, 'USDC')
+verifica(
+  'alerta do historico mostra titulo e motivo',
+  textoAlerta === 'ALERTA: Circuit breaker acionado — perda diaria de 5,2% acima do limite de 5%',
+  textoAlerta,
+)
+const textoSemMotivo = descreverEvento(
+  'alert',
+  { type: 'unclean_shutdown', title: 'A execucao anterior nao desligou -- ela foi derrubada' },
+  'USDC',
+)
+verifica(
+  'alerta sem motivo mostra o titulo, nao o tipo cru',
+  textoSemMotivo.includes('foi derrubada') && !textoSemMotivo.includes('unclean_shutdown'),
+  textoSemMotivo,
+)
+const textoDecisao = descreverEvento('risk_assessment', HISTORICO_REAL[2]!.data, 'USDC')
+verifica(
+  'decisao do historico usa a moeda do PAR, nao a de hoje',
+  textoDecisao === 'Risk Manager aprovou em BTC/BRL 22,50 BRL',
+  textoDecisao,
+)
+verifica(
+  'hora do feed: evento de ontem leva a data',
+  horaDoFeed('2026-11-09T12:00:00', new Date('2026-11-10T12:00:00')).includes('09/11') &&
+    !horaDoFeed('2026-11-10T09:00:00', new Date('2026-11-10T12:00:00')).includes('/'),
+)
+// [VERIFICACAO DE FONTE] A tela le o historico e junta com o tempo real; a
+// linha do feed e identificada pelo evento, nao pela posicao.
+const fonteDoFeed = fonteSemComentarios('pages', 'Dashboard.tsx')
+verifica(
+  'Dashboard le /atividade e junta com o tempo real',
+  /api\.atividade\(/.test(fonteDoFeed) && /juntarAtividade\(/.test(fonteDoFeed),
+)
+verifica('linha do feed com key do evento', /key=\{chaveDoEvento\(item\)\}/.test(fonteDoFeed))
 
 // ===========================================================================
 console.log(

@@ -1,4 +1,11 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import {
+  chaveDoEvento,
+  descreverEvento,
+  horaDoFeed,
+  juntarAtividade,
+  type ItemDoFeed,
+} from '../api/atividade'
 import { api } from '../api/client'
 import {
   comparacaoAtravessaTroca,
@@ -10,10 +17,8 @@ import {
   posicoesAbertas,
   price,
   quantity,
-  quoteOf,
   rotuloDeDecisao,
   serieNaMoedaAtual,
-  timeOnly,
   toNumber,
   unidadeDoEvento,
 } from '../api/format'
@@ -40,7 +45,10 @@ const SLICE_COLORS = ['#58a6ff', '#3fb950', '#d29922', '#bc8cff', '#f85149', '#3
 /** Quantas entradas de auditoria pedir para localizar a troca de moeda. */
 const AUDIT_LIMITE = 50
 
-export default function Dashboard({ feed }: { feed: { event: string; data: any; at: string }[] }) {
+/** Itens do feed "Atividade em tempo real" (historico + tempo real). */
+const LIMITE_DO_FEED = 50
+
+export default function Dashboard({ feed }: { feed: ItemDoFeed[] }) {
   const [periodo, setPeriodo] = usePeriodo('dashboard', { tipo: 'atalho', dias: 30 })
   const queryClient = useQueryClient()
   const health = useHealth()
@@ -58,6 +66,15 @@ export default function Dashboard({ feed }: { feed: { event: string; data: any; 
     queryKey: ['riskEvents'],
     queryFn: () => api.riskEvents(15),
   })
+  // O que aconteceu antes de a tela abrir (ou durante uma queda do WebSocket):
+  // sem isto o feed comecava vazio a cada recarga. O tempo real (`feed`) vai por
+  // cima, sem repetir o que os dois caminhos trazem (`juntarAtividade`).
+  const historico = useQuery<ItemDoFeed[]>({
+    queryKey: ['atividade', LIMITE_DO_FEED],
+    queryFn: () => api.atividade(LIMITE_DO_FEED),
+  })
+  const atividade = juntarAtividade(historico.data ?? [], feed, LIMITE_DO_FEED)
+  const agora = new Date()
   // O log de auditoria e append-only e registra a troca de moeda de cotacao com
   // `before.quote_currency`/`after.quote_currency`. E a unica fonte que permite
   // ao frontend saber ATE QUANDO a serie de patrimonio esta em outra unidade —
@@ -360,18 +377,25 @@ export default function Dashboard({ feed }: { feed: { event: string; data: any; 
         </Card>
 
         <Card title="Atividade em tempo real">
-          {feed.length === 0 ? (
+          {atividade.length === 0 && historico.isLoading ? (
+            <Loading />
+          ) : atividade.length === 0 && historico.isError ? (
+            <ErroDeCarga error={historico.error} oQue="a atividade recente" />
+          ) : atividade.length === 0 ? (
             <Empty>
-              Aguardando eventos.
+              Nenhum evento registrado ainda.
               <br />
-              Sinais, decisões de risco e execuções aparecem aqui assim que acontecem.
+              Sinais, decisões de risco, execuções, alertas e subidas do sistema aparecem aqui.
             </Empty>
           ) : (
             <div className="feed">
-              {feed.map((item, index) => (
-                <div key={index} className={`feed-item ${item.event}`}>
-                  <span className="feed-time">{timeOnly(item.at)}</span>
-                  <span>{describeEvent(item.event, item.data, moeda)}</span>
+              {atividade.map((item) => (
+                // A chave do evento, e nao o indice: os itens entram no topo, e
+                // com `key={index}` o React reaproveitava cada linha para o
+                // evento seguinte.
+                <div key={chaveDoEvento(item)} className={`feed-item ${item.event}`}>
+                  <span className="feed-time">{horaDoFeed(item.at, agora)}</span>
+                  <span>{descreverEvento(item.event, item.data, moeda)}</span>
                 </div>
               ))}
             </div>
@@ -433,37 +457,4 @@ export default function Dashboard({ feed }: { feed: { event: string; data: any; 
       </div>
     </>
   )
-}
-
-/** Converte o payload cru do WebSocket em uma frase legivel. */
-function describeEvent(event: string, data: any, moeda: string): string {
-  switch (event) {
-    case 'signal':
-      return `Sinal ${data.direction} em ${data.symbol} por ${data.strategy} (confiança ${percent(
-        data.confidence,
-        0,
-      )}) — ${data.reason}`
-    case 'risk_assessment':
-      return data.decision === 'approved'
-        ? `Risk Manager aprovou ${money(data.approved_notional ?? '0', quoteOf(data.symbol) || moeda)}`
-        : `Risk Manager rejeitou: ${(data.reasons ?? []).join(' · ')}`
-    case 'order_result':
-      return `Ordem ${data.status} — ${quantity(data.filled_quantity)} @ ${
-        data.average_price ? price(data.average_price) : '—'
-      }`
-    case 'portfolio':
-      // O percentual que estava aqui era `unrealized_pnl / max(total_value, 1)`:
-      // uma DIVISAO de dinheiro por dinheiro em float (proibida por D7) e,
-      // pior, com o denominador travado em 1 — numa carteira abaixo de 1 a
-      // conta devolvia o proprio PnL disfarcado de percentual. O backend nao
-      // manda essa razao neste evento, entao a frase mostra o que ele manda.
-      return `Patrimônio atualizado: ${money(data.total_value, moeda)} · ${money(
-        data.unrealized_pnl ?? '0',
-        moeda,
-      )} não realizado`
-    case 'alert':
-      return `ALERTA: ${data.reason ?? data.type}`
-    default:
-      return event
-  }
 }

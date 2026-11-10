@@ -19,6 +19,7 @@ import type {
   TradingConfig,
   Money,
 } from './types'
+import type { ItemDoFeed } from './atividade'
 import { pedidos, type LancamentoManual, type Pedido } from './mutacoes'
 import { RAIZ } from './raiz'
 
@@ -101,6 +102,8 @@ export const api = {
   orders: (limit = 50) => request<Order[]>(`/orders?limit=${limit}`),
   riskEvents: (limit = 50) => request<RiskEvent[]>(`/risk/events?limit=${limit}`),
   audit: (limit = 50) => request<AuditEntry[]>(`/audit?limit=${limit}`),
+  /** Historico do feed do Dashboard, na forma da mensagem do WebSocket. */
+  atividade: (limite = 50) => request<ItemDoFeed[]>(`/atividade?limite=${limite}`),
 
   riskConfig: () => request<RiskConfig>('/risk/config'),
   updateRiskConfig: (payload: Record<string, unknown>) =>

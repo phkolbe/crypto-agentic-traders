@@ -413,7 +413,7 @@ class TestVarreduraDeDinheiroComDadoDeVerdade:
 
     @pytest.mark.parametrize(
         "rota",
-        ["/api/signals", "/api/orders", "/api/risk/events", "/api/audit"],
+        ["/api/signals", "/api/orders", "/api/risk/events", "/api/audit", "/api/atividade"],
     )
     async def test_nenhuma_rota_de_historico_manda_dinheiro_em_number(
         self, povoado, rota
@@ -510,6 +510,7 @@ class TestChaveDeApiPelaBordaDaApi:
         "/api/orders",
         "/api/risk/events",
         "/api/audit",
+        "/api/atividade",
         "/openapi.json",
     ]
 

@@ -516,6 +516,7 @@ button.small { padding: 4px 9px; font-size: 12px; }
 .feed-item.order_result { border-left-color: var(--positive); }
 .feed-item.risk_assessment { border-left-color: var(--warning); }
 .feed-item.alert { border-left-color: var(--negative); }
+.feed-item.system { border-left-color: var(--neutral); }
 .feed-time { color: var(--text-faint); font-family: var(--mono); font-size: 11px; flex-shrink: 0; }
 
 .expandable { cursor: pointer; }

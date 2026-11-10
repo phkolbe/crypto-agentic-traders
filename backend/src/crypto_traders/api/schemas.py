@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import (
     AwareDatetime,
@@ -268,6 +268,21 @@ class AuditEntryOut(BaseModel):
     detail: str | None
     before: dict[str, Any]
     after: dict[str, Any]
+
+
+class AtividadeOut(BaseModel):
+    """Um item do feed "Atividade em tempo real", lido do banco.
+
+    `event` e `data` tem a forma da mensagem do WebSocket (`routes/ws.py`), para a
+    tela descrever historico e tempo real com a mesma funcao e reconhecer o mesmo
+    evento vindo pelos dois caminhos. `system` so existe aqui: subida e parada
+    ficam no `audit_log` e nao passam pelo barramento. O dinheiro em `data` ja
+    chega como string (D7), montado pelos `*Out` de cada fonte.
+    """
+
+    event: Literal["signal", "risk_assessment", "order_result", "alert", "system"]
+    at: AwareDatetime
+    data: dict[str, Any]
 
 
 # ---------------------------------------------------------------------------

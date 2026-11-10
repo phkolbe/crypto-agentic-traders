@@ -29,6 +29,7 @@ from ..logging_setup import get_logger
 from .deps import HOSTS_LOOPBACK, origem_confiavel, settings_dep
 from .routes import (
     agents,
+    atividade,
     backtest,
     notifications,
     portfolio,
@@ -131,6 +132,7 @@ def create_app(orchestrator: Orchestrator | None = None) -> FastAPI:
     app.include_router(backtest.router, prefix="/api", tags=["backtest"])
     app.include_router(notifications.router, prefix="/api", tags=["notificacoes"])
     app.include_router(trading_config.router, prefix="/api", tags=["configuracao"])
+    app.include_router(atividade.router, prefix="/api", tags=["atividade"])
     app.include_router(ws.router, tags=["tempo real"])
     _servir_telas(app, PROJECT_ROOT / "frontend" / "dist")
 
