@@ -92,6 +92,26 @@ RETIRED_ENV_KEYS = frozenset(
     }
 )
 
+#: Os blocos de negocio de `Settings` pelo nome do campo (`TRADING`, `RISK`, em JSON)
+#: e pelo `env_nested_delimiter` (`TRADING__TIMEFRAME`, `RISK__MAX_ORDER_NOTIONAL`).
+#: O delimitador existe para `BINANCE__API_KEY`, mas abria a mesma porta para o
+#: negocio: um `RISK__MAX_ORDER_NOTIONAL=7` no `crypto.env` de producao chegava a
+#: `settings.risk`, o banco sobrescrevia na subida e ninguem sabia -- a segunda fonte
+#: de verdade que `RETIRED_ENV_KEYS` (so os nomes antigos) nao via. Recusado em todo
+#: ambiente, como as chaves antigas: nao ha uso legitimo, e "avisar e ignorar" e o
+#: valor sem efeito que parece ter.
+_CAMPOS_DE_NEGOCIO = frozenset({"TRADING", "RISK"})
+_PREFIXOS_DE_NEGOCIO = ("TRADING__", "RISK__")
+
+
+def _e_chave_de_negocio(nome: str) -> bool:
+    nome = nome.upper()
+    return (
+        nome in RETIRED_ENV_KEYS
+        or nome in _CAMPOS_DE_NEGOCIO
+        or nome.startswith(_PREFIXOS_DE_NEGOCIO)
+    )
+
 
 def _split_csv_value(value: object, *, upper: bool = False) -> object:
     """Aceita CSV alem de JSON.
@@ -504,30 +524,39 @@ class Settings(BaseSettings):
             return None
         return value
 
-    @model_validator(mode="after")
-    def _reject_business_keys(self) -> Settings:
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_business_keys(cls, data: object) -> object:
         """Recusa subir quando uma chave de negocio aparece no ambiente.
 
         Ignorar em silencio seria repetir o erro que motivou esta separacao: a
         pessoa edita o arquivo, o valor nao tem efeito, e ninguem descobre ate
         uma ordem sair do tamanho errado.
+
+        Roda ANTES da validacao dos campos: com `TRADING__TIMEFRAME=xyz` a
+        mensagem seria a do `TradingSettings` ("timeframe invalido"), e a pessoa
+        corrigiria o valor -- que continuaria sem efeito. Olha o ambiente e o
+        `.env`, nunca `data`: `Settings(trading=...)` e o codigo instalando o
+        negocio vindo do banco, nao o ambiente.
         """
-        encontradas = sorted(chave for chave in RETIRED_ENV_KEYS if chave in os.environ)
+        encontradas = sorted(
+            {chave.upper() for chave in os.environ if _e_chave_de_negocio(chave)}
+        )
         encontradas += sorted(
             chave
-            for chave in _keys_in_dotenv(self.model_config.get("env_file"))
-            if chave in RETIRED_ENV_KEYS and chave not in encontradas
+            for chave in _keys_in_dotenv(cls.model_config.get("env_file"))
+            if _e_chave_de_negocio(chave) and chave not in encontradas
         )
         if encontradas:
             raise ValueError(
                 "estas sao configuracoes de NEGOCIO e agora moram no banco, "
                 "editaveis em Configuracoes na interface web:\n    "
                 + "\n    ".join(encontradas)
-                + "\n  Remova essas linhas do `.env`. Enquanto estiverem la, o valor "
-                "escrito no arquivo NAO tem efeito -- e um valor sem efeito que "
-                "parece ter e pior que nenhum valor."
+                + "\n  Remova essas linhas do `.env` (em producao, do `crypto.env`). "
+                "Enquanto estiverem la, o valor escrito no arquivo NAO tem efeito -- e "
+                "um valor sem efeito que parece ter e pior que nenhum valor."
             )
-        return self
+        return data
 
     @model_validator(mode="after")
     def _resolve_database_url(self) -> Settings:
