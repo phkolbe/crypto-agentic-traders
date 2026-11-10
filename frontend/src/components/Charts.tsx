@@ -21,6 +21,22 @@ import { rotuladorDeSerie } from '../api/format'
 /** Ponto de uma série temporal. `time` é ISO-8601; `value` já em unidades reais. */
 export type SeriesPoint = { time: string; value: number }
 
+/**
+ * Resumo de uma serie para leitor de tela: "de 29,29 USDC a 31,02 USDC".
+ *
+ * Os graficos eram `<svg>` sem nome nem papel: o leitor de tela pulava o grafico
+ * de patrimonio inteiro, e o valor so aparecia no tooltip, que e so de mouse.
+ * Primeiro e ultimo valor medidos (ignora buraco da serie).
+ */
+export function resumoDaSerie(
+  valores: (number | null)[],
+  formatar: (value: number) => string,
+): string {
+  const medidos = valores.filter((v): v is number => v !== null && Number.isFinite(v))
+  if (medidos.length === 0) return 'sem dados'
+  return `de ${formatar(medidos[0]!)} a ${formatar(medidos[medidos.length - 1]!)}`
+}
+
 const AXIS = 'var(--text-faint)'
 const LINE = 'var(--accent)'
 
@@ -439,6 +455,11 @@ export function TimeSeriesChart({
       <svg
         width={largura}
         height={height}
+        role="img"
+        aria-label={`${valueLabel}: ${resumoDaSerie(
+          data.map((p) => p.value),
+          formatValue,
+        )}`}
         onMouseMove={aoMover}
         onMouseLeave={() => setAtivo(null)}
         style={{ display: 'block', overflow: 'visible' }}
@@ -725,6 +746,8 @@ export function MultiSeriesChart({
       <svg
         width={largura}
         height={height}
+        role="img"
+        aria-label={series.map((s) => `${s.nome}: ${resumoDaSerie(s.valores, formatValue)}`).join('; ')}
         onMouseMove={aoMover}
         onMouseLeave={() => setAtivo(null)}
         style={{ display: 'block', overflow: 'visible' }}
@@ -894,7 +917,13 @@ export function BarChart({
 
   return (
     <div ref={ref} style={{ position: 'relative', width: '100%' }}>
-      <svg width={largura} height={height} style={{ display: 'block', overflow: 'visible' }}>
+      <svg
+        width={largura}
+        height={height}
+        role="img"
+        aria-label={itens.map((item) => `${item.rotulo}: ${formatValue(item.valor)}`).join('; ')}
+        style={{ display: 'block', overflow: 'visible' }}
+      >
         {ticksY.map((valor) => (
           <g key={`y-${valor}`}>
             <line
@@ -1100,7 +1129,13 @@ export function DonutChart({
 
   return (
     <div style={{ position: 'relative', width: size, height: size }}>
-      <svg width={size} height={size} style={{ display: 'block' }}>
+      <svg
+        width={size}
+        height={size}
+        role="img"
+        aria-label={data.map((s) => `${s.label}: ${formatValue(s.value)}`).join('; ')}
+        style={{ display: 'block' }}
+      >
         {setores.map(({ slice, indice, d }) => (
           <path
             key={slice.label}

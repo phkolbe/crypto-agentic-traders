@@ -100,7 +100,7 @@ export default function Agents() {
       />
       {health.isError && <ErroDeCarga error={health.error} oQue="o estado mais novo dos agentes" />}
 
-      {message && <div className="form-message err" style={{ marginBottom: 14 }}>{message}</div>}
+      {message && <div className="form-message err" style={{ marginBottom: 14 }} role="alert">{message}</div>}
 
       <div className="grid grid-2">
         <Card title="Estado dos agentes">

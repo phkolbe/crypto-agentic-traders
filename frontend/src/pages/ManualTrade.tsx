@@ -216,7 +216,9 @@ export default function ManualTrade() {
             )}
 
             {message && (
-              <div className={`form-message ${message.ok ? 'ok' : 'err'}`}>{message.text}</div>
+              <div className={`form-message ${message.ok ? 'ok' : 'err'}`} role={message.ok ? 'status' : 'alert'}>
+                {message.text}
+              </div>
             )}
 
             {revisando && (
@@ -232,7 +234,7 @@ export default function ManualTrade() {
                     Confira o preço contra o extrato da exchange.
                   </span>
                   {foraDoMercado && (
-                    <div className="form-message err" style={{ marginTop: 8 }}>
+                    <div className="form-message err" style={{ marginTop: 8 }} role="alert">
                       {foraDoMercado}
                     </div>
                   )}

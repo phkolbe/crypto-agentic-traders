@@ -28,15 +28,19 @@
 
 import {
   alteracoesDeNegocio,
+  alteracoesDeRisco,
   comparacaoAtravessaTroca,
   fronteiraDaMoeda,
   granularidadeDoIntervalo,
   money,
   multiplyDecimal,
+  rotuloDaPagina,
+  paginaValida,
   parDoEvento,
   percent,
   posicoesAbertas,
   price,
+  quantity,
   quoteOf,
   rodapeDoStat,
   rotuladorDeSerie,
@@ -80,6 +84,7 @@ import contratoDasMutacoes from './contrato-mutacoes.json'
 import {
   amostragemTipica,
   casasParaPasso,
+  resumoDaSerie,
   niceTicks,
   passosTemporais,
   tickIndices,
@@ -707,8 +712,15 @@ verifica(
 verifica('carteira vazia devolve lista vazia', posicoesAbertas([], 'USDC').length === 0)
 
 verifica('percent de nulo e travessao', percent(null) === '—')
-verifica('money de nulo com moeda', money(null, 'USDC') === '0,00 USDC', money(null, 'USDC'))
-verifica('money de string vazia', money('', 'USDC') === '0,00 USDC', money('', 'USDC'))
+// Estas duas exigiam "0,00 USDC" para nulo: era o defeito (telas.md, low
+// "toNumber transforma null em 0") — um zero que ninguem mediu, com unidade.
+verifica('money de nulo e travessao', money(null, 'USDC') === '—', money(null, 'USDC'))
+verifica('money de string vazia e travessao', money('', 'USDC') === '—', money('', 'USDC'))
+verifica(
+  'price e quantity de nulo ou lixo sao travessao',
+  price(null) === '—' && quantity(undefined) === '—' && price('abc' as never) === '—',
+)
+verifica('zero de verdade continua zero', money('0', 'USDC') === '0,00 USDC' && quantity('0') === '0,00')
 verifica('toNumber trata nulo como zero, sem NaN na tela', toNumber(null) === 0)
 verifica('toNumber trata texto invalido como zero', toNumber('abc' as never) === 0)
 
@@ -1535,6 +1547,52 @@ verifica(
   /onClick=\{pedirConfirmacao\}/.test(fonteConfiguracao),
 )
 
+// Risco tinha a mesma frase fixa para tudo (telas.md, low): apertar o stop e
+// esvaziar o "Capital autorizado" — que libera o patrimonio inteiro — pediam a
+// mesma confirmacao generica.
+const CAMPOS_DE_RISCO = [
+  { key: 'stop_loss_pct', label: 'Stop-loss' },
+  { key: 'authorized_capital', label: 'Capital autorizado a operar', nullable: true },
+  { key: 'max_order_notional', label: 'Valor máximo por ordem', nullable: true },
+]
+const BASE_DE_RISCO = { stop_loss_pct: '0.03', authorized_capital: '29.29', max_order_notional: '' }
+const liberarCapital = alteracoesDeRisco(CAMPOS_DE_RISCO, BASE_DE_RISCO, {
+  clear_authorized_capital: true,
+  stop_loss_pct: 0.05,
+})
+verifica(
+  'esvaziar o capital autorizado diz que libera o patrimonio e os depositos futuros',
+  liberarCapital.length === 2 &&
+    liberarCapital[0]!.campo === 'Capital autorizado a operar' &&
+    liberarCapital[0]!.antes === '29.29' &&
+    liberarCapital[0]!.depois === '(sem limite)' &&
+    /depósitos futuros/.test(liberarCapital[0]!.aviso ?? ''),
+  JSON.stringify(liberarCapital),
+)
+verifica(
+  'mudar o stop mostra antes e depois, sem aviso extra',
+  liberarCapital[1]!.campo === 'Stop-loss' &&
+    liberarCapital[1]!.antes === '0.03' &&
+    liberarCapital[1]!.depois === '0.05' &&
+    liberarCapital[1]!.aviso === undefined,
+  JSON.stringify(liberarCapital[1]),
+)
+const porTeto = alteracoesDeRisco(CAMPOS_DE_RISCO, BASE_DE_RISCO, { max_order_notional: '50' })
+verifica(
+  'campo que aceita vazio mostra "(sem limite)" como valor anterior',
+  porTeto[0]!.antes === '(sem limite)' && porTeto[0]!.depois === '50',
+  JSON.stringify(porTeto),
+)
+const fonteRisco = fonteSemComentarios('pages', 'RiskSettings.tsx')
+const salvarRisco = fonteRisco.match(/save\.mutate\([^)]*\)/g) ?? []
+verifica(
+  'Risco so envia o pedido confirmado, de onde o resumo saiu',
+  salvarRisco.length === 1 &&
+    salvarRisco[0] === 'save.mutate(pendente.pedido)' &&
+    /alteracoesDeRisco\(/.test(fonteRisco),
+  salvarRisco.join(', '),
+)
+
 // ===========================================================================
 bloco('Nenhuma tela de dados confunde falha com vazio')
 
@@ -1813,6 +1871,77 @@ verifica(
   /api\.atividade\(/.test(fonteDoFeed) && /juntarAtividade\(/.test(fonteDoFeed),
 )
 verifica('linha do feed com key do evento', /key=\{chaveDoEvento\(item\)\}/.test(fonteDoFeed))
+
+// ===========================================================================
+bloco('Negociacoes: paginacao depois de excluir, linha por teclado, avisos anunciados')
+
+// Excluir o unico item da ultima pagina (26 lancamentos, pagina 2) deixava a
+// tela em "26–25 de 25" com uma pagina vazia.
+const rotuloAntigo = (offset: number, tamanho: number, total: number) =>
+  total === 0 ? 'nenhum registro' : `${offset + 1}–${Math.min(offset + tamanho, total)} de ${total}`
+verifica('o defeito existe: a faixa antiga dizia "26–25 de 25"', rotuloAntigo(25, 25, 25) === '26–25 de 25')
+verifica(
+  'depois de excluir, a pagina volta para a ultima que existe',
+  paginaValida(25, 25, 25) === 0 && rotuloDaPagina(25, 25, 25) === '1–25 de 25',
+  rotuloDaPagina(25, 25, 25),
+)
+verifica(
+  'pagina valida nao muda; vazio e "nenhum registro"',
+  paginaValida(25, 25, 26) === 25 &&
+    rotuloDaPagina(25, 25, 26) === '26–26 de 26' &&
+    rotuloDaPagina(0, 25, 0) === 'nenhum registro',
+)
+// [VERIFICACAO DE FONTE] Acessibilidade e um defeito do texto do JSX.
+const fonteNegociacoes = fonteSemComentarios('pages', 'Trades.tsx')
+// Ate o `>` sozinho na linha que fecha a tag: os `=>` das funcoes ficam dentro.
+const linhaExpansivel = fonteNegociacoes.match(/<tr\s+className="expandable"[\s\S]*?\n\s*>/)?.[0] ?? ''
+verifica(
+  'linha que expande abre pelo teclado e diz se esta aberta',
+  /tabIndex=\{0\}/.test(linhaExpansivel) &&
+    /onKeyDown=/.test(linhaExpansivel) &&
+    /aria-expanded=/.test(linhaExpansivel),
+  linhaExpansivel,
+)
+const botaoDentroDeLink = paginas.filter((pagina) =>
+  /<a\b[^>]*>\s*<button/.test(fonteSemComentarios('pages', pagina)),
+)
+verifica('nenhum botao dentro de link', botaoDentroDeLink.length === 0, botaoDentroDeLink.join(', '))
+verifica('filtro "Par" espera a digitacao parar', /setTimeout\(/.test(fonteNegociacoes))
+const avisosMudos: string[] = []
+for (const partes of arquivosComClasse) {
+  const codigo = fonteSemComentarios(...partes)
+  for (const tag of codigo.matchAll(/<div\s+className=(?:"form-message[^"]*"|\{`form-message[^`]*`\})[^>]*>/g)) {
+    if (!/\brole=/.test(tag[0])) avisosMudos.push(`${partes.join('/')}: ${tag[0].slice(0, 60)}`)
+  }
+}
+verifica(
+  'toda mensagem de resultado e anunciada ao leitor de tela (role)',
+  avisosMudos.length === 0,
+  avisosMudos.join('; '),
+)
+verifica('o rodape "reconectando…" e anunciado', /sidebar-estado"[^>]*role="status"/.test(fonteApp))
+
+// ===========================================================================
+bloco('Graficos com nome para o leitor de tela')
+
+verifica(
+  'resumo da serie: primeiro e ultimo valor medidos, buraco ignorado',
+  resumoDaSerie([null, 29.29, 30, null, 31.02, null], (v) => money(v, 'USDC')) ===
+    'de 29,29 USDC a 31,02 USDC',
+  resumoDaSerie([null, 29.29, 30, null, 31.02, null], (v) => money(v, 'USDC')),
+)
+verifica('serie sem nenhum valor diz "sem dados"', resumoDaSerie([null, null], String) === 'sem dados')
+// [VERIFICACAO DE FONTE] `<svg>` sem papel nem nome: o leitor de tela pulava o
+// grafico, e o valor so existia no tooltip de mouse.
+const fonteGraficos = fonteSemComentarios('components', 'Charts.tsx')
+const svgsSemNome = [...fonteGraficos.matchAll(/<svg\b[\s\S]*?\n?\s*>/g)]
+  .map((m) => m[0])
+  .filter((tag) => !/role="img"/.test(tag) || !/aria-label=/.test(tag))
+verifica(
+  'todo <svg> de grafico tem role="img" e aria-label',
+  svgsSemNome.length === 0 && fonteGraficos.includes('<svg'),
+  svgsSemNome.map((t) => t.slice(0, 50)).join(' | '),
+)
 
 // ===========================================================================
 console.log(

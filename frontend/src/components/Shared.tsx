@@ -257,7 +257,7 @@ export function CapitalGateBanner({
             </span>
           </div>
         )}
-        {erro && <div className="form-message err" style={{ marginTop: 8 }}>{erro}</div>}
+        {erro && <div className="form-message err" style={{ marginTop: 8 }} role="alert">{erro}</div>}
       </div>
       {/* `primary`, nao `btn btn-primary`: nao existe regra `.btn` nem
           `.btn-primary` no CSS, e este botao — o que libera capital para operar —
@@ -327,7 +327,7 @@ export function CircuitBreakerBanner({
             </span>
           </div>
         )}
-        {erro && <div className="form-message err" style={{ marginTop: 8 }}>{erro}</div>}
+        {erro && <div className="form-message err" style={{ marginTop: 8 }} role="alert">{erro}</div>}
       </div>
       {onReset &&
         (!confirmando ? (

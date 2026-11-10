@@ -433,7 +433,7 @@ export default function Configuration() {
           ))}
         </div>
         {estrategiasSelecionadas.length === 0 && (
-          <div className="form-message err" style={{ marginTop: 10 }}>
+          <div className="form-message err" style={{ marginTop: 10 }} role="alert">
             Sem nenhuma estratégia o sistema fica de pé gerando zero sinais — parece saudável e
             nunca opera.
           </div>
