@@ -45,7 +45,7 @@ some).
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Iterable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -57,6 +57,7 @@ from ..config import Settings
 from ..db.repositories import (
     AgentRunRepository,
     AuditLogRepository,
+    CandleRepository,
     PortfolioLedgerRepository,
     PortfolioSnapshotRepository,
     TradeRepository,
@@ -95,6 +96,13 @@ ACAO_LANCAMENTO_APAGADO = "manual_trade_deleted"
 #: horario anterior ao dele. Sem a folga, a correcao do digito seria lida como
 #: prejuizo -- a direcao segura, mas e a trava armando por um typo.
 FOLGA_DA_ANCORA = timedelta(minutes=5)
+
+#: Quanto antes do trade o candle da moeda da taxa (BNB) pode ter fechado para
+#: valer como a cotacao do instante. Com o timeframe diario, o ultimo candle
+#: fechado e de ate 24 h antes; dois dias cobrem uma coleta perdida. A taxa e
+#: ~0,075% do valor, entao 5% de oscilacao do BNB nesse intervalo muda o custo em
+#: 0,004% -- e semanas de distancia ja nao seriam "o instante".
+TOLERANCIA_COTACAO_DA_TAXA = timedelta(days=2)
 
 #: As duas acoes que formam o **razao de fantasmas**: quantidade reconhecida como
 #: fora do saldo e credito ja atribuido a ela. O razao mora no `audit_log` porque
@@ -178,6 +186,14 @@ class PortfolioAgent(BaseAgent):
         self._avisados: set[tuple[str, str]] = set()
         """Avisos ja gravados: 1.440 linhas iguais por dia tornariam o registro ilegivel."""
 
+        self._cotacoes_da_taxa: dict[str, Decimal] = {}
+        """Cotacao da taxa em terceira moeda ja achada, por id de trade.
+
+        Ela nao muda depois de achada (so vale candle que fechou ANTES do trade),
+        entao nao precisa voltar ao banco a cada retrato. O que nao foi achado e
+        procurado de novo: um par recem-coletado traz o historico de candles.
+        """
+
     async def _run(self) -> None:
         while True:
             await self.wait_if_paused()
@@ -217,6 +233,7 @@ class PortfolioAgent(BaseAgent):
                 ),
                 ancora,
             )
+            cotacoes = await self._cotacoes_das_taxas(session, [*trades, *apagadas])
 
         positions = await self._broker.fetch_positions(prices)
 
@@ -231,10 +248,10 @@ class PortfolioAgent(BaseAgent):
                 f"{', '.join(sorted(saldo_anterior))}; retrato NAO produzido"
             )
 
-        apuracao = self._apurar(trades)
+        apuracao = self._apurar(trades, cotacoes)
         # O historico como era antes das exclusoes recentes: so ele diz quanto
         # realizado e quanta quantidade a correcao do operador tirou.
-        antes_da_edicao = self._apurar([*trades, *apagadas]) if apagadas else None
+        antes_da_edicao = self._apurar([*trades, *apagadas], cotacoes) if apagadas else None
         saldos = {p.asset: p.quantity for p in positions}
         creditos, avisos_razao = self._reconciliar(
             apuracao, saldos, prices, ancora, razao, antes_da_edicao
@@ -338,17 +355,33 @@ class PortfolioAgent(BaseAgent):
         )
         return snapshot
 
+    async def _cotacoes_das_taxas(
+        self, session: Any, trades: Sequence[Any]
+    ) -> dict[str, Decimal]:
+        """`cotacoes_das_taxas` com memoria: so procura o que ainda nao achou."""
+        quote = self._settings.trading.quote_currency
+        faltam = [
+            t
+            for t in trades
+            if str(t.id) not in self._cotacoes_da_taxa
+            and _taxa_em_terceira_moeda(t, quote) is not None
+        ]
+        if faltam:
+            self._cotacoes_da_taxa.update(await cotacoes_das_taxas(session, faltam, quote))
+        return self._cotacoes_da_taxa
+
     # ------------------------------------------------------------------
     # Apuracao do historico
     # ------------------------------------------------------------------
-    def _apurar(self, trades: Iterable[Any]) -> _Apuracao:
+    def _apurar(
+        self, trades: Iterable[Any], cotacoes_da_taxa: Mapping[str, Decimal] | None = None
+    ) -> _Apuracao:
         """Custo medio movel e PnL realizado, derivados do historico de trades.
 
-        Percorre em ordem cronologica: compra soma ao custo (com a taxa, que e
-        dinheiro que saiu para adquirir o ativo), venda realiza contra o custo
-        medio vigente e retira do custo a parte proporcional. O medio nao se move
-        numa venda parcial -- e isso que faz `2 * (500 - 175) = 650` de realizado
-        conviver com `175` de medio nas duas unidades que sobraram.
+        A conta mora em `custo_medio_movel`, que a tela Portfolio
+        (`analise.resultado_por_par`) usa tambem: uma regra so para o numero que
+        decide stop e para o que o operador le por par. Aqui ficam os avisos do
+        que foi descartado.
 
         Nao usa `SUM()` no banco por dois motivos independentes. O primeiro e
         precisao: no SQLite estas colunas sao texto (ver `db.models.Money`), e
@@ -359,67 +392,12 @@ class PortfolioAgent(BaseAgent):
         """
         quote = self._settings.trading.quote_currency
         modo = str(self._settings.trading_mode)
-
-        quantidades: dict[str, Decimal] = {}
-        custos: dict[str, Decimal] = {}
-        realizado = Decimal(0)
-
-        outra_cotacao: dict[str, int] = {}
-        outro_modo: dict[str, int] = {}
-        taxa_descartada: dict[str, Decimal] = {}
-        sem_base: dict[str, Decimal] = {}
-
-        for trade in _em_ordem(trades):
-            asset, _, cotacao = trade.symbol.partition("/")
-            if (cotacao or quote) != quote:
-                # 401.128 BRL nao entra num medio em USDT: seria erro de unidade,
-                # e a posicao herdada da troca de cotacao (D24) fica sem base de
-                # custo -- portanto sem stop -- o que o Risk Manager avisa.
-                outra_cotacao[cotacao or "?"] = outra_cotacao.get(cotacao or "?", 0) + 1
-                continue
-
-            trade_modo = trade.mode or modo
-            if trade_modo not in (modo, MODO_MANUAL):
-                outro_modo[trade_modo] = outro_modo.get(trade_modo, 0) + 1
-                continue
-
-            preco = _decimal(trade.price)
-            quantidade, taxa, descartada = _quantidade_e_taxa(trade, asset, quote)
-            if descartada is not None:
-                moeda_da_taxa, valor = descartada
-                taxa_descartada[moeda_da_taxa] = (
-                    taxa_descartada.get(moeda_da_taxa, Decimal(0)) + valor
-                )
-
-            mantido = quantidades.get(asset, Decimal(0))
-            custo = custos.get(asset, Decimal(0))
-
-            if trade.side == str(Side.BUY):
-                quantidades[asset] = mantido + quantidade
-                custos[asset] = custo + quantidade * preco + taxa
-                continue
-
-            # Venda: a taxa e dinheiro que saiu, entao entra no realizado mesmo
-            # quando nao ha base de custo para a quantidade vendida.
-            realizado -= taxa
-            if mantido <= 0:
-                # Saldo preexistente vendido: sem custo conhecido nao ha lucro a
-                # declarar. Declarar o preco cheio como lucro empurraria o
-                # resultado de negociacao para cima e esconderia prejuizo real do
-                # circuit breaker.
-                sem_base[asset] = sem_base.get(asset, Decimal(0)) + quantidade
-                continue
-
-            medio = custo / mantido
-            vendido = min(quantidade, mantido)
-            realizado += vendido * (preco - medio)
-            restante = mantido - vendido
-            quantidades[asset] = restante
-            # Fechamento total zera o custo EXATO: `custo - vendido * medio`
-            # deixaria residuo de dizima (1E-27) onde o correto e zero.
-            custos[asset] = custo - vendido * medio if restante > 0 else Decimal(0)
-            if quantidade > vendido:
-                sem_base[asset] = sem_base.get(asset, Decimal(0)) + (quantidade - vendido)
+        percurso = custo_medio_movel(trades, quote, modo, cotacoes_da_taxa)
+        quantidades, custos, realizado = (
+            percurso.quantidades, percurso.custos, percurso.realizado
+        )
+        outra_cotacao, outro_modo = percurso.outra_cotacao, percurso.outro_modo
+        taxa_descartada, sem_base = percurso.taxa_descartada, percurso.sem_base
 
         avisos: list[_Aviso] = []
         for cotacao, quantos in sorted(outra_cotacao.items()):
@@ -448,8 +426,10 @@ class PortfolioAgent(BaseAgent):
                 _Aviso(
                     ACAO_TAXA,
                     moeda,
-                    f"{total} {moeda} de taxa descartados do custo em {quote}: "
-                    f"sem a cotacao do instante do trade, somar seria erro de unidade",
+                    f"{total} {moeda} de taxa descartados do custo em {quote}: sem "
+                    f"candle de {moeda}/{quote} fechado ate "
+                    f"{TOLERANCIA_COTACAO_DA_TAXA} antes do trade, nao ha cotacao do "
+                    f"instante e somar seria erro de unidade",
                     {"moeda": moeda, "total": str(total)},
                 )
             )
@@ -661,9 +641,10 @@ class PortfolioAgent(BaseAgent):
                 continue
             self._avisados.add(chave)
             if aviso.action == ACAO_TAXA:
-                # Taxa em terceira moeda (BNB) fica fora do custo: o medio sai
-                # subestimado e o stop um pouco mais baixo. Alem do audit_log,
-                # sai como aviso no log de operacao, para nao passar calado.
+                # Taxa em terceira moeda (BNB) sem candle gravado fica fora do
+                # custo: o medio sai subestimado e o stop um pouco mais baixo.
+                # Alem do audit_log, sai como aviso no log de operacao, para nao
+                # passar calado.
                 self.log.warning(
                     "portfolio.taxa_descartada", moeda=aviso.target, detail=aviso.detail
                 )
@@ -711,8 +692,162 @@ def _movimento(
     )
 
 
+@dataclass(frozen=True)
+class _Passo:
+    """O efeito de UM trade na apuracao -- o que a tela soma por periodo."""
+
+    trade: Any
+    compra: bool
+    taxa: Decimal
+    """Na moeda de cotacao (zero quando descartada)."""
+
+    realizado: Decimal
+    """Da venda: `vendido x (preco - medio) - taxa`. Zero na compra."""
+
+    sem_base: bool
+    """Venda sem custo nenhum no historico: nao e ganho nem perda."""
+
+
+@dataclass
+class _Percurso:
+    """O historico percorrido por custo medio movel, com o que ficou de fora."""
+
+    quantidades: dict[str, Decimal] = field(default_factory=dict)
+    custos: dict[str, Decimal] = field(default_factory=dict)
+    realizado: Decimal = Decimal(0)
+    passos: list[_Passo] = field(default_factory=list)
+    outra_cotacao: dict[str, int] = field(default_factory=dict)
+    outro_modo: dict[str, int] = field(default_factory=dict)
+    taxa_descartada: dict[str, Decimal] = field(default_factory=dict)
+    sem_base: dict[str, Decimal] = field(default_factory=dict)
+
+
+def custo_medio_movel(
+    trades: Iterable[Any],
+    quote: str,
+    modo: str,
+    cotacoes_da_taxa: Mapping[str, Decimal] | None = None,
+) -> _Percurso:
+    """A regra de custo medio, UMA vez: o retrato e a tela Portfolio usam esta.
+
+    Eram duas copias linha a linha (`_apurar` e `analise.resultado_por_par`), e a
+    proxima correcao entraria numa so -- a regra que decide stop divergindo da
+    que o operador le por par (auditoria de 09/11/2026, dados).
+
+    Percorre em ordem cronologica: compra soma ao custo (com a taxa, que e
+    dinheiro que saiu para adquirir o ativo), venda realiza contra o custo
+    medio vigente e retira do custo a parte proporcional. O medio nao se move
+    numa venda parcial -- e isso que faz `2 * (500 - 175) = 650` de realizado
+    conviver com `175` de medio nas duas unidades que sobraram.
+
+    `cotacoes_da_taxa` (id do trade -> preco da moeda da taxa na cotacao, ver
+    `cotacoes_das_taxas`) converte a taxa em terceira moeda (BNB).
+    """
+    cotacoes = cotacoes_da_taxa or {}
+    p = _Percurso()
+    for trade in _em_ordem(trades):
+        asset, _, cotacao = trade.symbol.partition("/")
+        if (cotacao or quote) != quote:
+            # 401.128 BRL nao entra num medio em USDT: seria erro de unidade,
+            # e a posicao herdada da troca de cotacao (D24) fica sem base de
+            # custo -- portanto sem stop -- o que o Risk Manager avisa.
+            p.outra_cotacao[cotacao or "?"] = p.outra_cotacao.get(cotacao or "?", 0) + 1
+            continue
+
+        trade_modo = trade.mode or modo
+        if trade_modo not in (modo, MODO_MANUAL):
+            p.outro_modo[trade_modo] = p.outro_modo.get(trade_modo, 0) + 1
+            continue
+
+        preco = _decimal(trade.price)
+        quantidade, taxa, descartada = _quantidade_e_taxa(
+            trade, asset, quote, cotacoes.get(str(trade.id))
+        )
+        if descartada is not None:
+            moeda_da_taxa, valor = descartada
+            p.taxa_descartada[moeda_da_taxa] = (
+                p.taxa_descartada.get(moeda_da_taxa, Decimal(0)) + valor
+            )
+
+        mantido = p.quantidades.get(asset, Decimal(0))
+        custo = p.custos.get(asset, Decimal(0))
+
+        if trade.side == str(Side.BUY):
+            p.quantidades[asset] = mantido + quantidade
+            p.custos[asset] = custo + quantidade * preco + taxa
+            p.passos.append(_Passo(trade, True, taxa, Decimal(0), False))
+            continue
+
+        # Venda: a taxa e dinheiro que saiu, entao entra no realizado mesmo
+        # quando nao ha base de custo para a quantidade vendida.
+        realizado_da_venda = -taxa
+        if mantido <= 0:
+            # Saldo preexistente vendido: sem custo conhecido nao ha lucro a
+            # declarar. Declarar o preco cheio como lucro empurraria o
+            # resultado de negociacao para cima e esconderia prejuizo real do
+            # circuit breaker.
+            p.sem_base[asset] = p.sem_base.get(asset, Decimal(0)) + quantidade
+            p.realizado += realizado_da_venda
+            p.passos.append(_Passo(trade, False, taxa, realizado_da_venda, True))
+            continue
+
+        medio = custo / mantido
+        vendido = min(quantidade, mantido)
+        realizado_da_venda += vendido * (preco - medio)
+        restante = mantido - vendido
+        p.quantidades[asset] = restante
+        # Fechamento total zera o custo EXATO: `custo - vendido * medio`
+        # deixaria residuo de dizima (1E-27) onde o correto e zero.
+        p.custos[asset] = custo - vendido * medio if restante > 0 else Decimal(0)
+        if quantidade > vendido:
+            p.sem_base[asset] = p.sem_base.get(asset, Decimal(0)) + (quantidade - vendido)
+        p.realizado += realizado_da_venda
+        p.passos.append(_Passo(trade, False, taxa, realizado_da_venda, False))
+    return p
+
+
+def _taxa_em_terceira_moeda(trade: Any, quote: str) -> str | None:
+    """A moeda da taxa quando ela nao e nem a cotacao nem o ativo do trade."""
+    asset, _, cotacao = str(trade.symbol).partition("/")
+    moeda = trade.fee_currency or quote
+    if (cotacao or quote) != quote or moeda in (quote, asset):
+        return None
+    if _decimal(trade.fee) <= 0:
+        return None
+    return moeda
+
+
+async def cotacoes_das_taxas(
+    session: Any, trades: Iterable[Any], quote: str
+) -> dict[str, Decimal]:
+    """Id do trade -> preco da moeda da taxa (BNB) na cotacao, no instante do trade.
+
+    O preco e o fechamento do ultimo candle de `<moeda>/<quote>` que JA tinha
+    fechado no instante do trade, de qualquer timeframe gravado, e so vale se
+    fechou ate `TOLERANCIA_COTACAO_DA_TAXA` antes. Trade sem cotacao fica fora do
+    dicionario: a taxa dele e descartada com aviso, como antes.
+
+    So existe candle de BNB se o par BNB/<quote> for coletado (universo de
+    negociacao ou `SYMBOLS`). Fora dele, nada muda em relacao ao descarte.
+    """
+    cotacoes: dict[str, Decimal] = {}
+    repositorio = CandleRepository(session)
+    for trade in trades:
+        moeda = _taxa_em_terceira_moeda(trade, quote)
+        if moeda is None:
+            continue
+        instante = _instante(trade.executed_at)
+        achado = await repositorio.ultimo_fechamento_ate(f"{moeda}/{quote}", instante)
+        if achado is None:
+            continue
+        fechou, preco = achado
+        if instante - fechou <= TOLERANCIA_COTACAO_DA_TAXA and preco > 0:
+            cotacoes[str(trade.id)] = preco
+    return cotacoes
+
+
 def _quantidade_e_taxa(
-    trade: Any, asset: str, quote: str
+    trade: Any, asset: str, quote: str, cotacao_da_taxa: Decimal | None = None
 ) -> tuple[Decimal, Decimal, tuple[str, Decimal] | None]:
     """(quantidade que moveu o saldo do ativo, taxa na cotacao, taxa descartada).
 
@@ -726,9 +861,13 @@ def _quantidade_e_taxa(
     preco do PROPRIO trade, que e a cotacao exata do instante. Na compra isso da
     `custo = quantidade bruta x preco`: a taxa fica embutida no medio.
 
-    Taxa em terceira moeda (BNB) continua fora do custo: a cotacao do instante
-    nao esta guardada, e somar 0,01 BNB como 0,01 USDT inventaria custo. Ela
-    volta como descartada para o chamador deixar o rastro.
+    Taxa em terceira moeda (BNB) nao mexe na quantidade do ativo e entra no
+    dinheiro pela `cotacao_da_taxa` -- o fechamento do candle gravado no instante
+    do trade (`cotacoes_das_taxas`). Ate 10/11/2026 ela era sempre descartada
+    ("a cotacao do instante nao e guardada"), mas os candles de BNB estao no
+    banco: o medio saia subestimado e a taxa da venda ficava fora do realizado.
+    Sem cotacao, continua descartada -- somar 0,01 BNB como 0,01 USDT inventaria
+    custo -- e volta como descartada para o chamador deixar o rastro.
     """
     quantidade = _decimal(trade.quantity)
     taxa = _decimal(trade.fee)
@@ -739,6 +878,8 @@ def _quantidade_e_taxa(
         compra = trade.side == str(Side.BUY)
         no_saldo = quantidade - taxa if compra else quantidade + taxa
         return no_saldo, taxa * _decimal(trade.price), None
+    if cotacao_da_taxa is not None and cotacao_da_taxa > 0:
+        return quantidade, taxa * cotacao_da_taxa, None
     return quantidade, Decimal(0), (moeda, taxa)
 
 

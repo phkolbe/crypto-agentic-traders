@@ -8,20 +8,13 @@ usa.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from .agents.portfolio import (
-    MODO_MANUAL,
-    _decimal,
-    _em_ordem,
-    _instante,
-    _quantidade_e_taxa,
-)
-from .domain.enums import Side
+from .agents.portfolio import _instante, custo_medio_movel
 
 
 @dataclass
@@ -45,25 +38,29 @@ def resultado_por_par(
     modo: str,
     inicio: datetime,
     fim: datetime,
+    *,
+    cotacoes_da_taxa: Mapping[str, Decimal] | None = None,
 ) -> list[ResultadoDoPar]:
-    """Realizado por par no periodo, pela MESMA regra de `PortfolioAgent._apurar`.
+    """Realizado por par no periodo, pela MESMA regra do retrato da carteira.
 
-    Custo medio movel percorrendo o historico INTEIRO (a base de custo de uma venda
-    de hoje pode vir de uma compra de meses atras), mas so as vendas, compras e
-    taxas dentro de [inicio, fim] contam no resultado do periodo. As mesmas
-    exclusoes da apuracao, pelo mesmo motivo: trade de outra cotacao nao entra
-    num medio desta (erro de unidade), trade de outro modo nao entra (papel nao e
-    dinheiro real; lancamento manual conta sempre). A taxa segue a mesma
-    `_quantidade_e_taxa`: no ativo base, sai da quantidade e entra pelo preco do
-    proprio trade; em terceira moeda (BNB) e descartada, porque converter exigiria
-    a cotacao do instante, que nao esta guardada.
+    A conta e `agents.portfolio.custo_medio_movel`, a mesma que o
+    `PortfolioAgent._apurar` usa para o preco medio que decide stop. Eram duas
+    copias linha a linha, e a proxima correcao (como a taxa em BNB) entraria numa
+    so. O custo medio percorre o historico INTEIRO (a base de custo de uma venda de
+    hoje pode vir de uma compra de meses atras), mas so as vendas, compras e taxas
+    dentro de [inicio, fim] contam no resultado do periodo. As exclusoes sao as da
+    apuracao: outra cotacao, outro modo (lancamento manual conta sempre), e a taxa
+    em terceira moeda sem `cotacoes_da_taxa` (ver `cotacoes_das_taxas`).
 
-    "Ganho" e "perda" sao por VENDA: uma venda que realizou acima do custo medio
-    mais a taxa. Venda sem base de custo nao e ganho nem perda -- e contada a
-    parte, porque declarar o preco cheio como lucro mentiria sobre o resultado.
+    "Ganho" e "perda" sao por VENDA: uma venda que realizou acima ou abaixo do
+    custo medio mais a taxa. A que realizou exatamente zero nao e nenhum dos dois
+    (contava como perda). Venda sem base de custo tambem nao -- e contada a parte,
+    porque declarar o preco cheio como lucro mentiria sobre o resultado.
+
+    O que este total NAO tem: o credito do razao de fantasmas, que o retrato soma
+    ao realizado (`PortfolioAgent._reconciliar`). Por isso a soma por par pode
+    diferir do realizado do retrato quando ha reconciliacao.
     """
-    quantidades: dict[str, Decimal] = {}
-    custos: dict[str, Decimal] = {}
     pares: dict[str, ResultadoDoPar] = {}
 
     def par(simbolo: str) -> ResultadoDoPar:
@@ -71,50 +68,23 @@ def resultado_por_par(
             pares[simbolo] = ResultadoDoPar(simbolo=simbolo, moeda=quote)
         return pares[simbolo]
 
-    for trade in _em_ordem(trades):
-        asset, _, cotacao = trade.symbol.partition("/")
-        if (cotacao or quote) != quote:
+    percurso = custo_medio_movel(trades, quote, modo, cotacoes_da_taxa)
+    for passo in percurso.passos:
+        if not inicio <= _instante(passo.trade.executed_at) <= fim:
             continue
-        if (trade.mode or modo) not in (modo, MODO_MANUAL):
+        resultado = par(passo.trade.symbol)
+        resultado.taxas += passo.taxa
+        if passo.compra:
+            resultado.compras += 1
             continue
-
-        preco = _decimal(trade.price)
-        quantidade, taxa, _ = _quantidade_e_taxa(trade, asset, quote)
-        no_periodo = inicio <= _instante(trade.executed_at) <= fim
-
-        mantido = quantidades.get(asset, Decimal(0))
-        custo = custos.get(asset, Decimal(0))
-
-        if trade.side == str(Side.BUY):
-            quantidades[asset] = mantido + quantidade
-            custos[asset] = custo + quantidade * preco + taxa
-            if no_periodo:
-                resultado = par(trade.symbol)
-                resultado.compras += 1
-                resultado.taxas += taxa
-            continue
-
-        realizado_da_venda = -taxa
-        sem_base = mantido <= 0
-        if not sem_base:
-            medio = custo / mantido
-            vendido = min(quantidade, mantido)
-            realizado_da_venda += vendido * (preco - medio)
-            restante = mantido - vendido
-            quantidades[asset] = restante
-            custos[asset] = custo - vendido * medio if restante > 0 else Decimal(0)
-
-        if no_periodo:
-            resultado = par(trade.symbol)
-            resultado.vendas += 1
-            resultado.taxas += taxa
-            resultado.realizado += realizado_da_venda
-            if sem_base:
-                resultado.vendas_sem_base += 1
-            elif realizado_da_venda > 0:
-                resultado.ganhos += 1
-            else:
-                resultado.perdas += 1
+        resultado.vendas += 1
+        resultado.realizado += passo.realizado
+        if passo.sem_base:
+            resultado.vendas_sem_base += 1
+        elif passo.realizado > 0:
+            resultado.ganhos += 1
+        elif passo.realizado < 0:
+            resultado.perdas += 1
 
     return sorted(pares.values(), key=lambda r: r.realizado, reverse=True)
 
