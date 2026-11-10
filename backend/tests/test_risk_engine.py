@@ -173,6 +173,22 @@ class TestExposure:
         assert result.decision is RiskDecision.APPROVED
         assert result.approved_notional <= Decimal("60")
 
+    def test_the_message_measures_against_the_same_capital_as_the_cap(self, risk_limits):
+        """Com o portao ativo, o teto e sobre o autorizado; a mensagem tambem.
+
+        Auditoria de 09/11/2026, L6: 300 em BTC, 1000 autorizados de um patrimonio
+        de 1500 (deposito nao autorizado), teto de 30% = 300. A mensagem dividia
+        pelo patrimonio bruto e dizia "ja em 20.0% (limite 30%)" -- e rejeitava.
+        """
+        limites = risk_limits.model_copy(
+            update={"authorized_capital": Decimal("1000"), "max_asset_exposure_pct": 0.30}
+        )
+        state = make_state(total="1500", cash="1200", positions={"BTC": "0.006"})
+        result = RiskEngine(limites, quote_currency="USDT").evaluate(make_signal(), state, NOW)
+        assert result.decision is RiskDecision.REJECTED
+        mensagem = next(r for r in result.reasons if "exposicao" in r)
+        assert "30.0%" in mensagem, mensagem
+
     def test_rejects_when_remaining_room_is_below_minimum_order(self, engine):
         # sobram apenas 5, abaixo do minimo de 10
         state = make_state(total="1000", cash="500", positions={"BTC": "0.0099"})
@@ -462,6 +478,34 @@ class TestNoOrderLeavesWithoutItsProtection:
             take_profit=Decimal("53000"),
         )
         assert await self._publicadas(agente, avaliacao, signal) == []
+
+    async def test_a_zero_notional_never_becomes_an_order(self, settings):
+        """Notional zero com quantidade positiva: bloqueado, e sem excecao.
+
+        Auditoria de 09/11/2026, L7: `faltando` so olhava a quantidade, e o
+        `OrderRequest` (notional > 0) levantava `ValidationError` dentro do laco
+        de `_on_batch` -- os sinais seguintes do lote nao eram gravados nem
+        publicados.
+        """
+        from crypto_traders.db.repositories import AuditLogRepository
+        from crypto_traders.db.session import session_scope
+        from crypto_traders.domain.models import RiskAssessment
+
+        agente = await self._agente(settings)
+        signal = make_signal()
+        avaliacao = RiskAssessment(
+            signal_id=signal.id,
+            decision=RiskDecision.APPROVED,
+            approved_quantity=Decimal("0.001"),
+            approved_notional=Decimal(0),
+            stop_loss=Decimal("48500"),
+            take_profit=Decimal("53000"),
+        )
+        assert await self._publicadas(agente, avaliacao, signal) == []
+        async with session_scope(settings) as session:
+            entradas = await AuditLogRepository(session).list()
+        bloqueio = next(e for e in entradas if e.action == "incomplete_approval_blocked")
+        assert "notional" in bloqueio.detail
 
     async def test_a_close_needs_no_levels(self, settings):
         """Fechamento nao carrega stop: exigir um travaria a saida (D4)."""

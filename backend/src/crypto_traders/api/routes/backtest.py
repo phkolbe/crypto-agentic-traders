@@ -25,8 +25,15 @@ from ..schemas import (
 router = APIRouter()
 log = get_logger(__name__)
 
-#: A exchange limita o historico por requisicao; alem disso seria paginacao.
-MAX_CANDLES = 1000
+#: Teto do historico de um backtest, por MEMORIA. O backtest roda no processo dos
+#: agentes, limitado a 512 MB em producao, e o que cresce com o pedido e a lista
+#: de candles, a curva de capital e a resposta: medido (tracemalloc, motor real
+#: e resposta serializada) ~2 KB por candle -- 4,1 MB com 2000 candles, 14,9 MB
+#: com 8000. 20.000 candles sao ~40 MB, menos de um decimo do processo, e cobrem
+#: um ano em 30m (17.520) e em 1h (8.760). Acima disto a rota devolve 422 dizendo
+#: o que fazer, em vez de cortar: ate a rodada 3 o corte era em 1000 e calado, e
+#: os 90 dias padrao em 1h (2160) eram medidos como 41.
+MAX_CANDLES = 20_000
 
 #: Um backtest por vez no processo inteiro. O backtest divide processo, memoria
 #: (512 MB em producao) e CPU com os agentes que guardam o stop; dois cliques em
@@ -40,7 +47,7 @@ def _executar_motor(engine: BacktestEngine, candles: list) -> BacktestResult:
     """Roda o motor numa thread, com laco de eventos proprio.
 
     O `run` e `async` so por causa do `PaperBroker`, que nao faz E/S nenhuma: na
-    pratica e um laco sincrono de ate 1000 iteracoes montando `DataFrame` e
+    pratica e um laco sincrono de ate `MAX_CANDLES` iteracoes montando `DataFrame` e
     avaliando a estrategia. No laco de eventos do sistema, ele parava o Risk
     Manager (stop), o WebSocket e as outras rotas pelo tempo inteiro do backtest.
     Aceita tambem um `run` sincrono, para nao depender de como o motor evolui.
@@ -76,6 +83,18 @@ async def run_backtest(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    needed = int(payload.days * 24 * 60 / minutes)
+    if needed > MAX_CANDLES:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"{payload.days} dias em {payload.timeframe} sao {needed} candles, acima do "
+                f"teto de {MAX_CANDLES} (memoria do processo). Use menos dias ou um "
+                f"timeframe maior: no maximo {MAX_CANDLES * minutes // (24 * 60)} dias "
+                f"em {payload.timeframe}."
+            ),
+        )
+
     # Conferir e tomar a vaga sem `await` no meio: no mesmo laco de eventos,
     # nenhum outro pedido entra entre as duas linhas.
     if _UM_POR_VEZ.locked():
@@ -84,7 +103,7 @@ async def run_backtest(
             detail="ja ha um backtest rodando; espere ele terminar e tente de novo",
         )
     async with _UM_POR_VEZ:
-        result = await _rodar(payload, settings, strategy, minutes)
+        result = await _rodar(payload, settings, strategy, needed)
 
     # Dinheiro sai como string (D7). Os Decimais vem do proprio `result`, e nao
     # do `summary()`, porque `summary()` entrega `initial_balance` e
@@ -116,8 +135,7 @@ async def run_backtest(
     )
 
 
-async def _rodar(payload: BacktestIn, settings: Settings, strategy, minutes: int) -> BacktestResult:
-    needed = min(int(payload.days * 24 * 60 / minutes), MAX_CANDLES)
+async def _rodar(payload: BacktestIn, settings: Settings, strategy, needed: int) -> BacktestResult:
     # Cliente proprio e fechado ao fim, mesmo com erro. O do orquestrador nao e
     # reaproveitado de proposito: ele aponta para a testnet quando o sistema roda
     # em testnet, e o backtest quer o historico real; com um backtest por vez, ha

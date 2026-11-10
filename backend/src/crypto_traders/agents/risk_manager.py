@@ -96,7 +96,12 @@ class _SaidaEmVoo:
 
 @dataclass(frozen=True)
 class _Reserva:
-    """Compra aprovada e publicada que o retrato do portfolio ainda nao mostra."""
+    """Ordem aprovada e publicada que o retrato do portfolio ainda nao mostra.
+
+    A compra reserva caixa, quantidade (exposicao e vagas) e o cooldown; a venda
+    reserva so a QUANTIDADE, como "em voo" (`PortfolioState.em_voo`): o retrato
+    ainda mostra a posicao inteira, e um segundo FLAT a venderia de novo.
+    """
 
     client_order_id: str
     symbol: str
@@ -105,6 +110,7 @@ class _Reserva:
     notional: Decimal
     price: Decimal
     emitted_at: datetime
+    venda: bool = False
 
 
 #: Desfechos em que a ordem terminou. Com algo preenchido, o dinheiro saiu e a
@@ -188,7 +194,11 @@ class RiskManagerAgent(BaseAgent):
         """
 
         self._reservas: dict[str, _Reserva] = {}
-        """Compras publicadas e ainda nao refletidas num retrato, por `client_order_id`.
+        """Ordens publicadas e ainda nao refletidas num retrato, por `client_order_id`.
+
+        Compras e, desde a rodada 3, vendas (`_Reserva.venda`): a venda nao mexe
+        no caixa, so marca a quantidade como em voo para um segundo FLAT nao
+        vende-la de novo.
 
         A simulacao de caixa e vagas consumidas (`_apply_fill`) so vale DENTRO de
         um lote. Com a janela de lote em 0 (o padrao), cada sinal e um lote, e
@@ -384,7 +394,7 @@ class RiskManagerAgent(BaseAgent):
             return
 
         await self._load_state()
-        state = await self._build_state(batch[0])
+        state = await self._build_state(batch[0], {s.symbol for s in batch})
         for symbol in {s.symbol for s in batch}:
             base = symbol.partition("/")[0]
             for signal in batch:
@@ -414,24 +424,31 @@ class RiskManagerAgent(BaseAgent):
 
         O `.env` fornece os valores iniciais; a partir da primeira alteracao pela
         interface, o banco e a fonte da verdade.
+
+        Sob a `_limits_lock`, como `update_limits`: ler o banco e atribuir na
+        memoria tem `await` no meio, e uma alteracao que terminasse entre os dois
+        era sobrescrita aqui pelo valor ANTIGO lido -- a API respondia o
+        `stop_loss_pct` novo e o stop seguia com o antigo ate a recarga seguinte
+        (com 1d, ate um dia; auditoria de 09/11/2026, L1).
         """
-        async with session_scope(self._settings) as session:
-            config = await RiskConfigRepository(session).get_or_create(
-                self._limits.model_dump(mode="json")
-            )
-            self._circuit_breaker_active = config.circuit_breaker_active
-            self._circuit_breaker_reason = config.circuit_breaker_reason
-            stored = dict(config.values or {})
+        async with self._limits_lock:
+            async with session_scope(self._settings) as session:
+                config = await RiskConfigRepository(session).get_or_create(
+                    self._limits.model_dump(mode="json")
+                )
+                self._circuit_breaker_active = config.circuit_breaker_active
+                self._circuit_breaker_reason = config.circuit_breaker_reason
+                stored = dict(config.values or {})
 
-        if stored:
-            try:
-                self._limits = RiskSettings.model_validate(stored)
-            except Exception as exc:
-                # Config invalida no banco nao pode derrubar o guardiao: seguimos
-                # com os limites do .env, que sao conservadores por padrao.
-                self.log.error("risk.stored_limits_invalid", error=str(exc))
+            if stored:
+                try:
+                    self._limits = RiskSettings.model_validate(stored)
+                except Exception as exc:
+                    # Config invalida no banco nao pode derrubar o guardiao:
+                    # seguimos com os limites do .env, conservadores por padrao.
+                    self.log.error("risk.stored_limits_invalid", error=str(exc))
 
-        self._rebuild_engine()
+            self._rebuild_engine()
 
     def _rebuild_engine(self) -> None:
         """Aplica o universo descoberto por cima dos limites vigentes.
@@ -614,6 +631,12 @@ class RiskManagerAgent(BaseAgent):
         em_carteira = {p.asset for p in snapshot.positions if p.quantity > 0}
         for asset in set(self._poeira) - em_carteira:
             del self._poeira[asset]
+        for asset in set(self._exit_failures) - em_carteira - self._exiting:
+            # A posicao saiu da carteira por outro caminho (FLAT, venda manual)
+            # depois de uma recusa ja liberada: o episodio acabou. A contagem so
+            # zerava em `_reconcile_exits`, e o proximo episodio comecava com as
+            # tentativas ja gastas (auditoria de 09/11/2026, L2).
+            self._esquecer_falhas(asset)
         for position in snapshot.positions:
             if position.asset == self._settings.trading.quote_currency:
                 continue
@@ -1276,7 +1299,16 @@ class RiskManagerAgent(BaseAgent):
                 return corrente
         return signal.reference_price
 
-    async def _build_state(self, signal: Signal) -> PortfolioState:
+    async def _build_state(
+        self, signal: Signal, simbolos: set[str] | None = None
+    ) -> PortfolioState:
+        """Retrato + o que foi publicado e o retrato ainda nao mostra.
+
+        `simbolos` sao os pares do lote inteiro: o cooldown e consultado para
+        cada um. Com o lote ligado, so o par do primeiro sinal era consultado, e
+        um BTC com ordem ha 5 minutos passava por estar em segundo lugar
+        (auditoria de 09/11/2026, M2).
+        """
         snapshot = self._snapshot
         assert snapshot is not None
 
@@ -1287,9 +1319,13 @@ class RiskManagerAgent(BaseAgent):
         base = signal.symbol.partition("/")[0]
         prices[base] = self._preco_de_dimensionamento(signal)
 
+        last_order_at: dict[str, datetime] = {}
         async with session_scope(self._settings) as session:
             orders = OrderRepository(session)
-            last_order = await orders.last_order_time(signal.symbol)
+            for simbolo in sorted({signal.symbol} | (simbolos or set())):
+                ultima = await orders.last_order_time(simbolo)
+                if ultima is not None:
+                    last_order_at[simbolo] = ultima
             await self._conciliar_reservas(orders)
 
         # O que ja foi aprovado e publicado e o retrato ainda nao mostra: o mesmo
@@ -1297,14 +1333,26 @@ class RiskManagerAgent(BaseAgent):
         # retrato (ativo novo), vale o da aprovacao -- sem ele a posicao reservada
         # valeria zero e nao contaria nem na exposicao nem nas vagas.
         cash = snapshot.cash_value
-        last_order_at = {signal.symbol: last_order} if last_order else {}
+        em_voo: dict[str, Decimal] = {}
         for reserva in self._reservas.values():
-            cash -= reserva.notional
-            positions[reserva.asset] = positions.get(reserva.asset, Decimal(0)) + reserva.quantity
-            prices.setdefault(reserva.asset, reserva.price)
+            # Compra ou venda, a quantidade fica "em voo": nao pode ser vendida
+            # (de novo, ou antes de existir na conta) ate o retrato mostra-la.
+            em_voo[reserva.asset] = em_voo.get(reserva.asset, Decimal(0)) + reserva.quantity
+            if not reserva.venda:
+                cash -= reserva.notional
+                positions[reserva.asset] = (
+                    positions.get(reserva.asset, Decimal(0)) + reserva.quantity
+                )
+                prices.setdefault(reserva.asset, reserva.price)
             anterior = last_order_at.get(reserva.symbol)
             if anterior is None or _aware(anterior) < reserva.emitted_at:
                 last_order_at[reserva.symbol] = reserva.emitted_at
+        for asset, voo in self._exits_in_flight.items():
+            # A saida de protecao em voo vende a posicao inteira: um FLAT da
+            # estrategia por cima dela era a segunda venda do mesmo saldo. O
+            # abandonado nao conta -- nada esta em voo, so a trava ficou armada.
+            if asset not in self._exit_abandoned:
+                em_voo[asset] = em_voo.get(asset, Decimal(0)) + voo.quantity
 
         # Leitura de regime. Falha ou ausencia => None => filtro nao se aplica.
         mvrv_percentile = None
@@ -1326,10 +1374,11 @@ class RiskManagerAgent(BaseAgent):
             circuit_breaker_active=self._circuit_breaker_active,
             circuit_breaker_reason=self._circuit_breaker_reason,
             mvrv_percentile=mvrv_percentile,
+            em_voo=em_voo,
         )
 
     async def _conciliar_reservas(self, orders: OrderRepository) -> None:
-        """Solta a reserva da compra que o retrato ja mostra ou que nao gastou nada.
+        """Solta a reserva da ordem que o retrato ja mostra ou que nao moveu nada.
 
         Pelo banco, e nao pelo topico de resultados, pelo mesmo motivo de
         `_reconcile_exits`: a linha em `orders` e gravada pelo Execution antes de
@@ -1389,6 +1438,11 @@ class RiskManagerAgent(BaseAgent):
         faltando: list[str] = []
         if quantidade <= 0:
             faltando.append("quantidade aprovada nao positiva")
+        if (assessment.approved_notional or Decimal(0)) <= 0:
+            # O `OrderRequest` exige notional > 0: sem esta linha a aprovacao
+            # levantava `ValidationError` dentro do laco de `_on_batch`, e os
+            # sinais seguintes do lote nao eram gravados nem publicados (L7).
+            faltando.append("notional aprovado nao positivo")
         if abertura and assessment.stop_loss is None:
             faltando.append("abertura sem stop-loss")
         if abertura and assessment.take_profit is None:
@@ -1432,21 +1486,23 @@ class RiskManagerAgent(BaseAgent):
             notional=str(request.notional),
             stop_loss=str(request.stop_loss) if request.stop_loss else None,
         )
-        if abertura:
-            # Reservada ANTES de publicar: o proximo sinal pode ser avaliado
-            # enquanto o Execution ainda nem gravou a ordem. So a compra reserva;
-            # a venda nao credita caixa nem libera vaga ate o retrato mostrar o
-            # dinheiro (o lado conservador: atrasa uma abertura, nunca a financia
-            # com uma venda que pode ser recusada).
-            self._reservas[request.client_order_id] = _Reserva(
-                client_order_id=request.client_order_id,
-                symbol=request.symbol,
-                asset=request.symbol.partition("/")[0],
-                quantity=request.quantity,
-                notional=request.notional,
-                price=signal.reference_price,
-                emitted_at=datetime.now(UTC),
-            )
+        # Reservada ANTES de publicar: o proximo sinal pode ser avaliado enquanto
+        # o Execution ainda nem gravou a ordem. A compra reserva caixa e vaga; a
+        # venda reserva so a quantidade (nao credita caixa nem libera vaga ate o
+        # retrato mostrar o dinheiro -- o lado conservador: atrasa uma abertura,
+        # nunca a financia com uma venda que pode ser recusada). Sem a reserva da
+        # venda, dois FLAT do mesmo ativo antes do retrato seguinte eram duas
+        # vendas do mesmo saldo.
+        self._reservas[request.client_order_id] = _Reserva(
+            client_order_id=request.client_order_id,
+            symbol=request.symbol,
+            asset=request.symbol.partition("/")[0],
+            quantity=request.quantity,
+            notional=request.notional,
+            price=signal.reference_price,
+            emitted_at=datetime.now(UTC),
+            venda=not abertura,
+        )
         await self.bus.publish(Topics.ORDER_REQUESTS, request)
 
     # ------------------------------------------------------------------

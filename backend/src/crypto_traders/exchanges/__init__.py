@@ -36,6 +36,9 @@ def build_broker(settings: Settings) -> Broker:
             initial_balance=settings.trading.paper_initial_balance,
             fee_pct=settings.trading.paper_fee_pct,
             slippage_pct=settings.trading.paper_slippage_pct,
+            # No dry_run nao ha motor de backtest decidindo o preco: LIMIT seria
+            # simulada errada, entao e recusada (ver `PaperBroker`).
+            preenche_limit_no_preco=False,
         )
 
     testnet = settings.trading_mode is TradingMode.TESTNET

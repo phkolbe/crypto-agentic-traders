@@ -61,6 +61,18 @@ class PortfolioState:
     durante todo o desenvolvimento -- conhecido e testado, nao arriscado.
     """
 
+    em_voo: dict[str, Decimal] = field(default_factory=dict)
+    """Ativo base -> quantidade em `positions` que NAO pode ser vendida agora.
+
+    Duas origens, as duas entre a ordem publicada e o retrato que a mostra:
+    a venda ja em voo (FLAT aprovado ou saida de protecao), cuja quantidade o
+    retrato ainda exibe; e a compra reservada, que conta para exposicao e vagas
+    mas ainda nao esta na conta (e chega menor que a pedida, com a taxa cobrada
+    no ativo). Conta na exposicao e nas vagas -- o lado conservador --, e so o
+    fechamento a desconta. Sem isto, dois FLAT do mesmo ativo em lotes seguidos
+    viravam duas vendas do mesmo saldo.
+    """
+
     def copy(self) -> PortfolioState:
         """Copia rasa com dicionarios proprios.
 
@@ -77,6 +89,7 @@ class PortfolioState:
             circuit_breaker_active=self.circuit_breaker_active,
             circuit_breaker_reason=self.circuit_breaker_reason,
             mvrv_percentile=self.mvrv_percentile,
+            em_voo=dict(self.em_voo),
         )
 
     def working_value(self, authorized: Decimal | None) -> Decimal:
@@ -110,6 +123,10 @@ class PortfolioState:
 
     def quantity_of(self, asset: str) -> Decimal:
         return self.positions.get(asset, Decimal(0))
+
+    def sellable_of(self, asset: str) -> Decimal:
+        """Quantidade que um fechamento pode vender agora (ver `em_voo`)."""
+        return max(Decimal(0), self.quantity_of(asset) - self.em_voo.get(asset, Decimal(0)))
 
     def value_of(self, asset: str) -> Decimal:
         price = self.prices.get(asset)
@@ -388,8 +405,11 @@ class RiskEngine:
         current_exposure = state.value_of(base)
         headroom = exposure_cap - current_exposure
         if headroom <= 0:
+            # O percentual e sobre o MESMO capital do teto (o autorizado). Sobre o
+            # patrimonio bruto, com deposito nao autorizado, a mensagem dizia
+            # "ja em 20% (limite 30%)" e rejeitava (auditoria de 09/11/2026, L6).
             reasons.append(
-                f"exposicao em {base} ja em {_pct(current_exposure, state.total_value)} "
+                f"exposicao em {base} ja em {_pct(current_exposure, working)} "
                 f"(limite {limits.max_asset_exposure_pct:.0%})"
             )
         elif headroom < notional:
@@ -433,8 +453,19 @@ class RiskEngine:
     def _evaluate_close(
         self, signal: Signal, state: PortfolioState, base: str, now: datetime
     ) -> RiskAssessment:
-        quantity = state.quantity_of(base).quantize(QUANTITY_PRECISION, rounding=ROUND_DOWN)
+        quantity = state.sellable_of(base).quantize(QUANTITY_PRECISION, rounding=ROUND_DOWN)
         if quantity <= 0:
+            if state.em_voo.get(base, Decimal(0)) > 0:
+                # Nao e cooldown nem trava: a mesma quantidade ja tem ordem em voo
+                # (ou ainda nem chegou a conta). Vender de novo era vender duas vezes.
+                return self._reject(
+                    signal,
+                    [
+                        f"posicao em {base} com ordem em voo ({state.em_voo[base]}) "
+                        "ainda nao refletida no retrato; nada a fechar alem dela"
+                    ],
+                    state,
+                )
             return self._reject(signal, [f"nao ha posicao em {base} para fechar"], state)
 
         price = signal.reference_price

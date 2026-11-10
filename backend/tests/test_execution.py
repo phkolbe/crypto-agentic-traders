@@ -200,6 +200,43 @@ def paper_broker() -> PaperBroker:
     return broker
 
 
+class TestPaperBrokerLimit:
+    """LIMIT no papel: regra do backtest, recusada no dry_run (exchanges M3 d).
+
+    O papel nao tem livro de ofertas e preenchia a LIMIT na hora ao preco-limite,
+    sem olhar o mercado: uma venda LIMIT a 60.000 com o BTC a 50.000 "vendia" a
+    60.000. O backtest usa isso de proposito (o motor ja decidiu pelo candle o
+    preco da saida); o dry_run nao tem quem decida, e simular errado e pior do
+    que recusar.
+    """
+
+    def _limit(self, price: str) -> OrderRequest:
+        return make_request(side=Side.SELL, price=price).model_copy(
+            update={"order_type": OrderType.LIMIT}
+        )
+
+    async def test_dry_run_recusa_limit_com_motivo(self, settings):
+        from crypto_traders.exchanges import build_broker
+
+        broker = build_broker(settings)
+        assert isinstance(broker, PaperBroker)
+        broker.set_price("BTC", Decimal("50000"))
+        broker.credit("BTC", Decimal("0.01"))
+
+        result = await broker.place_order(self._limit("60000"))
+
+        assert result.status is OrderStatus.REJECTED
+        assert "LIMIT" in (result.error or "")
+        assert (await broker.fetch_balances())["BTC"] == Decimal("0.01"), "nada vendido"
+
+    async def test_backtest_continua_preenchendo_ao_preco_do_motor(self, paper_broker):
+        paper_broker.credit("BTC", Decimal("0.01"))
+
+        result = await paper_broker.place_order(self._limit("48500"))
+
+        assert result.status is OrderStatus.FILLED
+
+
 class TestPaperBroker:
     async def test_buy_moves_cash_into_the_asset(self, paper_broker):
         result = await paper_broker.place_order(make_request())
