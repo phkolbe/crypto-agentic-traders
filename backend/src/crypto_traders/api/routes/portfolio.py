@@ -65,7 +65,12 @@ def _unrealized(position: dict) -> Decimal:
     if not position.get("current_price") or not position.get("average_price"):
         return Decimal(0)
     delta = Decimal(str(position["current_price"])) - Decimal(str(position["average_price"]))
-    return delta * Decimal(str(position["quantity"]))
+    quantidade = Decimal(str(position["quantity"]))
+    # Mesma regra de `Position.unrealized_pnl`: o excedente depositado de fora nao
+    # tem custo conhecido e nao entra no resultado (auditoria 09/11/2026).
+    if position.get("cost_basis_quantity") is not None:
+        quantidade = min(quantidade, Decimal(str(position["cost_basis_quantity"])))
+    return delta * quantidade
 
 
 @router.get("/portfolio", response_model=PortfolioSummary)

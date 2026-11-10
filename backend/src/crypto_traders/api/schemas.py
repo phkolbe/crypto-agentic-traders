@@ -470,6 +470,18 @@ class AgentStatusOut(BaseModel):
     last_heartbeat: datetime | None
     stale: bool
     last_error: str | None
+    given_up: bool = False
+    """O vigia interno desistiu de reiniciar este agente (retomar pela tela o reabilita)."""
+
+    openings_blocked: str | None = None
+    """Motivo do bloqueio de abertura (so o agente de execucao informa)."""
+
+
+class AlertDeliveryOut(BaseModel):
+    """Se os alertas estao chegando aos canais. Canal que recusa nao levanta excecao,
+    entao "enviado" e "recebido" so se distinguem por aqui (auditoria 09/11/2026)."""
+
+    model_config = ConfigDict(extra="allow")
 
 
 class HealthOut(BaseModel):
@@ -487,6 +499,7 @@ class HealthOut(BaseModel):
 
     sizing_detail: str | None = None
     agents: dict[str, AgentStatusOut]
+    alert_delivery: AlertDeliveryOut | None = None
 
 
 class StrategyOut(BaseModel):
