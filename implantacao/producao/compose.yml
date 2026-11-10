@@ -6,12 +6,16 @@
 # Quatro conteineres numa rede propria (`crypto-prd`):
 #   tailscale  no Tailscale `crypto`: o unico caminho de entrada. O `tailscale serve`
 #              termina o HTTPS (*.ts.net) e repassa a API pondo o login de quem
-#              acessa em Tailscale-User-Login; a API so aceita ACESSO_LOGIN_TAILSCALE.
+#              acessa em Tailscale-User-Login; a API so aceita ACESSO_LOGIN_TAILSCALE,
+#              e so quando a conexao vem DESTE conteiner (ACESSO_PROXY_TAILSCALE).
 #   postgres   Postgres 16 proprio (database `crypto`, usuarios crypto_dono e crypto).
 #   migrar     schema e gatilhos com o usuario dono; roda e sai.
 #   crypto     agentes + API + telas, com o usuario da aplicacao (so linhas).
-# Nenhuma porta publicada no servidor. A telemetria sai por OTLP para OTEL_ENDPOINT
-# (a observabilidade, onde ela estiver); vazio, nao sai.
+# Nenhuma porta publicada no servidor. A porta da API (8000) e alcancavel pelo host e
+# pelos conteineres da rede pelo IP da bridge; por isso o cabecalho do Tailscale so vale
+# vindo do conteiner tailscale, e os outros conteineres nao tem NET_RAW (sem ele nao se
+# forja pacote com o IP de outro conteiner na bridge). A telemetria sai por OTLP para
+# OTEL_ENDPOINT (a observabilidade, onde ela estiver); vazio, nao sai.
 #
 # Variaveis: /opt/crypto/.env (preparar.sh) e /opt/crypto/crypto.env (modo, chaves da
 # Binance, SMTP, WhatsApp). O que esta em `environment` vence o crypto.env.
@@ -60,6 +64,7 @@ services:
       CRYPTO_SENHA_DONO: ${SENHA_DB_CRYPTO_DONO:?}
       CRYPTO_SENHA_APP: ${SENHA_DB_CRYPTO:?}
     command: ["postgres", "-c", "shared_buffers=64MB", "-c", "max_connections=30"]
+    cap_drop: [NET_RAW]
     volumes:
       - postgres:/var/lib/postgresql/data
       - ../../docker/postgres_init.sh:/docker-entrypoint-initdb.d/00-crypto.sh:ro
@@ -78,6 +83,7 @@ services:
     container_name: crypto-prd-migrar
     restart: "no"
     command: ["crypto-traders", "migrar", "--usuario-aplicacao", "crypto"]
+    cap_drop: [NET_RAW]
     environment:
       DATABASE_URL: postgresql+asyncpg://crypto_dono:${SENHA_DB_CRYPTO_DONO}@crypto-prd-postgres:5432/crypto
       ENVIRONMENT: prd
@@ -89,6 +95,7 @@ services:
     <<: [*imagem, *logs]
     container_name: crypto-prd
     restart: unless-stopped
+    cap_drop: [NET_RAW]
     env_file:
       - path: ${PASTA:?}/crypto.env
         required: true
@@ -100,8 +107,13 @@ services:
       API_HOST: 0.0.0.0
       API_PORT: "8000"
       CORS_ORIGINS: https://${TS_HOSTNAME:-crypto}.${TAILNET:?}
-      # A trava: so este login Tailscale passa (api.app.PortaoTailscale).
+      # A trava: so este login Tailscale passa (api.app.PortaoTailscale), e so com a
+      # conexao vindo do conteiner tailscale. A API escuta em 0.0.0.0 na bridge: sem a
+      # origem, o host ou outro conteiner mandava o cabecalho com o login do dono direto
+      # em http://<ip-da-bridge>:8000 (auditoria 09/11/2026). O nome e resolvido pelo
+      # DNS da rede; recriado o conteiner (IP novo), a API resolve de novo.
       ACESSO_LOGIN_TAILSCALE: ${CRYPTO_LOGIN:?defina CRYPTO_LOGIN no .env}
+      ACESSO_PROXY_TAILSCALE: crypto-prd-tailscale
       LOG_JSON: "true"
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_ENDPOINT:-}
     depends_on:

@@ -1,0 +1,8 @@
+[Unit]
+Description=Aviso de falha do Sistema Cripto (%i)
+
+[Service]
+Type=oneshot
+# Journal com prioridade de erro e, com VIGIA_URL no /opt/crypto/.env, ping em <url>/fail.
+ExecStart=/opt/crypto/codigo/implantacao/producao/avisar-falha.sh %i
+TimeoutStartSec=60

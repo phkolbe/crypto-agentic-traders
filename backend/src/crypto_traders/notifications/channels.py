@@ -18,6 +18,7 @@ import abc
 import asyncio
 import re
 import smtplib
+import ssl
 from dataclasses import dataclass
 from email.message import EmailMessage
 
@@ -84,9 +85,9 @@ class EmailChannel(NotificationChannel):
 
     async def send(self, title: str, body: str, to: str) -> DeliveryResult:
         if missing := self.missing_settings():
-            return DeliveryResult(self.name, False, f"faltam no .env: {', '.join(missing)}")
+            return _sem_entrega(self.name, f"faltam no .env: {', '.join(missing)}")
         if not to:
-            return DeliveryResult(self.name, False, "destinatario nao configurado")
+            return _sem_entrega(self.name, "destinatario nao configurado")
 
         message = EmailMessage()
         message["Subject"] = f"[crypto-traders] {title}"
@@ -102,15 +103,29 @@ class EmailChannel(NotificationChannel):
             log.error("notification.email_failed", error=str(exc))
             return DeliveryResult(self.name, False, str(exc))
 
-        log.info("notification.email_sent", to=to)
+        log.info("notification.email_sent", to=_mask_email(to))
         return DeliveryResult(self.name, True, f"enviado para {to}")
 
     def _send_sync(self, message: EmailMessage) -> None:
         s = self._settings
         password = s.smtp_password.get_secret_value() if s.smtp_password else ""
+        # Contexto que VERIFICA certificado e nome. `starttls()` sem contexto usa
+        # `ssl._create_stdlib_context()`, que aceita qualquer certificado: quem
+        # estivesse no caminho recebia a SMTP_PASSWORD no `login` e podia engolir
+        # o alerta de stop (auditoria 09/11/2026).
+        contexto = ssl.create_default_context()
+        if s.smtp_port == 465:
+            # 465 e TLS implicito (desde o primeiro byte); `SMTP` + `starttls`
+            # ficava esperando o banner ate o timeout.
+            with smtplib.SMTP_SSL(
+                s.smtp_host, s.smtp_port, timeout=20, context=contexto
+            ) as server:
+                server.login(s.smtp_username, password)
+                server.send_message(message)
+            return
         with smtplib.SMTP(s.smtp_host, s.smtp_port, timeout=20) as server:
             if s.smtp_use_tls:
-                server.starttls()
+                server.starttls(context=contexto)
             server.login(s.smtp_username, password)
             server.send_message(message)
 
@@ -151,9 +166,9 @@ class WhatsAppChannel(NotificationChannel):
 
     async def send(self, title: str, body: str, to: str) -> DeliveryResult:
         if missing := self.missing_settings():
-            return DeliveryResult(self.name, False, f"faltam no .env: {', '.join(missing)}")
+            return _sem_entrega(self.name, f"faltam no .env: {', '.join(missing)}")
         if not to:
-            return DeliveryResult(self.name, False, "numero nao configurado")
+            return _sem_entrega(self.name, "numero nao configurado")
 
         s = self._settings
         url = (
@@ -204,6 +219,17 @@ class WhatsAppChannel(NotificationChannel):
         return DeliveryResult(self.name, True, f"enviado para {_mask_phone(to)}")
 
 
+def _sem_entrega(canal: str, motivo: str) -> DeliveryResult:
+    """Canal ligado que nao pode entregar: erro no log, nao so no resultado.
+
+    O orquestrador nao olha o `DeliveryResult`; sem esta linha, o canal ligado na
+    tela com o SMTP vazio no ambiente transformava cada "stop executado" no
+    `alert` generico do log, sem nada dizendo que a entrega nao aconteceu.
+    """
+    log.error("notification.sem_entrega", channel=canal, detail=motivo)
+    return DeliveryResult(canal, False, motivo)
+
+
 def sanitize_template_param(text: str) -> str:
     """Deixa o texto aceitavel como parametro de template da Meta.
 
@@ -219,6 +245,12 @@ def sanitize_template_param(text: str) -> str:
 
 def _only_digits(value: str) -> str:
     return re.sub(r"\D", "", value)
+
+
+def _mask_email(value: str) -> str:
+    """Mesmo motivo do telefone: o log de operacao nao precisa do endereco inteiro."""
+    usuario, arroba, dominio = value.partition("@")
+    return f"{usuario[:1]}…@{dominio}" if arroba else "…"
 
 
 def _mask_phone(value: str) -> str:
