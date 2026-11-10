@@ -15,7 +15,7 @@ import pytest
 from crypto_traders.config import ExchangeCredentials, Settings
 from crypto_traders.domain.enums import ExchangeName, OrderStatus, Side
 from crypto_traders.domain.models import OrderResult
-from crypto_traders.ensaio_testnet import AVISO, FALHOU, OK, aponta_para_testnet, ensaiar
+from crypto_traders.ensaio_testnet import FALHOU, OK, aponta_para_testnet, ensaiar
 from crypto_traders.exchanges import build_broker
 from crypto_traders.exchanges.base import ExchangeError
 from crypto_traders.exchanges.filters import FONTE_AO_VIVO, MarketFilter
@@ -42,8 +42,11 @@ class _Ticker:
 class ExchangeDublada:
     """Spot minimo: saldo, filtro, ticker e ordens a mercado executadas na hora."""
 
-    def __init__(self, urls=TESTNET_URLS, aceita_repetida=False, preco_execucao=None):
+    def __init__(self, urls=TESTNET_URLS, aceita_repetida=False, preco_execucao=None,
+                 consulta_acha=True):
         self._client = _Ccxt(urls)
+        self.consulta_acha = consulta_acha
+        self.resultados: dict[str, OrderResult] = {}
         self.saldos = {"USDT": Decimal(1000), "BTC": Decimal("0.5")}
         self.preco = Decimal(50000)
         self.preco_execucao = preco_execucao or self.preco
@@ -80,9 +83,14 @@ class ExchangeDublada:
         sinal = 1 if req.side is Side.BUY else -1
         self.saldos["BTC"] += sinal * req.quantity
         self.saldos["USDT"] -= sinal * req.quantity * self.preco_execucao
-        return OrderResult(order_request_id=req.id, client_order_id=req.client_order_id,
-                           exchange_order_id="1", status=OrderStatus.FILLED,
-                           filled_quantity=req.quantity, average_price=self.preco_execucao)
+        resultado = OrderResult(order_request_id=req.id, client_order_id=req.client_order_id,
+                                exchange_order_id="1", status=OrderStatus.FILLED,
+                                filled_quantity=req.quantity, average_price=self.preco_execucao)
+        self.resultados[req.client_order_id] = resultado
+        return resultado
+
+    async def consultar_ordem(self, req):
+        return self.resultados.get(req.client_order_id) if self.consulta_acha else None
 
     async def close(self):
         self.fechado = True
@@ -98,8 +106,8 @@ async def test_ensaio_completo_aprovado():
     estados = _estados(relatorio)
     assert relatorio.ok, relatorio.etapas
     for nome in ("url da testnet", "autenticacao", "filtro do par", "compra a mercado",
-                 "clientOrderId repetido", "venda a mercado", "recusa abaixo do minimo",
-                 "saldo final"):
+                 "consulta por clientOrderId", "clientOrderId repetido", "venda a mercado",
+                 "recusa abaixo do minimo", "saldo final"):
         assert estados[nome] == OK, nome
     assert ex.saldos["BTC"] == Decimal("0.5"), "o ensaio tem de devolver a posicao"
     assert ex.fechado
@@ -119,11 +127,28 @@ def test_url_misturada_nao_conta_como_testnet():
     assert aponta_para_testnet(_Ccxt(TESTNET_URLS)) is True
 
 
-async def test_clientorderid_aceito_duas_vezes_vira_aviso_e_a_sobra_e_vendida():
+async def test_clientorderid_aceito_duas_vezes_reprova_e_a_sobra_e_vendida():
+    """Duplicata aceita REPROVA o ensaio (antes era AVISO e saia "APROVADO").
+
+    E a prova, no servidor, de que o `clientOrderId` nao protege um reenvio: a
+    MARKET preenchida deixa de ser ordem aberta e o mesmo id compra de novo
+    (auditoria de 09/11/2026, M1).
+    """
     ex = ExchangeDublada(aceita_repetida=True)
     relatorio = await ensaiar(Settings(_env_file=None), cliente=ex)
-    assert _estados(relatorio)["clientOrderId repetido"] == AVISO
+    assert _estados(relatorio)["clientOrderId repetido"] == FALHOU
+    assert not relatorio.ok
     assert ex.saldos["BTC"] == Decimal("0.5"), "as duas compras tem de ser vendidas"
+
+
+async def test_consulta_que_nao_acha_a_ordem_executada_reprova():
+    """Sem a consulta pelo clientOrderId, o adaptador nao tem como descobrir o
+    desfecho de um envio sem resposta -- e o mecanismo que impede a compra dupla."""
+    ex = ExchangeDublada(consulta_acha=False)
+    relatorio = await ensaiar(Settings(_env_file=None), cliente=ex)
+    assert _estados(relatorio)["consulta por clientOrderId"] == FALHOU
+    assert not relatorio.ok
+    assert ex.saldos["BTC"] == Decimal("0.5"), "a compra tem de ser vendida mesmo assim"
 
 
 async def test_execucao_longe_do_ticker_reprova():
