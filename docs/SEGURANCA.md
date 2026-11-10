@@ -154,7 +154,12 @@ patrimônio, um **saque** da conta é indistinguível de uma perda catastrófica
 tirar R$100 de uma conta de R$150 dispararia "perda diária de 67%" e pausaria
 tudo, culpando um prejuízo que não existiu. O ensaio em `dry_run` encontrou isso
 em três minutos, quando mudar o saldo simulado de 1000 para 150 disparou "perda
-de 85%".
+de 85%". O **depósito** de um ativo que já está na carteira também não move a
+trava desde 09/11/2026: o excedente sem base de custo no histórico fica fora do
+não realizado (antes, 1 BTC depositado sobre 1 BTC comprado dobrava a perda
+contada). E a sustentação do realizado depois de excluir um lançamento manual só
+vale para exclusão feita pela API (com o lançamento inteiro no `audit_log`) e só
+até o que a venda apagada produzia.
 
 A base do percentual é o **capital autorizado**, não o saldo total: com o portão
 em R$150 sobre uma conta de R$650, medir contra 650 tornaria a trava quatro vezes
@@ -456,18 +461,43 @@ alerta bem escrito tem exatamente isso.
 Use o botão **Enviar teste** depois de configurar. O objetivo é não descobrir que
 a notificação não funciona justamente no dia em que o circuit breaker dispara.
 
+Desde 09/11/2026:
+
+- o SMTP **verifica o certificado** do servidor (STARTTLS com contexto padrão; porta
+  465 usa TLS desde o início) — antes a senha podia ir para um intermediário;
+- canal ligado sem segredo ou sem destinatário deixa erro no log
+  (`notification.sem_entrega`), e toda falha de entrega vira ERROR
+  `orchestrator.alert_delivery_failed` e aparece em `/api/health` (`alert_delivery`);
+- **sem banco o alerta ainda sai**: os destinatários são lidos com prazo de 5 s; se
+  o Postgres não responde, vale a última configuração lida, e se o processo nunca
+  leu, `ALERTA_EMAIL_RESERVA`/`ALERTA_WHATSAPP_RESERVA` do ambiente. Antes, banco
+  fora = nenhum aviso, justamente quando mais se precisa dele.
+
 ---
 
 ## 7. Infraestrutura local
 
-- A API escuta **apenas em `127.0.0.1`**. O default nunca é `0.0.0.0`.
+- No desenvolvimento a API escuta **apenas em `127.0.0.1`**. O default nunca é
+  `0.0.0.0`.
+- Em produção (`implantacao/producao/`) ela escuta na rede interna `crypto-prd`, e
+  o portão aceita o cabeçalho `Tailscale-User-Login` **só de conexões vindas do
+  contêiner do Tailscale** (`ACESSO_PROXY_TAILSCALE`). Até 09/11/2026 o portão
+  conferia só o cabeçalho, e qualquer processo do host ou contêiner dessa rede o
+  forjava. Os contêineres rodam sem `NET_RAW` (não forjam pacote com o IP de
+  outro), o uvicorn ignora `X-Forwarded-For` (`proxy_headers=False`), e o
+  `implantar.sh` confere o 403 com login forjado de dentro do contêiner.
 - Os serviços do `docker-compose.yml` publicam portas com prefixo `127.0.0.1:`,
   então nem o Postgres nem o Redis ficam acessíveis na rede local.
-- CORS restrito à origem do dashboard.
+- CORS restrito à origem do dashboard. Com o portão ligado, a trava de origem
+  aceita **só** `CORS_ORIGINS` — sem a exceção de loopback do desenvolvimento.
 - Para acessar o dashboard remotamente, use **VPN pessoal (Tailscale)** — nunca
   abra portas no roteador.
-- Faça backup do banco: o histórico de negociações é dado sensível e é o que
-  sustenta a apuração fiscal.
+- **Backup do banco**: o histórico de negociações é dado sensível e é o que
+  sustenta a apuração fiscal. Em produção, `backup.sh` diário (dumps 0600, pasta
+  0700), falha avisada pelo journal e por `VIGIA_URL/fail`; **cópia fora do
+  servidor (restic) é passo obrigatório antes do `live`**; e a restauração tem
+  ensaio (`restaurar.sh --ensaio`, num database descartável) e procedimento real
+  (`--confirmar`, numa transação, com o estado anterior guardado).
 
 ---
 
@@ -644,7 +674,11 @@ tempo. Se é isso que se quer, desligar é mais honesto e mais barato.
 
 Nunca bloqueia fechamento: o indicador diz "está caro", não "fique preso".
 E dado ausente não bloqueia nada — sem o provedor, o sistema volta ao
-comportamento sem filtro, que é o estado conhecido e testado.
+comportamento sem filtro, que é o estado conhecido e testado. **Dado velho conta
+como ausente** desde 09/11/2026: com o último ponto mais antigo que 3 dias, a
+leitura vira `None` e sai o alerta `mvrv_stale` (uma vez por episódio, só com o
+filtro ligado). Antes, com o provedor fora do ar, o último percentil seguia valendo
+por semanas.
 
 ### A série não pode congelar
 
@@ -928,14 +962,16 @@ operar — entregue de uma forma que ninguém pediria: uma carteira sem stop.
 
 E retomar a execução **não** desarma o circuit breaker por porta lateral: com a
 trava armada, liberar a abertura aqui seria o mesmo desarme com outro nome, e é
-recusado com registro no log. A abertura só volta com o rearme manual.
+recusado com registro no log. A abertura só volta com o rearme manual. Desde
+09/11/2026 o "retomar tudo" também recusa com a trava armada — a regra está no
+orquestrador, não só na rota —, e a tela desabilita o retomar mostrando o motivo.
 
 O detalhe de cada linha que não é óbvia:
 
 **Pavio dentro do intervalo.** Uma queda que desce abaixo do stop e volta antes do
-próximo snapshot passa batida. O backtest, que lê a mínima do candle, é nesse
-ponto **mais severo** que a produção: um backtest que mostra o stop disparando
-pode corresponder, na prática, a uma posição que sobreviveu.
+próximo snapshot passa batida. O backtest lê a mínima do candle, mas desde
+09/11/2026 só dispara o stop se o pavio passar 0,15% do nível, o que reproduz o
+ticker de 60 s na média medida (ver "As convenções do backtest").
 
 **Processo morre.** Proteção que depende do processo estar vivo cobre mercado, não
 infraestrutura. O que mudou não é a proteção, é a **visibilidade**: se o último
@@ -1046,15 +1082,34 @@ swap: é **trocar a moeda de cotação para USDC** e negociar pares em USDC. Aí
 caixa já é dólar por natureza, sem perna extra, sem taxa a mais e sem colisão. A
 Binance tem 45 pares USDC líquidos, contra 43 em BRL.
 
-### As três convenções do backtest, todas pessimistas
+### As convenções do backtest
 
-1. **Stop e alvo no mesmo candle: o stop vence.** O OHLC não diz qual preço veio
-   primeiro. Supor o alvo seria escolher o desfecho bom com informação que não
-   existe.
-2. **Gap conta contra.** Candle que abre abaixo do stop executa na abertura, não
-   no nível — é assim que stops machucam de verdade. O alvo, ao contrário,
-   executa no nível, sem crédito pelo gap favorável.
-3. **Deslizamento nas duas pontas.**
+Até 09/11/2026 esta seção se chamava "as três convenções, todas pessimistas", e
+duas delas não eram: o stop executava **exatamente** no nível (a produção só vende
+no primeiro ticker de 60 s abaixo dele) e o alvo disparava quando o **pavio** do
+candle diário tocava o nível (a produção não vê pavio entre duas leituras). Hoje,
+calibrado com candles de 1 minuto da Binance (BTC, ETH, SOL, DOGE, XRP; 20
+pares-mês; medição registrada em `backtest/protecao.py`):
+
+1. **Stop e alvo no mesmo candle: o stop vence.**
+2. **Gap conta contra.** Candle que abre abaixo do stop executa na abertura.
+3. **Stop preenche 0,13% além do nível** (a primeira leitura de minuto abaixo do
+   stop ficou, em média, 0,13% além dele), nunca abaixo da mínima do candle.
+4. **Stop e alvo só disparam se o pavio passar 0,15% do nível** — 7% dos
+   rompimentos diários foram só pavio, que a produção não veria.
+5. **Alvo preenche no nível**, sem crédito (a produção vende em média 0,17% acima).
+6. **Deslizamento nas duas pontas.**
+
+Medido contra a caminhada de minuto, o conjunto fica levemente **pessimista** por
+operação (−0,15% a −0,19%), e nenhuma convenção isolada é otimista. `SEM_FOLGA`
+desliga as folgas.
+
+Também desde 09/11/2026 o backtest de carteira escolhe os sinais **como a produção**
+(janela 0 = cada sinal na ordem de chegada, contra o estado já atualizado; a ordem
+de chegada é a de `SYMBOLS`), mede a queda máxima em **todo** instante (antes,
+1 em 4), conta o período a partir do fim do aquecimento e aceita pares que começam
+depois. As medições anteriores a essa data mediam outro sistema: com a seleção por
+confiança, a queda máxima do último ano saía em ~10%; com a da produção, ~20%.
 
 Os níveis protegem a **posição**, não o lote: ao reforçar uma posição são
 recalculados sobre o preço médio. Manter o stop do primeiro lote deixaria a parte
@@ -1202,7 +1257,11 @@ opera.
   sistema não busca e pares fora da moeda de cotação (422). Os botões que mexem
   em dinheiro (rearmar a trava, autorizar capital, lançar e excluir) pedem
   confirmação na tela antes de mandar o `confirm` — até 09/11/2026 "Rearmar" e
-  "Autorizar capital" mandavam o pedido sem corpo e recebiam 400 sempre.
+  "Autorizar capital" mandavam o pedido sem corpo e recebiam 400 sempre. O
+  "Aplicar" de Configurações também tem um segundo passo, que lista campo a campo
+  o que muda e em que modo vale. A faixa Simulação/Dinheiro real está em todas as
+  telas. O `POST /backtest` roda um por vez (o segundo recebe 429) e fora do laço
+  de eventos do sistema, para não atrasar o stop.
 - **Configuração gravada que deixou de validar** (um campo saiu ou entrou no
   modelo numa atualização): campo desconhecido é ignorado com aviso e campo novo
   recebe o padrão, preservando o resto. Se mesmo assim não valida, o sistema
@@ -1236,8 +1295,11 @@ Uma sequência, não uma escolha:
 2. `dry_run` por **semanas**, com o dashboard acompanhado de perto.
 3. `testnet`, para validar a integração real com a API da exchange. Primeiro o
    ensaio automático, que envia compra, venda, `clientOrderId` repetido e ordem
-   abaixo do mínimo e confere cada resposta (chave **separada** da real,
-   `BINANCE_TESTNET__API_KEY`/`_SECRET`, criada em testnet.binance.vision):
+   abaixo do mínimo, consulta a ordem pelo `clientOrderId` e confere cada resposta
+   (chave **separada** da real, `BINANCE_TESTNET__API_KEY`/`_SECRET`, criada em
+   testnet.binance.vision). O `clientOrderId` repetido **aceito** é o comportamento
+   documentado da Binance e sai como AVISO; quem reprova é a consulta pelo
+   `clientOrderId`, porque é dela que o envio depende para não comprar duas vezes:
 
    ```bash
    docker compose run --rm --no-deps crypto crypto-traders ensaio-testnet --par BTC/USDT --valor 20
@@ -1345,7 +1407,9 @@ PostgreSQL. Enquanto ele não rodar, essa limitação continua aberta.
 
 **Atualização em 24/10/2026 — o PostgreSQL rodou.** Com a ida para o Docker, a
 suíte passou a rodar contra um PostgreSQL 16 de verdade (`POSTGRES_TEST_URL`, no
-CI e no compose de desenvolvimento): os testes de Postgres passam, menos o das
+CI e — até 09/11/2026 — no compose de desenvolvimento, que é o banco do `dry_run`;
+hoje a suíte **recusa** o banco do sistema e o README manda usar um Postgres
+descartável): os testes de Postgres passam, menos o das
 *hypertables*, que fica `skipped` porque o Postgres da plataforma não tem a
 extensão TimescaleDB — as séries ficam em tabela comum, e o Timescale continua
 **não exercitado**. A separação de privilégio da seção 5 agora existe: o dono do
@@ -1355,6 +1419,19 @@ recusa o `DROP TRIGGER` e o `CREATE TABLE` dela (medido em
 `test_docker_e_observabilidade.py` e na stack de produção). Um teste antigo desta
 classe, que nunca tinha rodado, falhou na primeira vez por ler "a última trade"
 num banco compartilhado; foi corrigido para ler a própria.
+
+*(09/11/2026)* O `REVOKE TRIGGER` sozinho **não** basta: `DROP TRIGGER` e
+`DISABLE TRIGGER` exigem posse da tabela, e a sonda antiga só perguntava pelo
+privilégio. Hoje ela pega dono e superusuário, e em `live` a aplicação rodando
+assim **recusa subir** (em `dry_run` e `testnet`, erro no log). Gatilho desligado
+conta como ausente, e o `migrar` o religa. O esquema passou a ter **migrações
+versionadas** (`db/migracoes.py`, tabela `schema_versao`), aplicadas pelo `migrar`
+numa transação; a subida compara o banco com o modelo e recusa divergência que
+quebraria a gravação (antes, uma coluna nova deixaria um fill da exchange `PENDING`
+e sem trade). `trades` ganhou índice único de trade de agente por ordem (um
+duplicado seria irremovível, por ser só de inserção) e `CHECK` de domínio em
+`origin`, `side` e `mode`. Se a gravação do resultado falhar depois do envio, sai o
+alerta `order_record_lost` com a ordem inteira no log.
 
 **2. Não houve teste de integração contra a testnet.** Nenhuma ordem deste
 sistema jamais chegou a um servidor da Binance. *(04/11/2026: o ensaio existe —
@@ -1489,8 +1566,9 @@ WebSocket na tela. Não há teste ponta a ponta.
 
 **7. Ninguém nunca operou este sistema em `live`.** Não há uma única ordem de
 dinheiro real no histórico. Todos os números de retorno e queda deste documento
-vêm de backtest sobre dados históricos, com as três convenções pessimistas da
-seção 12 — e o próprio documento registra, na seção 8, que resultado de poucas
+vêm de backtest sobre dados históricos, com as convenções da seção 12 (calibradas
+em 09/11/2026; os números anteriores a essa data mediam seleção por confiança e
+queda amostrada) — e o próprio documento registra, na seção 8, que resultado de poucas
 operações mede sorte, não qualidade de estratégia.
 
 **8. A suíte depende do diretório de trabalho.** Um teste do grupo de ataques lê
