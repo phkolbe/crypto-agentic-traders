@@ -3,6 +3,13 @@
 .venv
 .env
 .env.*
+# Em qualquer pasta, nao so na raiz (o padrao `.env.*` acima so casa na raiz): um
+# frontend/.env.local com VITE_* entraria no `COPY frontend/` e no bundle das telas; um
+# crypto.env/backup.env de teste dentro do repositorio, na imagem.
+**/.env
+**/.env.*
+**/crypto.env
+**/backup.env
 .coverage
 .pytest_cache
 .ruff_cache

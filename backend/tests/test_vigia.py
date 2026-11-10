@@ -31,6 +31,7 @@ case "$1" in
     case "$*" in
       *State.Running*) echo true ;;
       *Health.Log*) echo "HTTP Error 503" ;;
+      *crypto-prd-tailscale*) cat "$FALSO_ESTADO_TS" ;;
       *) cat "$FALSO_ESTADO" ;;
     esac ;;
   restart) exit 0 ;;
@@ -57,10 +58,17 @@ def host(tmp_path):
     log.write_text("", encoding="utf-8")
     falso_estado = tmp_path / "health"
 
+    falso_estado_ts = tmp_path / "health-ts"
+
     def rodar(
-        saude: str, *, url: str | None = "https://vigia.example/abc", **extra: str
+        saude: str,
+        *,
+        url: str | None = "https://vigia.example/abc",
+        tailscale: str = "healthy",
+        **extra: str,
     ) -> list[str]:
         falso_estado.write_text(saude + "\n", encoding="utf-8", newline="\n")
+        falso_estado_ts.write_text(tailscale + "\n", encoding="utf-8", newline="\n")
         (pasta / ".env").write_text(
             f"PASTA={pasta.as_posix()}\n" + (f"VIGIA_URL={url}\n" if url else ""),
             encoding="utf-8",
@@ -74,6 +82,7 @@ def host(tmp_path):
             "VIGIA_ESTADO": estado.as_posix(),
             "FALSO_LOG": log.as_posix(),
             "FALSO_ESTADO": falso_estado.as_posix(),
+            "FALSO_ESTADO_TS": falso_estado_ts.as_posix(),
             **extra,
         }
         resultado = subprocess.run(
@@ -136,6 +145,42 @@ def test_subida_ou_parada_pedida_nao_reinicia_nem_pinga(host, estado):
         chamadas = host(estado)
         assert _reinicios(chamadas) == []
         assert _pings(chamadas) == []
+
+
+class TestNoTailscale:
+    """O no fora do tailnet deixa o dono sem tela: antes ficava "Up" e ninguem sabia."""
+
+    def test_no_unhealthy_reinicia_o_no_e_nao_o_sistema(self, host):
+        for _ in range(2):
+            assert _reinicios(host("healthy", tailscale="unhealthy")) == []
+        terceira = host("healthy", tailscale="unhealthy")
+        assert _reinicios(terceira) == ["docker restart -t 10 crypto-prd-tailscale"]
+
+    def test_no_unhealthy_pinga_fail_mesmo_com_o_sistema_saudavel(self, host):
+        pings = _pings(host("healthy", tailscale="unhealthy"))
+        assert len(pings) == 1 and pings[0].rstrip().endswith("/fail"), pings
+
+    @pytest.mark.parametrize("estado", ["ausente", "starting"])
+    def test_no_ausente_ou_subindo_nao_e_falha(self, host, estado):
+        """`implantar.sh --local` nao sobe o no; a primeira subida tem o start_period."""
+        pings = _pings(host("healthy", tailscale=estado))
+        assert len(pings) == 1 and "/fail" not in pings[0], pings
+
+    def test_teto_por_hora_e_separado_do_sistema(self, host):
+        reinicios: list[str] = []
+        for _ in range(5):
+            reinicios += _reinicios(host("unhealthy", tailscale="unhealthy", VIGIA_LIMITE="1"))
+        assert reinicios.count("docker restart -t 60 crypto-prd") == 3
+        assert reinicios.count("docker restart -t 10 crypto-prd-tailscale") == 3
+
+    def test_o_compose_de_producao_da_healthcheck_ao_no(self):
+        compose = (RAIZ / "implantacao/producao/compose.yml").read_text(encoding="utf-8")
+        bloco = compose[compose.index("  tailscale:") : compose.index("  postgres:")]
+        assert "healthcheck:" in bloco
+        assert "http://127.0.0.1:9002/healthz" in bloco
+        assert 'TS_ENABLE_HEALTH_CHECK: "true"' in bloco
+        # So no loopback do conteiner: o padrao [::]:9002 abria a porta na rede da stack.
+        assert "TS_LOCAL_ADDR_PORT: 127.0.0.1:9002" in bloco
 
 
 def test_o_healthcheck_da_imagem_usa_a_sonda_do_sistema_vivo():

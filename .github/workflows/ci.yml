@@ -12,6 +12,14 @@
 # Actions fixadas por SHA do commit (versao no comentario): uma tag de action pode ser
 # movida para outro commit; o SHA nao. Para atualizar: `git ls-remote --tags <repo>`.
 # O imagem.yml so publica imagem de commit da main com este workflow verde.
+#
+# Imagem: o Dockerfile e construido aqui tambem (linux/arm64, a plataforma da producao,
+# sem push). Antes ele so era construido na tag, e uma quebra de imagem (lock, npm,
+# estagio do Dockerfile, digest de base que sumiu) aparecia na hora de publicar. O cache
+# (type=gha) da main e o que o imagem.yml reaproveita na tag.
+#
+# Imagens de servico fixadas por digest, como no compose de producao (README da
+# producao, "Imagens"): a CI testa contra o mesmo Postgres que roda la.
 name: CI
 
 on:
@@ -34,7 +42,8 @@ jobs:
     timeout-minutes: 20
     services:
       postgres:
-        image: postgres:16-alpine
+        # postgres 16.15 (alpine)
+        image: postgres:16-alpine@sha256:aa6cb33cf4c19c765cefcf48d96176258800870a9a1e930ad126200f9d825139
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -82,3 +91,25 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm run check
+
+  imagem:
+    name: Imagem (build linux/arm64, sem push)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          platforms: linux/arm64
+          push: false
+          tags: ghcr.io/phkolbe/crypto:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false

@@ -30,9 +30,16 @@ x-logs: &logs
 x-imagem: &imagem
   image: ghcr.io/phkolbe/crypto:${VERSAO_CRYPTO:?defina VERSAO_CRYPTO no .env}
 
+# Imagens de terceiros fixadas por DIGEST, com a versao exata no comentario: a tag
+# `16-alpine` muda de conteudo a cada correcao (e o `pull` do implantar.sh trocava o
+# Postgres menor, a musl e a ICU de producao sem ninguem pedir). O digest e o do indice
+# multiplataforma. Atualizar de proposito, num commit proprio: README, "Imagens".
 services:
   tailscale:
-    image: tailscale/tailscale:${VERSAO_TAILSCALE:-v1.84.3}
+    # Antes a versao vinha de VERSAO_TAILSCALE no .env; com o digest fixo a tag seria
+    # ignorada em silencio, entao a troca e aqui (README, "Imagens").
+    # tailscale v1.84.3
+    image: tailscale/tailscale:v1.84.3@sha256:f97ea471667bd94023f76e228c5be0b95564cdba2f9501cb084eeef139d8b65e
     container_name: crypto-prd-tailscale
     hostname: ${TS_HOSTNAME:-crypto}
     restart: unless-stopped
@@ -44,6 +51,19 @@ services:
       TS_SERVE_CONFIG: /config/serve.json
       # Userspace: sem /dev/net/tun nem NET_ADMIN; o `serve` funciona igual.
       TS_USERSPACE: "true"
+      # /healthz do containerboot: 200 so com o no no tailnet (com IP do Tailscale).
+      # So em 127.0.0.1: o padrao ([::]:9002) abriria a porta para a rede da stack.
+      TS_ENABLE_HEALTH_CHECK: "true"
+      TS_LOCAL_ADDR_PORT: 127.0.0.1:9002
+    # Sem healthcheck, o no fora do tailnet (chave expirada, logout, coordenacao fora)
+    # ficava "Up" para sempre e ninguem sabia que as telas sairam do ar. O vigia.sh le
+    # este estado: reinicia o unhealthy e pinga VIGIA_URL/fail.
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-T", "4", "-O", "/dev/null", "http://127.0.0.1:9002/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
     volumes:
       - tailscale:/var/lib/tailscale
       - ./serve.json:/config/serve.json:ro
@@ -53,7 +73,8 @@ services:
         limits: {memory: 128M, cpus: "0.25"}
 
   postgres:
-    image: postgres:16-alpine
+    # postgres 16.15 (alpine)
+    image: postgres:16-alpine@sha256:aa6cb33cf4c19c765cefcf48d96176258800870a9a1e930ad126200f9d825139
     container_name: crypto-prd-postgres
     restart: unless-stopped
     <<: *logs
@@ -79,7 +100,7 @@ services:
         limits: {memory: 256M, cpus: "0.5"}
 
   migrar:
-    <<: *imagem
+    <<: [*imagem, *logs]
     container_name: crypto-prd-migrar
     restart: "no"
     command: ["crypto-traders", "migrar", "--usuario-aplicacao", "crypto"]
@@ -90,6 +111,13 @@ services:
     depends_on:
       postgres: {condition: service_healthy}
     networks: [crypto]
+    # Roda ao lado do crypto-prd ainda no ar (a versao anterior): sem limite, um migrar
+    # que cresce dividia a memoria do host com o sistema que protege a carteira. O
+    # trabalho pesado (indices, ALTER) e do Postgres; o processo Python so manda o DDL.
+    # Morto pelo limite, a transacao volta atras e o implantar.sh volta a versao.
+    deploy:
+      resources:
+        limits: {memory: 256M, cpus: "0.5"}
 
   crypto:
     <<: [*imagem, *logs]
