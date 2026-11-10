@@ -269,7 +269,11 @@ Resumo do que o sistema garante estruturalmente:
 - Circuit breaker de perda diária/semanal **bloqueia a abertura** de posição e
   **só rearma manualmente**. Nunca bloqueia o fechamento: pausar quem executa o
   stop desligaria o stop.
-- Idempotência por `client_order_id`: um retry de rede não duplica ordem.
+- Envio de ordem **sem reenvio às cegas**: o `client_order_id` sozinho não evita
+  ordem dupla (na Binance ele é único só entre ordens abertas, e uma MARKET preenche
+  na hora). Em desfecho incerto o sistema consulta a ordem pelo `client_order_id`;
+  sem achar, ela fica `PENDING` com alerta e não é reenviada. Ver
+  [`docs/SEGURANCA.md`](docs/SEGURANCA.md) §3.
 - `audit_log` append-only, com gatilho no banco e autorizador no driver.
 - API escuta apenas em `127.0.0.1`.
 
