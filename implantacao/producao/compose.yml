@@ -106,8 +106,9 @@ services:
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_ENDPOINT:-}
     depends_on:
       migrar: {condition: service_completed_successfully}
-    # Os agentes terminam o ciclo corrente antes de parar: nenhuma ordem enviada fica
-    # sem registro. 10 s (o padrao do Docker) pode cortar isso.
+    # A parada drena: o evento em processamento (a ordem no meio do envio) tem ate 20 s
+    # para terminar (agents.base.PRAZO_DRENAGEM_SEGUNDOS), e o que ficar vai para o log
+    # e o audit_log. 10 s (o padrao do Docker) cortaria a drenagem no meio.
     stop_grace_period: 60s
     networks: [crypto]
     deploy:

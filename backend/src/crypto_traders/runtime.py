@@ -1,7 +1,11 @@
 """Ponto de entrada do sistema: sobe orquestrador e API juntos.
 
-Um processo so, com desligamento limpo -- os agentes terminam o ciclo corrente
-antes de parar, para que nenhuma ordem fique enviada sem registro.
+Um processo so, com desligamento limpo: os agentes param de pegar evento novo e o
+que esta em processamento (a ordem no meio do `place_order`) tem ate
+`agents.base.PRAZO_DRENAGEM_SEGUNDOS` para terminar. Passado o prazo, e cancelado,
+e o que ficou -- evento cortado no meio e eventos na fila -- vai para o log em ERROR
+e para o `system_stopped` do audit_log (`deixados_na_parada`). Nao ha garantia de
+que nada fica no meio; ha garantia de que, se ficar, fica escrito.
 """
 
 from __future__ import annotations
