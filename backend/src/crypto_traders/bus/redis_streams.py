@@ -1,15 +1,29 @@
 """Event bus sobre Redis Streams.
 
-Ainda nao e o backend padrao (o Docker nao esta instalado na maquina local),
-mas implementa o mesmo contrato `EventBus`. Para migrar basta subir o
-`docker compose` e trocar duas linhas no `.env`:
+Ainda nao e o backend padrao, mas implementa o mesmo contrato `EventBus`:
 
     EVENT_BUS=redis
     REDIS_URL=redis://localhost:6379/0
 
-Nenhum agente muda. A vantagem sobre o bus in-process e o replay: os eventos
-ficam no stream e podem ser reprocessados para auditoria ou para reconstruir o
-estado apos um crash.
+**Entrega no-maximo-uma-vez**, e por isso recusado em `live`
+(`bus.build_event_bus`). O docstring anterior prometia "replay para reconstruir o
+estado apos um crash", e nada disso existia (auditoria de 09/11/2026,
+orquestracao M2): nao ha consumer group, `XACK` nem `XPENDING`, entao o evento em
+voo de um agente que morre nao volta, e uma assinatura refeita depois de queda
+ou reinicio comeca do "agora" -- o que foi publicado no intervalo esta no stream
+e nunca e lido. Para um `OrderRequest` de venda de protecao isso e um stop que
+nao acontece.
+
+O que este modulo garante: dentro de UMA assinatura viva, nenhum evento se perde
+entre duas leituras (o cursor e fixado num ID concreto na primeira leitura; ver
+`subscribe`). Entrega pelo menos uma vez exigiria um grupo por agente, `XACK`
+depois do `handled` da caixa de entrada (`agents/base._Inbox`) e
+idempotencia em todo consumidor -- o Execution tem (`client_order_id`), o Risk
+e a Strategy nao deduplicam sinal reavaliado.
+
+Lacuna que continua: o cursor so e fixado no primeiro `anext`, e
+`_Inbox.ready` e marcado antes dele -- o que for publicado nessa janela da
+subida nao e entregue (no bus em memoria a assinatura nasce sem `await`).
 """
 
 from __future__ import annotations
@@ -62,16 +76,23 @@ class RedisStreamsEventBus(EventBus):
         self._notificar_observadores(topic, payload)
 
     async def subscribe(self, topic: str) -> AsyncIterator[Any]:
-        """Le o stream a partir de agora (`$`), em fan-out.
+        """Le o stream a partir de agora, em fan-out.
 
         Cada assinante mantem seu proprio cursor local, o que reproduz a
         semantica do bus in-process: todos recebem todos os eventos.
+
+        O "agora" e FIXADO num ID concreto (o ultimo do stream, ou `0-0` se ele
+        ainda nao existe) antes da primeira leitura. Antes o cursor era `$` ate
+        o primeiro evento chegar, e `$` e reavaliado a cada `XREAD`: um `XADD`
+        que caisse entre duas leituras vazias (o bloqueio de 5 s expirou, o laco
+        voltou) era gravado no stream e nunca entregue.
         """
         if self._redis is None:
             raise RuntimeError("EventBus nao iniciado: chame start() antes de subscribe()")
 
         model = TOPIC_MODELS.get(topic)
-        last_id = "$"
+        ultimos = await self._redis.xrevrange(topic, count=1)
+        last_id = ultimos[0][0] if ultimos else "0-0"
         while True:
             response = await self._redis.xread({topic: last_id}, count=100, block=5000)
             if not response:

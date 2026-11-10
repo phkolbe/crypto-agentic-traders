@@ -296,12 +296,23 @@ Um engenheiro novo deve sair desta seção sabendo o que o sistema **não** gara
 > de `src/` por caminho relativo, então a suíte só passa com esse diretório de
 > trabalho. Da raiz do repositório, 1 deles falha com `FileNotFoundError`.
 
-Com o Postgres do compose de pé (e o database de teste criado uma vez:
-`docker exec crypto-postgres psql -U postgres -c "CREATE DATABASE crypto_teste"`):
+Os testes de Postgres rodam contra um Postgres **descartável**, nunca contra o do
+compose: aquele guarda o histórico do ensaio (preço médio e stop), e `trades` e
+`audit_log` são append-only — o que a suíte gravar lá não sai mais. Suba um
+servidor só para a suíte (o `--rm` o apaga ao parar):
 
 ```bash
-cd backend && POSTGRES_TEST_URL=postgresql+asyncpg://postgres:postgres@127.0.0.1:5433/crypto_teste uv run pytest -q
+docker run --rm -d --name crypto-pg-teste -p 127.0.0.1:55432:5432 -e POSTGRES_PASSWORD=postgres postgres:16
+cd backend && POSTGRES_TEST_URL=postgresql+asyncpg://postgres:postgres@127.0.0.1:55432/postgres uv run --extra dev pytest -q
+docker stop crypto-pg-teste
 ```
+
+Cada teste de Postgres cria e apaga o próprio database nesse servidor. A suíte
+**recusa subir** se `DATABASE_URL` ou `POSTGRES_TEST_URL` apontarem para o banco
+do sistema (database `crypto`, porta 5433 ou host `crypto-postgres`/`postgres`);
+forçar exige `CRYPTO_TESTES_ACEITAM_BANCO_DO_SISTEMA=1`, e não há caso de uso do
+dia a dia para isso. Cada teste tem limite de 120 s (`pytest-timeout`): um
+`await` pendurado falha com o nome do teste em vez de travar o CI.
 
 Verde em 24/10/2026: **1212 passed, 1 skipped, 1 xfailed** (é também o que o CI
 roda). Os três números importam:

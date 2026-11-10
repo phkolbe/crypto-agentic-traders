@@ -176,6 +176,16 @@ class Position(DomainModel):
     quantity: Decimal
     average_price: Decimal | None = None
     current_price: Decimal | None = None
+    cost_basis_quantity: Decimal | None = None
+    """Parte de `quantity` que tem base de custo no historico (`None` = toda).
+
+    O saldo vem da exchange e o medio vem do historico. Quando o saldo passa do
+    historico -- deposito externo de um ativo que ja estava em carteira --, o
+    excedente nao tem custo conhecido. Multiplicar o saldo inteiro pelo medio
+    movia o resultado de negociacao sem perda nenhuma: 1 BTC comprado a 100 com
+    mercado a 90 (-10) virava -20 com mais 1 BTC depositado, e a trava armava
+    (auditoria de 09/11/2026, dados M2).
+    """
 
     @property
     def market_value(self) -> Decimal:
@@ -185,9 +195,13 @@ class Position(DomainModel):
 
     @property
     def unrealized_pnl(self) -> Decimal:
+        """So da quantidade com base de custo: sem custo nao ha resultado a declarar."""
         if self.current_price is None or self.average_price is None:
             return Decimal(0)
-        return (self.current_price - self.average_price) * self.quantity
+        quantidade = self.quantity
+        if self.cost_basis_quantity is not None:
+            quantidade = min(quantidade, self.cost_basis_quantity)
+        return (self.current_price - self.average_price) * quantidade
 
 
 class PortfolioSnapshot(DomainModel):

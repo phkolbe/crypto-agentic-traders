@@ -37,6 +37,12 @@ METRIC_MVRV = "mvrv_zscore"
 #: A serie e diaria: rebuscar mais de uma vez ao dia e desperdicio.
 REFRESH_INTERVAL = timedelta(hours=12)
 
+#: Idade maxima do ultimo ponto para ele ainda valer como "o mercado de agora".
+#: O ponto do dia D so sai depois do fim de D (e o provedor publica horas
+#: depois), entao na manha de D+1 o mais novo e o de D-1: 2 dias pela data. Tres
+#: dias de folga cobrem um atraso do provedor sem deixar semanas passarem.
+IDADE_MAXIMA_MVRV = timedelta(days=3)
+
 
 class OnChainProvider:
     """Busca e cacheia metricas on-chain."""
@@ -44,6 +50,8 @@ class OnChainProvider:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._last_fetch: datetime | None = None
+        self._velho_avisado = False
+        """O `onchain.mvrv_stale` ja saiu neste episodio de serie envelhecida."""
 
     async def refresh_mvrv(self, force: bool = False) -> int:
         """Baixa a serie e grava o que ainda nao existe. Devolve quantos pontos novos."""
@@ -109,18 +117,39 @@ class OnChainProvider:
         pedido. Usar a serie inteira daria ao backtest conhecimento do futuro: um
         Z-Score de 3,0 em 2023 pareceria mediano por causa de valores que so
         aconteceriam em 2025.
+
+        E o ultimo ponto precisa ser RECENTE (`IDADE_MAXIMA_MVRV`). Sem limite,
+        com o provedor fora do ar (ou `mvrv_empty_payload`) por 3 semanas, o
+        ultimo percentil em cache (0,85) seguia valendo: o Risk recusava toda
+        compra com "mercado caro" sem o aviso `risk.mvrv_unavailable`, e o
+        percentil baixo congelado deixava comprar num mercado que esquentou
+        (auditoria de 09/11/2026, dados M3). Dado velho que parece atual e pior
+        que dado nenhum: velho vira `None`, e o filtro se desliga de forma visivel.
         """
         serie = await self.mvrv_series()
-        if not serie:
-            return None
+        alvo = moment or datetime.now(UTC)
+        passado = [(d, v) for d, v in serie if d <= alvo.date()]
+        if passado:
+            idade = alvo.date() - passado[-1][0]
+            if idade > IDADE_MAXIMA_MVRV:
+                if not self._velho_avisado:
+                    # Um aviso por episodio: o Risk le isto a cada lote de sinais.
+                    self._velho_avisado = True
+                    log.error(
+                        "onchain.mvrv_stale",
+                        ultimo_ponto=str(passado[-1][0]),
+                        idade_dias=idade.days,
+                        limite_dias=IDADE_MAXIMA_MVRV.days,
+                        detail="filtro de regime desligado ate o provedor voltar",
+                    )
+                return None
+            self._velho_avisado = False
+        return reading_from_series(serie, alvo)
 
-        alvo = (moment or datetime.now(UTC)).date()
-        passado = [(d, v) for d, v in serie if d <= alvo]
-        if not passado:
-            return None
-
-        atual = passado[-1][1]
-        return zone_by_percentile(atual, [v for _, v in passado])
+    async def ultimo_ponto_mvrv(self) -> date | None:
+        """Data do ponto mais novo em cache, para o aviso de serie envelhecida."""
+        serie = await self.mvrv_series()
+        return serie[-1][0] if serie else None
 
 
 def reading_from_series(
@@ -130,6 +159,9 @@ def reading_from_series(
 
     Recebe a serie ja carregada e respeita o mesmo cuidado com o futuro -- so
     usa pontos anteriores ou iguais ao momento avaliado.
+
+    Nao aplica `IDADE_MAXIMA_MVRV`: a serie historica do backtest e diaria e
+    completa, e quem precisa do limite e a leitura ao vivo (`mvrv_reading`).
     """
     alvo = moment.date()
     passado = [(d, v) for d, v in serie if d <= alvo]
