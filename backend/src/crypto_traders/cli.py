@@ -690,7 +690,17 @@ async def _backtest(settings, args) -> int:
     if minutes is None:
         print(f"timeframe desconhecido: {timeframe}")
         return 1
-    needed = min(int(args.days * 24 * 60 / minutes), 1000)
+    from .api.routes.backtest import MAX_CANDLES
+
+    # O adaptador pagina o historico; o teto e o da rota (memoria), e acima dele
+    # o comando recusa em vez de cortar calado (antes: 1000, sem aviso).
+    needed = int(args.days * 24 * 60 / minutes)
+    if needed > MAX_CANDLES:
+        print(
+            f"{args.days} dias em {timeframe} sao {needed} candles; o teto e {MAX_CANDLES}. "
+            f"Use no maximo {MAX_CANDLES * minutes // (24 * 60)} dias neste timeframe."
+        )
+        return 1
 
     print(f"\nBaixando {needed} candles de {symbol} ({timeframe})...")
     source = build_market_data_source(settings.exchange)

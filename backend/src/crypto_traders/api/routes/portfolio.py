@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ...agents.portfolio import cotacoes_das_taxas
 from ...analise import resultado_por_par, resumo_de_risco
 from ...db import models as orm
 from ...db.repositories import PortfolioSnapshotRepository, TradeRepository
@@ -251,7 +252,12 @@ async def portfolio_analise(
     )
 
     trades = await TradeRepository(session).for_cost_basis()
-    pares = resultado_por_par(trades, quote, modo, inicio, fim)
+    # Mesma conversao da taxa em terceira moeda (BNB) que o Portfolio Agent faz:
+    # sem ela, a tela descartava a taxa que a carteira ja conta.
+    pares = resultado_por_par(
+        trades, quote, modo, inicio, fim,
+        cotacoes_da_taxa=await cotacoes_das_taxas(session, trades, quote),
+    )
 
     eventos = (
         await session.execute(

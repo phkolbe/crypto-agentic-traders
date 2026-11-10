@@ -516,6 +516,8 @@ class HealthOut(BaseModel):
     sizing_detail: str | None = None
     agents: dict[str, AgentStatusOut]
     alert_delivery: AlertDeliveryOut | None = None
+    instancia_unica: str | None = None
+    """`mantida`, `perdida` (abertura barrada ate retomar) ou None sem Postgres."""
 
 
 class StrategyOut(BaseModel):

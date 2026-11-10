@@ -169,6 +169,21 @@ def _linhas_ohlcv_confiaveis(
     return [validas[chave] for chave in sorted(validas)]
 
 
+def _carimbo(raw: dict[str, Any]) -> dict[str, datetime]:
+    """O instante do preco segundo a EXCHANGE (`timestamp` do ccxt, em ms).
+
+    O Market Data mede o frescor do preco corrente por este carimbo: a hora de
+    RECEBIMENTO fazia um preco velho, entregue atrasado, parecer recente. Sem o
+    campo (ou com um valor no futuro, relogio errado de algum lado), volta ao
+    padrao do modelo -- a hora local --, e o Market Data ja trata carimbo no
+    futuro como agora.
+    """
+    ms = raw.get("timestamp")
+    if not isinstance(ms, (int, float)) or ms <= 0:
+        return {}
+    return {"timestamp": datetime.fromtimestamp(ms / 1000, tz=UTC)}
+
+
 class CcxtExchange(MarketDataSource, Broker):
     """Implementa leitura de mercado e execucao sobre um cliente ccxt."""
 
@@ -563,7 +578,10 @@ class CcxtExchange(MarketDataSource, Broker):
             # saia preco ZERO, que e "o ativo nao vale nada" -- so o Market Data
             # recusar preco <= 0 impedia o stop de ler isso (exchanges L1).
             raise ExchangeError(f"{self.name}.fetch_ticker: resposta sem preco para {symbol}")
-        return Ticker(exchange=self._exchange_enum(), symbol=symbol, price=_dec(price))
+        return Ticker(
+            exchange=self._exchange_enum(), symbol=symbol, price=_dec(price),
+            **_carimbo(raw),
+        )
 
     async def fetch_tickers(self, symbols: list[str]) -> dict[str, Ticker]:
         """Preco corrente de varios pares numa chamada so (o ciclo do Market Data).
@@ -579,7 +597,8 @@ class CcxtExchange(MarketDataSource, Broker):
             if price is None:
                 continue
             tickers[symbol] = Ticker(
-                exchange=self._exchange_enum(), symbol=symbol, price=_dec(price)
+                exchange=self._exchange_enum(), symbol=symbol, price=_dec(price),
+                **_carimbo(item),
             )
         return tickers
 
