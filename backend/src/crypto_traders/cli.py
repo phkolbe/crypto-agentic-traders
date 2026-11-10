@@ -3,7 +3,7 @@
     crypto-traders check                      diagnostico do ambiente
     crypto-traders backtest --symbol BTC/USDT valida uma estrategia
     crypto-traders run                        sobe agentes + API
-    crypto-traders migrar                     cria schema e gatilhos (usuario dono)
+    crypto-traders migrar                     migra o schema e cria os gatilhos (usuario dono)
     crypto-traders copiar-sqlite ARQUIVO      leva o historico do SQLite ao Postgres
 """
 
@@ -55,7 +55,8 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--no-api", action="store_true", help="Sobe apenas os agentes")
 
     migrar = subparsers.add_parser(
-        "migrar", help="Cria o schema e os gatilhos append-only (com o usuario dono do banco)"
+        "migrar",
+        help="Aplica as migracoes do schema e os gatilhos append-only (usuario dono do banco)",
     )
     migrar.add_argument(
         "--usuario-aplicacao",
@@ -112,23 +113,29 @@ def main(argv: list[str] | None = None) -> int:
 
 # ---------------------------------------------------------------------------
 async def _migrar(settings, usuario_aplicacao: str | None) -> int:
-    """Schema, gatilhos e privilegios. Roda e sai, antes do `run` (Docker).
+    """Migracoes versionadas, gatilhos e privilegios. Roda e sai, antes do `run` (Docker).
 
     No Postgres, quem roda isto e o DONO do banco; a aplicacao roda com
     `usuario_aplicacao`, que recebe SELECT/INSERT/UPDATE/DELETE nas tabelas e uso
     das sequencias -- e nada de TRIGGER nem CREATE, entao nao derruba a propria
     trilha append-only (`db.models.conceder_a_aplicacao`).
     """
+    from .db.migracoes import VERSAO_ATUAL
     from .db.session import dispose_engine
 
     try:
-        await init_db(settings, migrar=True, usuario_aplicacao=usuario_aplicacao)
+        await init_db(
+            settings, migrar=True, usuario_aplicacao=usuario_aplicacao, como_dono=True
+        )
     except Exception as exc:
         log.error("migrar.falhou", error=str(exc))
+        # Tambem no stderr, e inteiro: a recusa de uma migracao (trade repetido,
+        # valor fora do dominio, banco divergente) diz o que o dono tem de fazer.
+        print(f"migrar falhou: {exc}", file=sys.stderr)
         return 1
     finally:
         await dispose_engine()
-    print("migrar: schema e gatilhos prontos")
+    print(f"migrar: schema na versao {VERSAO_ATUAL}, gatilhos e conferencia prontos")
     return 0
 
 

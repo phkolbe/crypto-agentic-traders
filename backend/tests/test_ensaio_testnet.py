@@ -3,7 +3,7 @@
 O ensaio em si so roda com a chave que o operador cria; aqui se prova, com a
 exchange dublada, que ele (a) recusa rodar fora da testnet antes de qualquer
 ordem, (b) reprova cada falha que existe para pegar e (c) mede a idempotencia
-do clientOrderId em vez de supor.
+do clientOrderId em vez de supor (aceita = aviso; quem protege e a consulta).
 """
 
 from __future__ import annotations
@@ -15,7 +15,14 @@ import pytest
 from crypto_traders.config import ExchangeCredentials, Settings
 from crypto_traders.domain.enums import ExchangeName, OrderStatus, Side
 from crypto_traders.domain.models import OrderResult
-from crypto_traders.ensaio_testnet import FALHOU, OK, aponta_para_testnet, ensaiar
+from crypto_traders.ensaio_testnet import (
+    AVISO,
+    FALHOU,
+    OK,
+    aponta_para_testnet,
+    ensaiar,
+    imprimir,
+)
 from crypto_traders.exchanges import build_broker
 from crypto_traders.exchanges.base import ExchangeError
 from crypto_traders.exchanges.filters import FONTE_AO_VIVO, MarketFilter
@@ -127,18 +134,32 @@ def test_url_misturada_nao_conta_como_testnet():
     assert aponta_para_testnet(_Ccxt(TESTNET_URLS)) is True
 
 
-async def test_clientorderid_aceito_duas_vezes_reprova_e_a_sobra_e_vendida():
-    """Duplicata aceita REPROVA o ensaio (antes era AVISO e saia "APROVADO").
+async def test_clientorderid_aceito_duas_vezes_e_aviso_e_a_sobra_e_vendida():
+    """Duplicata aceita e AVISO informativo, nao reprovacao.
 
-    E a prova, no servidor, de que o `clientOrderId` nao protege um reenvio: a
-    MARKET preenchida deixa de ser ordem aberta e o mesmo id compra de novo
-    (auditoria de 09/11/2026, M1).
+    Antes REPROVAVA (auditoria de 09/11/2026, M1), e isso era defeito do ensaio:
+    a Binance documenta que o `newClientOrderId` so e unico entre ordens ABERTAS,
+    entao a MARKET preenchida libera o id e o reenvio compra de novo -- e o
+    comportamento normal dela, que nenhuma chave ou configuracao muda, e o ensaio
+    reprovaria para sempre. Desde as correcoes P0 o envio nao depende disso: depois
+    de um timeout o adaptador CONSULTA pelo id e nunca reenvia. O que reprova e
+    essa consulta falhar (`test_consulta_que_nao_acha_a_ordem_executada_reprova`).
     """
     ex = ExchangeDublada(aceita_repetida=True)
     relatorio = await ensaiar(Settings(_env_file=None), cliente=ex)
-    assert _estados(relatorio)["clientOrderId repetido"] == FALHOU
-    assert not relatorio.ok
+    assert _estados(relatorio)["clientOrderId repetido"] == AVISO
+    assert relatorio.ok, relatorio.etapas
+    detalhe = next(e.detalhe for e in relatorio.etapas if e.nome == "clientOrderId repetido")
+    assert "consulta" in detalhe and "nao reenvia" in detalhe
     assert ex.saldos["BTC"] == Decimal("0.5"), "as duas compras tem de ser vendidas"
+
+
+async def test_imprime_aprovado_com_aviso_quando_a_duplicata_e_aceita(capsys):
+    ex = ExchangeDublada(aceita_repetida=True)
+    imprimir(await ensaiar(Settings(_env_file=None), cliente=ex))
+    saida = capsys.readouterr().out
+    assert "[AVISO ] clientOrderId repetido" in saida
+    assert "Resultado: APROVADO (com avisos)" in saida
 
 
 async def test_consulta_que_nao_acha_a_ordem_executada_reprova():

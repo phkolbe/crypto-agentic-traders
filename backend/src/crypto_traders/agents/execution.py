@@ -12,7 +12,9 @@ Ordem das operacoes, que importa:
 5. Grava a ordem como PENDING **antes** de chamar a exchange.
 6. Le a trava do D4 **de novo**, agora colada no envio.
 7. Envia.
-8. Grava o resultado e, se preenchida, o trade no historico consolidado.
+8. Grava o resultado e, se preenchida, o trade no historico consolidado. Se a
+   gravacao falhar (Postgres fora), o resultado inteiro vai para o log e sai o
+   alerta `order_record_lost`: o fill aconteceu e nao pode sumir.
 
 O passo 5 antes do 7 e deliberado: se o processo morrer entre o envio e a
 confirmacao, existe registro local de que a ordem foi tentada. O inverso
@@ -270,7 +272,7 @@ class ExecutionAgent(BaseAgent):
             # (timeout ou "status unknown" sem achar a ordem pelo clientOrderId).
             result = self._unknown(request, f"{type(exc).__name__}: {exc}")
 
-        result = self._classificar(request, result)
+        result = self._classificar(request, self._em_decimal(request, result))
         await self._record(request, result)
         await self.bus.publish(Topics.ORDER_RESULTS, result)
 
@@ -772,6 +774,89 @@ class ExecutionAgent(BaseAgent):
             },
         )
 
+    def _em_decimal(self, request: OrderRequest, result: OrderResult) -> OrderResult:
+        """Quantidade, preco e taxa do broker como `Decimal`, antes de gravar.
+
+        `Money` recusa `float` (D7), e esta certo: o float ja perdeu digito. Mas
+        o fill aconteceu, e a recusa derrubava a transacao inteira -- ordem
+        PENDING e sem trade embora preenchida (auditoria de 09/11/2026, banco).
+        `model_copy(update=...)` nao valida, entao um adaptador que devolva float
+        passa pelo modelo; aqui ele vira Decimal pela representacao curta (a que
+        a exchange mandou no JSON) e o log diz que chegou float.
+        """
+        trocas: dict[str, Decimal] = {}
+        for campo in ("filled_quantity", "average_price", "fee"):
+            valor = getattr(result, campo)
+            if isinstance(valor, float | int) and not isinstance(valor, bool):
+                trocas[campo] = Decimal(str(valor))
+        if not trocas:
+            return result
+        self.log.warning(
+            "execution.numero_nao_decimal_do_broker",
+            client_order_id=request.client_order_id,
+            campos={campo: str(valor) for campo, valor in trocas.items()},
+        )
+        return result.model_copy(update=trocas)
+
+    async def _report_record_lost(
+        self,
+        request: OrderRequest,
+        result: OrderResult,
+        error: Exception,
+        *,
+        preenchida: bool,
+    ) -> None:
+        """O banco recusou o resultado de uma ordem JA enviada: log inteiro e alerta.
+
+        O log leva o `OrderResult` completo, que passa a ser o unico registro do
+        fill. Sem `audit_log`: o motivo mais provavel e o banco fora do ar, e o
+        alerta nao pode depender dele.
+        """
+        try:
+            resultado: dict[str, object] = result.model_dump(mode="json")
+        except Exception:  # pragma: no cover - raw com objeto nao serializavel
+            resultado = {"repr": repr(result)}
+        self.log.error(
+            "execution.registro_perdido",
+            symbol=request.symbol,
+            side=str(request.side),
+            order_id=request.id,
+            client_order_id=request.client_order_id,
+            preenchida=preenchida,
+            resultado=resultado,
+            error=f"{type(error).__name__}: {error}",
+        )
+        if preenchida:
+            titulo = f"Ordem EXECUTADA sem registro no banco — {request.symbol}"
+            acao = (
+                "A ordem foi executada na exchange, mas o banco recusou a gravacao: ela "
+                "ficou PENDING e o trade NAO esta no historico, entao a posicao fica sem "
+                "preco medio e sem stop-loss. Quando o banco voltar, confira na exchange e "
+                "lance o trade com estes valores."
+            )
+        else:
+            titulo = f"Resultado de ordem sem registro no banco — {request.symbol}"
+            acao = (
+                "O banco recusou a gravacao do resultado: a ordem ficou PENDING no banco "
+                "com outro desfecho na exchange. Confira na exchange quando o banco voltar."
+            )
+        await self.bus.publish(
+            Topics.ALERTS,
+            {
+                "type": "order_record_lost",
+                "title": titulo,
+                "message": (
+                    f"{acao}\n\n"
+                    f"client_order_id {request.client_order_id}, exchange_order_id "
+                    f"{result.exchange_order_id}, {request.side} {request.symbol}: "
+                    f"status {result.status}, preenchido {result.filled_quantity} a "
+                    f"{result.average_price}, taxa {result.fee} {result.fee_currency or ''}"
+                    f"\n\nErro do banco: {type(error).__name__}: {error}"
+                ),
+                "timestamp": datetime.now(UTC).isoformat(),
+            },
+        )
+
     async def _record(self, request: OrderRequest, result: OrderResult) -> None:
         # O que decide se ha trade e a moeda ter mudado de mao, NAO o status da
         # ordem. Medido em 2026-09-09: com `status is FILLED` como condicao, uma
@@ -800,25 +885,35 @@ class ExecutionAgent(BaseAgent):
             )
             filled = False
 
-        async with session_scope(self._settings) as session:
-            await OrderRepository(session).apply_result(result)
+        try:
+            async with session_scope(self._settings) as session:
+                await OrderRepository(session).apply_result(result)
 
-            if filled and price is not None:
-                await TradeRepository(session).record(
-                    executed_at=result.timestamp,
-                    exchange=str(request.exchange),
-                    symbol=request.symbol,
-                    side=str(request.side),
-                    quantity=result.filled_quantity,
-                    price=price,
-                    fee=result.fee,
-                    fee_currency=result.fee_currency,
-                    origin=TradeOrigin.AGENT,
-                    order_id=request.id,
-                    signal_id=request.signal_id,
-                    strategy=request.strategy,
-                    mode=self._mode,
-                )
+                if filled and price is not None:
+                    await TradeRepository(session).record(
+                        executed_at=result.timestamp,
+                        exchange=str(request.exchange),
+                        symbol=request.symbol,
+                        side=str(request.side),
+                        quantity=result.filled_quantity,
+                        price=price,
+                        fee=result.fee,
+                        fee_currency=result.fee_currency,
+                        origin=TradeOrigin.AGENT,
+                        order_id=request.id,
+                        signal_id=request.signal_id,
+                        strategy=request.strategy,
+                        mode=self._mode,
+                    )
+        except Exception as exc:
+            # A ordem JA foi enviada: o que falhou foi so lembrar dela. Subir a
+            # excecao (como antes) levava ate `_run`, que logava `error=str(exc)`
+            # e mais nada -- quantidade, preco e taxa do fill sumiam, a ordem
+            # ficava PENDING sem trade e nenhum alerta saia (auditoria de
+            # 09/11/2026, M4). Engolir e certo, porque nada aqui desfaz o envio
+            # e reenviar seria comprar duas vezes; engolir CALADO nao.
+            await self._report_record_lost(request, result, exc, preenchida=filled)
+            return
 
         if result.status is OrderStatus.FILLED:
             self.log.info(

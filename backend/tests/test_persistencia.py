@@ -1117,6 +1117,10 @@ class TestEscalaDoDinheiroJaGravado:
         conn = sqlite3.connect(_arquivo_do_banco(settings))
         try:
             conn.execute("DROP TABLE trades")
+            # Banco com a forma antiga e anterior as migracoes versionadas: sem a
+            # tabela de versao, a subida o trata como a linha de base e aplica a
+            # migracao 2 (o indice unico de trade de agente) sobre a tabela antiga.
+            conn.execute("DROP TABLE schema_versao")
             conn.execute(
                 "CREATE TABLE trades (id VARCHAR(32) PRIMARY KEY, "
                 "created_at DATETIME, executed_at DATETIME, exchange VARCHAR(32), "
@@ -1651,8 +1655,10 @@ class TestHypertablesDoTimescale:
         primeira_hypertable = next(
             indice for indice, sql in enumerate(passos) if "create_hypertable" in sql
         )
-        assert "run_sync:create_all" in passos
-        assert passos.index("run_sync:create_all") < fim_do_schema
+        # O `create_all` mora dentro de `aplicar_migracoes` desde as migracoes
+        # versionadas (auditoria de 09/11/2026, banco F2); a ordem e a mesma.
+        assert "run_sync:aplicar_migracoes" in passos
+        assert passos.index("run_sync:aplicar_migracoes") < fim_do_schema
         assert fim_do_schema < primeira_hypertable, f"schema nao foi commitado antes: {passos}"
 
     async def test_sqlite_nao_tenta_hypertable(self, tmp_path, monkeypatch):
@@ -1700,7 +1706,8 @@ class TestOSchemaPermiteHypertable:
     def test_a_regra_reprova_quem_nao_cumpre(self):
         """A guarda so vale se souber dizer nao: `trades` nao serve de hypertable."""
         problemas = orm.hypertable_possivel("trades", "executed_at")
-        assert problemas == ["PRIMARY KEY ['id']"], problemas
+        # E o indice unico de um trade de agente por ordem tambem impediria.
+        assert problemas == ["PRIMARY KEY ['id']", "INDEX UNIQUE ['order_id']"], problemas
 
     async def test_tabela_que_nao_cumpre_a_regra_nao_e_sequer_tentada(self, monkeypatch):
         """E o WARNING generico vira ERROR nomeando o indice que impede."""
@@ -1833,3 +1840,147 @@ class TestPostgresDeVerdade:
         async with session_scope(pg) as ses:
             trade = (await TradeRepository(ses).list(limit=1))[0]
         assert trade.quantity == Decimal("0.431666666666666667")
+
+
+# ---------------------------------------------------------------------------
+# Auditoria de 09/11/2026 (banco, F2/low): restricoes de `trades`, limites que
+# descartavam o historico mais NOVO e JSON que o Postgres recusa.
+# ---------------------------------------------------------------------------
+def _trade_de_agente(**extra: Any) -> dict[str, Any]:
+    campos: dict[str, Any] = {
+        "executed_at": datetime(2026, 11, 1, tzinfo=UTC),
+        "exchange": "binance",
+        "symbol": "BTC/USDC",
+        "side": "buy",
+        "quantity": Decimal("0.001"),
+        "price": Decimal("60000"),
+        "origin": TradeOrigin.AGENT,
+        "order_id": "ordem-1",
+        "mode": "live",
+    }
+    campos.update(extra)
+    return campos
+
+
+class TestRestricoesDeTrades:
+    async def test_segundo_trade_de_agente_para_a_mesma_ordem_e_recusado(self, settings):
+        """Um trade duplicado seria IRREMOVIVEL (append-only): o banco recusa antes.
+
+        Cenario do relatorio: `_record` rodando duas vezes para a mesma ordem
+        (fill parcial seguido do total, ou uma reconciliacao) gravava dois trades
+        de agente com o mesmo `order_id`, e o gatilho impede apagar o segundo.
+        """
+        from sqlalchemy.exc import IntegrityError
+
+        async with session_scope(settings) as ses:
+            await TradeRepository(ses).record(**_trade_de_agente())
+        with pytest.raises(IntegrityError):
+            async with session_scope(settings) as ses:
+                await TradeRepository(ses).record(**_trade_de_agente())
+        async with session_scope(settings) as ses:
+            assert await TradeRepository(ses).count() == 1
+
+    async def test_lancamentos_manuais_e_trades_sem_ordem_nao_colidem(self, settings):
+        async with session_scope(settings) as ses:
+            repo = TradeRepository(ses)
+            for _ in range(2):
+                await repo.record(**_trade_de_agente(
+                    origin=TradeOrigin.MANUAL, order_id="ordem-1", mode="manual"
+                ))
+                await repo.record(**_trade_de_agente(order_id=None))
+            await repo.record(**_trade_de_agente(order_id="ordem-1"))
+            assert await repo.count() == 5
+
+    @pytest.mark.parametrize(
+        "campo, valor",
+        [("origin", "bot"), ("side", "long"), ("mode", "paper"), ("mode", "LIVE")],
+    )
+    async def test_valor_fora_do_dominio_e_recusado(self, settings, campo, valor):
+        """`origin`, `side` e `mode` tem dominio fechado; o banco passa a impor."""
+        from sqlalchemy.exc import IntegrityError
+
+        with pytest.raises(IntegrityError):
+            async with session_scope(settings) as ses:
+                await TradeRepository(ses).record(**_trade_de_agente(**{campo: valor}))
+
+
+class TestLimiteGuardaOHistoricoMaisNovo:
+    """Com limite e ordem CRESCENTE, o que caia fora eram os registros mais novos.
+
+    Cenario do relatorio: semanas de dry_run e depois o live; ao bater o limite,
+    o custo medio do live era apurado SEM os trades do live.
+    """
+
+    async def _gravar(self, settings, modos: list[str]) -> None:
+        async with session_scope(settings) as ses:
+            repo = TradeRepository(ses)
+            for dia, modo in enumerate(modos, start=1):
+                await repo.record(**_trade_de_agente(
+                    executed_at=datetime(2026, 10, dia, tzinfo=UTC),
+                    order_id=f"ordem-{dia}",
+                    mode=modo,
+                ))
+
+    async def test_custo_medio_mantem_os_mais_novos_em_ordem_cronologica(self, settings):
+        await self._gravar(settings, ["dry_run"] * 4 + ["live"] * 2)
+        with capture_logs() as logs:
+            async with session_scope(settings) as ses:
+                trades = await TradeRepository(ses).for_cost_basis(limit=3)
+        assert [t.executed_at.day for t in trades] == [4, 5, 6]
+        assert [t.mode for t in trades] == ["dry_run", "live", "live"]
+        assert any(
+            e["event"] == "db.historico_truncado" and e["log_level"] == "error" for e in logs
+        ), logs
+
+    async def test_custo_medio_filtra_o_modo_no_banco(self, settings):
+        await self._gravar(settings, ["dry_run"] * 4 + ["live"] * 2)
+        async with session_scope(settings) as ses:
+            ses.add(orm.Trade(**{
+                **_trade_de_agente(origin="manual", order_id=None, mode="manual"),
+                "id": "manual-1", "notional": Decimal("60"),
+            }))
+        with capture_logs() as logs:
+            async with session_scope(settings) as ses:
+                trades = await TradeRepository(ses).for_cost_basis(limit=3, modo="live")
+        assert sorted(t.mode for t in trades) == ["live", "live", "manual"]
+        assert not any(e["event"] == "db.historico_truncado" for e in logs), (
+            "o limite so conta os trades do modo, entao nao bateu"
+        )
+
+    async def test_razao_mantem_os_movimentos_mais_novos(self, settings):
+        from crypto_traders.db.repositories import PortfolioLedgerRepository
+
+        async with session_scope(settings) as ses:
+            for dia in range(1, 6):
+                ses.add(orm.AuditLog(
+                    timestamp=datetime(2026, 10, dia, tzinfo=UTC),
+                    action="razao_teste",
+                    after={"mode": "dry_run" if dia < 4 else "live", "dia": dia},
+                ))
+        with capture_logs() as logs:
+            async with session_scope(settings) as ses:
+                razao = PortfolioLedgerRepository(ses)
+                ultimos = await razao.movements(["razao_teste"], limit=2)
+                do_live = await razao.movements(["razao_teste"], limit=10, modo="live")
+        assert [m.after["dia"] for m in ultimos] == [4, 5]
+        assert [m.after["dia"] for m in do_live] == [4, 5]
+        assert any(e["event"] == "db.historico_truncado" for e in logs)
+
+
+class TestJsonQueOBancoAceita:
+    async def test_nan_e_decimal_em_json_nao_derrubam_a_gravacao(self, settings):
+        """`json.dumps` emite `NaN` (o tipo json do Postgres recusa) e levanta
+        TypeError com Decimal; um indicador em aquecimento derrubava o sinal."""
+        async with session_scope(settings) as ses:
+            ses.add(orm.Signal(
+                id="sinal-nan", exchange="binance", symbol="BTC/USDC", timeframe="1d",
+                strategy="ma_crossover", direction="long", confidence=Decimal("0.5"),
+                reason="teste", reference_price=Decimal("1"),
+                indicators={"rsi": float("nan"), "topo": float("inf"),
+                            "preco": Decimal("60000.10"), "lista": [float("-inf")]},
+            ))
+        async with session_scope(settings) as ses:
+            sinal = await ses.get(orm.Signal, "sinal-nan")
+        assert sinal.indicators == {
+            "rsi": "NaN", "topo": "Infinity", "preco": "60000.10", "lista": ["-Infinity"]
+        }

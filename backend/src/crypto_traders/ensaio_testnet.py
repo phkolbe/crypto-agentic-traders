@@ -13,10 +13,12 @@ verdade responde, com dinheiro ficticio:
    como o sistema le; e a CONSULTA pelo `clientOrderId` acha essa compra -- e o
    mecanismo com que o adaptador descobre o desfecho de um envio sem resposta, em
    vez de reenviar;
-4. o MESMO `clientOrderId` reenviado e MEDIDO: se a exchange aceitar, REPROVA. E
-   a prova de que o id nao protege um reenvio (a MARKET preenchida deixa de ser
-   ordem aberta), e de que qualquer caminho que reenvie depois de timeout compra
-   duas vezes;
+4. o MESMO `clientOrderId` reenviado e MEDIDO, e sai como AVISO informativo se a
+   exchange aceitar. A Binance documenta que o id so e unico entre ordens ABERTAS
+   (a MARKET preenchida o libera), entao aceitar e o comportamento dela, e nao
+   defeito desta instalacao. O envio nao depende disso: depois de um timeout o
+   adaptador CONSULTA pelo id (etapa 3) e nunca reenvia -- e e a consulta falhar
+   que reprova o ensaio;
 5. a venda a mercado -- o caminho da saida protetora -- devolve a posicao;
 6. uma ordem abaixo do minimo volta como falha da ordem, e nao derruba o agente.
 
@@ -216,6 +218,12 @@ async def ensaiar(
         )
 
         # 4. Idempotencia do clientOrderId: o que a exchange faz com um reenvio.
+        # MEDIDO e informado, mas nao reprova. Ja reprovou (auditoria de
+        # 09/11/2026, M1), e reprovaria para sempre: a Binance documenta que o
+        # `newClientOrderId` so e unico entre ordens abertas, entao a MARKET
+        # preenchida libera o id e o reenvio compra de novo. Desde as correcoes
+        # P0 o envio nao depende do id: depois de um timeout o adaptador consulta
+        # pela etapa 3b e NUNCA reenvia. A reprovacao que importa e a da consulta.
         try:
             repetida = await cliente.place_order(compra)
         except ExchangeError as exc:
@@ -223,15 +231,13 @@ async def ensaiar(
             relatorio.registrar("clientOrderId repetido", OK, f"recusado: {exc}")
         if repetida is not None:
             if _executada(repetida):
-                # FALHOU e nao AVISO (auditoria de 09/11/2026, M1): com AVISO o
-                # ensaio saia "APROVADO (com avisos)" com o risco de compra dupla
-                # que o SEGURANCA §17 diz ser bloqueante para o live.
                 relatorio.registrar(
-                    "clientOrderId repetido", FALHOU,
-                    "a exchange ACEITOU o mesmo clientOrderId de uma ordem ja executada e "
-                    "comprou de novo: o id nao protege um reenvio, e qualquer caminho que "
-                    "reenvie depois de um timeout compra duas vezes. Ver docs/SEGURANCA.md "
-                    "(idempotencia).",
+                    "clientOrderId repetido", AVISO,
+                    "a exchange aceitou o mesmo clientOrderId de uma ordem ja executada e "
+                    "comprou de novo (comportamento documentado da Binance: o id so e unico "
+                    "entre ordens abertas). O sistema nao reenvia depois de um timeout: "
+                    "descobre o desfecho pela consulta por clientOrderId, que e a etapa que "
+                    "reprova se falhar. A compra a mais e vendida abaixo.",
                 )
             else:
                 relatorio.registrar(

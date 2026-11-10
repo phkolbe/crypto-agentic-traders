@@ -1429,3 +1429,90 @@ class TestAuditoriaQueFalhaNaoFicaEmSilencio:
         # E o alerta continua saindo: o operador nao pode depender do audit_log
         # para saber que a trava agiu.
         assert bus.alertas("opening_refused")
+
+
+class TestFillQueNaoConsegueSerGravado:
+    """M4 (auditoria de 09/11/2026): o fill acontecido na exchange nao some.
+
+    Cenario do relatorio: compra preenchida (0,0001 BTC a 60.000) e o Postgres
+    cai entre o envio e a gravacao. Antes, `apply_result`/`record` levantavam,
+    a excecao subia ate `_run` com so `error=str(exc)`, a ordem ficava PENDING
+    sem trade, `ORDER_RESULTS` nao era publicado e quantidade, preco e taxa do
+    fill nao ficavam em lugar nenhum.
+    """
+
+    async def test_banco_caido_depois_do_envio_loga_o_fill_inteiro_e_alerta(
+        self, settings, monkeypatch
+    ):
+        from structlog.testing import capture_logs
+
+        preenchida = OrderResult(
+            order_request_id="x",
+            client_order_id="cat-m4-1",
+            exchange_order_id="bin-777",
+            status=OrderStatus.FILLED,
+            filled_quantity=Decimal("0.0001"),
+            average_price=Decimal("60000"),
+            fee=Decimal("0.0000001"),
+            fee_currency="BTC",
+        )
+        broker = BrokerProgramado(
+            lambda req: preenchida.model_copy(update={"order_request_id": req.id})
+        )
+
+        async def banco_caiu(self, result):
+            raise ConnectionError("connection was closed in the middle of operation")
+
+        monkeypatch.setattr(OrderRepository, "apply_result", banco_caiu)
+        bus = BusEspiao()
+        agent = ExecutionAgent(bus, broker, settings)
+
+        with capture_logs() as registros:
+            result = await agent._execute(
+                make_request(client_order_id="cat-m4-1", quantity="0.0001", reference="60000")
+            )
+
+        assert result is not None and result.status is OrderStatus.FILLED
+        perdidos = [r for r in registros if r["event"] == "execution.registro_perdido"]
+        assert perdidos, "o fill sumiu sem rastro"
+        assert perdidos[0]["log_level"] == "error"
+        assert perdidos[0]["resultado"]["filled_quantity"] == "0.0001"
+        assert perdidos[0]["resultado"]["average_price"] == "60000"
+        assert perdidos[0]["resultado"]["exchange_order_id"] == "bin-777"
+        assert "connection was closed" in perdidos[0]["error"]
+
+        (alerta,) = bus.alertas("order_record_lost")
+        assert "cat-m4-1" in alerta["message"]
+        assert "0.0001" in alerta["message"] and "60000" in alerta["message"]
+        # O resultado continua publicado: quem assina ORDER_RESULTS sabe que executou.
+        assert [p for t, p in bus.publicados if t == Topics.ORDER_RESULTS]
+        assert len(broker.envios) == 1, "registro perdido nunca pode virar reenvio"
+
+    async def test_float_vindo_do_broker_nao_derruba_a_transacao_do_fill(self, settings):
+        """`Money` recusa float (D7) -- certo no banco, mas o fill ja aconteceu.
+
+        `model_copy(update=...)` nao valida, entao um adaptador que devolvesse
+        float passava pelo modelo e era o banco que recusava: ordem PENDING e
+        sem trade embora preenchida. O valor vira Decimal pela representacao
+        curta, na fronteira, e o trade e gravado.
+        """
+        base = OrderResult(
+            order_request_id="x", client_order_id="cat-float-1", exchange_order_id="b-1",
+            status=OrderStatus.FILLED,
+        )
+        broker = BrokerProgramado(lambda req: base.model_copy(update={
+            "order_request_id": req.id,
+            "filled_quantity": 0.001,
+            "average_price": 50000.5,
+            "fee": 0.05,
+        }))
+        agent = ExecutionAgent(BusEspiao(), broker, settings)
+        await agent._execute(make_request(client_order_id="cat-float-1"))
+
+        async with session_scope(settings) as session:
+            (ordem,) = await OrderRepository(session).list()
+            (trade,) = await TradeRepository(session).list()
+        assert ordem.status == str(OrderStatus.FILLED)
+        assert trade.quantity == Decimal("0.001")
+        assert trade.price == Decimal("50000.5")
+        assert trade.fee == Decimal("0.05")
